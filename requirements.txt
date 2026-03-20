@@ -1,0 +1,15 @@
+torch
+torchvision
+
+gym
+
+numpy
+pandas
+
+matplotlib
+configparser
+pathlib
+setproctitle
+absl-py
+imageio
+tensorboardX
