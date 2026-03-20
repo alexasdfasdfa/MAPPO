@@ -179,7 +179,8 @@ class R_Critic(nn.Module):
         if self.agent_state_mode == "all":
             self.num_agent_features = self.robot_num
         else:
-            self.num_agent_features = self.neighbor_n
+            # match previous semantics: neighbor_n is capped by robot_num
+            self.num_agent_features = min(self.neighbor_n, self.robot_num)
 
         init_method = [nn.init.xavier_uniform_, nn.init.orthogonal_][self._use_orthogonal]
 
@@ -232,58 +233,73 @@ class R_Critic(nn.Module):
             batch, self.num_agent_features, self.agent_feat_dim, device=device, dtype=cent_obs.dtype
         )
 
-        # loop over envs and agents to build neighbourhoods
+        # loop over envs (vectorized over self agents)
         for env_id in range(n_envs):
             # take one agent's centralized obs as the joint state for this env
             joint = cent_obs[env_id * self.robot_num]  # (share_obs_dim,)
-            # guard against any length mismatch by truncating to the expected size
             expected_dim = self.robot_num * self.num_rows * self.obs_row_dim
-            joint = joint[:expected_dim]
-            joint = joint.view(self.robot_num, self.num_rows, self.obs_row_dim)
+            joint = joint[:expected_dim].view(self.robot_num, self.num_rows, self.obs_row_dim)
 
             # per-robot features are row 0, last two entries are (px, py)
             env_robots = joint[:, 0, : self.agent_feat_dim]  # (robot_num, agent_feat_dim)
             positions = env_robots[:, -2:]  # (robot_num, 2)
 
-            for self_id in range(self.robot_num):
-                global_idx = env_id * self.robot_num + self_id
-                self_pos = positions[self_id]  # (2,)
-                diffs = positions - self_pos  # (robot_num, 2)
-                if self.neighbor_distance_metric == "manhattan":
-                    dists = diffs.abs().sum(dim=-1)
-                else:
-                    dists = torch.sqrt((diffs ** 2).sum(dim=-1) + 1e-8)
+            # build pairwise distances dists[i, j] = dist(self=i, other=j)
+            diffs = positions.unsqueeze(1) - positions.unsqueeze(0)  # (R, R, 2)
+            if self.neighbor_distance_metric == "manhattan":
+                dists = diffs.abs().sum(dim=-1)  # (R, R)
+            else:
+                dists = torch.sqrt((diffs ** 2).sum(dim=-1) + 1e-8)  # (R, R)
 
-                if self.agent_state_mode == "all":
-                    # use all robots (including self)
-                    order = torch.argsort(dists)
-                    selected_idx = order[: self.num_agent_features]
-                else:
-                    # nearest_n / nearest_n_radius
-                    order = torch.argsort(dists)
-                    k = min(self.neighbor_n, self.robot_num)
-                    if self.agent_state_mode == "nearest_n":
-                        selected_idx = order[:k]
-                    else:  # "nearest_n_radius"
-                        within = order[dists[order] <= self.neighbor_radius]
-                        selected_idx = within[:k]
+            order = torch.argsort(dists, dim=1)  # (R, R), sorted by distance per self-agent
 
-                selected = env_robots[selected_idx]  # (m, agent_feat_dim)
+            R = self.robot_num
+            k = self.num_agent_features  # fixed slot count for critic
 
-                # padding / trimming to fixed num_agent_features
-                m = selected.shape[0]
-                if m < self.num_agent_features:
-                    pad = torch.full(
-                        (self.num_agent_features - m, self.agent_feat_dim),
-                        self.neighbor_padding_value,
-                        device=device,
-                        dtype=env_robots.dtype,
-                    )
-                    selected = torch.cat([selected, pad], dim=0)
-                elif m > self.num_agent_features:
-                    selected = selected[: self.num_agent_features]
+            if self.agent_state_mode == "nearest_n":
+                # nearest_n: only need top-k nearest, avoids full argsort cost
+                # sorted=True keeps the same "distance ascending" order as argsort.
+                selected_idx = torch.topk(dists, k, dim=1, largest=False, sorted=True).indices  # (R, k)
+            elif self.agent_state_mode == "all":
+                # all: previous semantics sorts all robots by distance
+                selected_idx = order[:, :k]  # (R, R)
+            else:
+                # nearest_n_radius:
+                # previous semantics:
+                #   within = order[dists[order] <= radius]
+                #   selected_idx = within[:k]
+                # i.e., take the first k valid indices in distance-sorted order, pad remaining slots.
+                sorted_dists = dists.gather(1, order)  # (R, R)
+                valid = sorted_dists <= self.neighbor_radius  # (R, R)
 
-                neighbour_feats[global_idx] = selected
+                # pick[i, pos] is True for the first k valid neighbors for self=i
+                cumsum = valid.cumsum(dim=1)  # (R, R), 1..(#valid)
+                pick = valid & (cumsum <= k)  # (R, R)
+
+                selected_idx = torch.full((R, k), R, device=positions.device, dtype=order.dtype)
+                pad_mask_idx = pick.nonzero(as_tuple=False)  # (N, 2): [i, pos]
+                if pad_mask_idx.numel() > 0:
+                    i_idx = pad_mask_idx[:, 0]
+                    pos_idx = pad_mask_idx[:, 1]
+                    slot_idx = (cumsum[i_idx, pos_idx] - 1).to(dtype=selected_idx.dtype)  # 0..k-1
+                    selected_idx[i_idx, slot_idx.long()] = order[i_idx, pos_idx]
+
+            # gather features with padding row for radius mode
+            if self.agent_state_mode == "nearest_n_radius":
+                pad_vec = torch.full(
+                    (1, self.agent_feat_dim),
+                    self.neighbor_padding_value,
+                    device=positions.device,
+                    dtype=env_robots.dtype,
+                )
+                env_robots_padded = torch.cat([env_robots, pad_vec], dim=0)  # (R+1, agent_feat_dim)
+                selected = env_robots_padded[selected_idx]  # (R, k, agent_feat_dim)
+            else:
+                selected = env_robots[selected_idx]  # (R, k, agent_feat_dim)
+
+            # assign to neighbour_feats for all (env_id, self_id) samples
+            start = env_id * self.robot_num
+            neighbour_feats[start : start + self.robot_num] = selected
 
         critic_input = neighbour_feats.view(batch, -1)
         critic_features = self.base(critic_input)
