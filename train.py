@@ -56,6 +56,8 @@ def make_eval_env(all_args):
 def parser_args(args, parser):
     parser.add_argument("--num_agents", type=int, default=15, help="number of players")
     parser.add_argument("--random_act_prob", type=int, default=0, help="the probability of robot to choice random action")
+    parser.add_argument('--config_path', type=str, default='reward.yaml',
+                        help='Path to reward function config file')
 
     all_args = parser.parse_known_args(args)[0]
 

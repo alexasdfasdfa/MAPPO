@@ -1,4 +1,5 @@
 import logging
+from envs.utils import robot
 import numpy as np
 import rvo2
 from numpy.linalg import norm
@@ -8,6 +9,8 @@ from envs.utils.utils import cal_distance,reach_goal,get_weight
 from envs.utils.state_lux import JointState
 from envs.utils.robot import Robot
 import time
+import os
+import yaml
 
 class EnvCore(object):
     """
@@ -50,6 +53,8 @@ class EnvCore(object):
 
         self.is_reset = None
         self.collision_flag = None
+
+        self.reward_config = self.load_reward_config(args.config_path)
         
         # print('human number:',self.human_num)
 
@@ -60,6 +65,25 @@ class EnvCore(object):
 
         logging.info('simulation: {}'.format(self.train_val_sim))
         logging.info('Square width: {}, circle width: {}'.format(self.square_width, self.circle_radius))
+
+    def load_reward_config(self, config_path):
+        """加载奖励函数配置"""
+        if config_path is None:
+            # 默认配置文件路径（相对于项目根目录）
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            config_path = os.path.join(base_dir, 'reward.yaml')
+        
+        try:
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            print(f"成功加载奖励配置文件: {config_path}")
+            return config
+        except FileNotFoundError:
+            print(f"警告: 配置文件 {config_path} 未找到，使用默认参数")
+            return {}
+        except Exception as e:
+            print(f"警告: 读取配置文件失败 {e}，使用默认参数")
+            return {}
 
     def generate_remote_human_position(self):
         for i,human in enumerate(self.humans):
@@ -480,7 +504,7 @@ class EnvCore(object):
         for i, robot in enumerate(self.robots):
             sub_agent_obs.append(self.get_obs(robot, self.humans, for_feature)[0])
             sub_agent_obs_render.append(self.get_obs(robot, self.humans, for_feature)[1])
-            sub_agent_reward.append(self.get_reward(robot,for_feature))
+            sub_agent_reward.append(self.get_reward_new(robot,for_feature))
             # reward += self.get_reward(robot,for_feature)
 
             sub_agent_done.append(self.get_done(robot))
@@ -584,6 +608,85 @@ class EnvCore(object):
         # print(discount_formation * r_formation, discount_nav * r_nav, discount_avoid * r_avoid, reward, robot.id)
         return np.array([reward])
     
+    def get_reward_new(self, robot, for_feature, config=None):
+        """
+        优化的奖励函数
+        Args:
+            robot: 机器人对象
+            for_feature: 编队特征
+            config: 配置文件路径或配置字典
+        """
+        # 加载配置
+        if config is not None:
+            if isinstance(config, str):
+                # 如果是文件路径，则加载
+                config = self.load_reward_config(config)
+        else:
+            config = self.reward_config
+
+        # ========================
+        # 1. 初始化
+        # ========================
+        reward = 0.0
+        robot.goal_flag = False
+
+        # ========================
+        # 2. 导航奖励（核心）
+        # ========================
+        delta_dist = robot.pre_dist2goal - robot.dist2goal
+        nav_clip_min = config.get('nav_clip_min', -5.0)
+        nav_clip_max = config.get('nav_clip_max', 5.0)
+        r_nav = np.clip(delta_dist, nav_clip_min, nav_clip_max)
+
+        # ========================
+        # 3. 避障（平滑）
+        # ========================
+        r_avoid = 0.0
+        if robot.collision:
+            collision_penalty = config.get('collision_penalty', -50.0)
+            r_avoid = collision_penalty
+        else:
+            avoid_base = config.get('avoid_base', 1.0)
+            avoid_offset = config.get('avoid_offset', 0.2)
+            r_avoid = -avoid_base / (robot.dmin + avoid_offset)
+
+        # ========================
+        # 4. 编队（弱约束）
+        # ========================
+        formation_use_sqrt = config.get('formation_use_sqrt', False)
+        if formation_use_sqrt:
+            r_formation = -np.sqrt(for_feature)
+        else:
+            r_formation = -for_feature
+
+        # ========================
+        # 5. 到达目标（强奖励）
+        # ========================
+        r_goal = 0.0
+        if reach_goal(robot):
+            robot.goal_flag = True
+            goal_reward = config.get('goal_reward', 50.0)
+            r_goal = goal_reward
+
+        # ========================
+        # 6. 权重
+        # ========================
+        w_nav = config.get('w_nav', 10.0)
+        w_avoid = config.get('w_avoid', 5.0)
+        w_formation = config.get('w_formation', 2.0)
+        w_goal = config.get('w_goal', 5.0)
+
+        # ========================
+        # 7. 总 reward
+        # ========================
+        reward = (
+            w_nav * r_nav +
+            w_avoid * r_avoid +
+            w_formation * r_formation +
+            w_goal * r_goal
+        )
+
+        return np.array([reward])
     def get_done(self,agent):
         done = False
         if agent.collision == True:

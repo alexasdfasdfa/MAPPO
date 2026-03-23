@@ -1,0 +1,22 @@
+# 奖励函数配置
+
+# 导航奖励参数
+nav_clip_min: -5.0
+nav_clip_max: 5.0
+
+# 避障奖励参数
+collision_penalty: -50.0
+avoid_base: 1.0
+avoid_offset: 0.2
+
+# 目标到达奖励
+goal_reward: 50.0
+
+# 编队奖励参数
+formation_use_sqrt: false  # false表示不用sqrt，true表示用sqrt
+
+# 权重参数
+w_nav: 10.0
+w_avoid: 5.0
+w_formation: 2.0
+w_goal: 5.0

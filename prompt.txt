@@ -1,0 +1,57 @@
+你是一位精通强化学习的奖励工程专家，擅长设计奖励函数以引导智能体收敛
+
+你现在需要帮我优化以下强化学习奖励函数。当前奖励设计存在权重分配不恰当、收敛缓慢的问题。
+
+def get_reward(self,robot,for_feature):
+        r_avoid = 0
+        r_goal = 0
+        r_nav = 0
+        r_bonus = 0
+        robot.goal_flag = False
+        #collision
+        if robot.collision == True:
+            r_avoid = -60
+        else:
+            if robot.dmin < robot.discomfort_dist * 2:
+                r_avoid = -np.exp(-robot.dmin/3)
+        
+        #formation
+        r_formation = -np.sqrt(for_feature)
+
+        if abs(robot.pre_theta - robot.theta) > 0.7:
+            r_bonus = -1
+
+        r_nav += (robot.pre_dist2goal - robot.dist2goal) * 5
+
+        if r_nav > 0 and robot.collision:
+            r_nav = 0
+        
+        if reach_goal(robot):
+            robot.goal_flag = True
+            if robot.v != 0:
+                r_goal += 5
+
+        if self.collision_flag:
+            r_goal = 0
+
+        discount_formation = 30
+        discount_avoid = 50
+        discount_nav = 20
+        discount_goal = 200
+        discount_bonus = 2
+
+        reward =  discount_formation * r_formation + discount_avoid * r_avoid + discount_nav * r_nav \
+                + discount_goal * r_goal #+ discount_bonus * r_bonus
+        if robot.goal_flag:
+            reward = 0
+        return np.array([reward])
+
+环境描述：智能体需要从各自的初始位置，最高效地移动到提供的最终位置，比如说：
+        [[10, 0], [8, 6], [3, 9], [-3, 9], [-8, 6], [-10, 0], [-8, -6], [-3, -9], [3, -9], [8, -6]]-->[[1, 26], [4, 26], [7, 26], [10, 26], [13, 26], [7, 23], [7, 18], [7, 13], [7, 8], [7, 3]]
+        代表编队成“T”形，从初始位置到目标位置。
+        [[10, 0], [8, 6], [3, 9], [-3, 9], [-8, 6], [-10, 0], [-8, -6], [-3, -9], [3, -9], [8, -6]]-->[[1,26],[1,18],[1,11],[1,3],[7,26],[13,26],[5,15],[9,15],[7,3],[13,3]]
+        代表编队成“E”形，从初始位置到目标位置。
+
+期望行为：智能体需要尽快到达目标位置，同时避免碰撞，越快越好。
+
+输出格式：先分析当前奖励函数的缺陷，再提供优化版本的思路，最后给出完整的优化后的奖励函数代码。
