@@ -320,14 +320,14 @@ def get_config():
     parser.add_argument(
         "--render_font_pattern_policy",
         type=str,
-        default="all",
+        default="only",
         choices=["all", "only", "must_contain"],
         help="Render pattern pool policy: use all patterns, only the listed ones, or must include the listed ones.",
     )
     parser.add_argument(
         "--render_font_pattern_names",
         type=str,
-        default="",
+        default="S",
         help="Comma-separated pattern names for render (used by 'only'/'must_contain' policies).",
     )
     parser.add_argument("--square_width",type=float,default=10,help='if select square_crossing in human_action,the width of the square')

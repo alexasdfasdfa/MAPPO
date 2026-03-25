@@ -39,7 +39,7 @@ def main(args):
     parser = get_config()
     all_args = parser_args(args, parser)
     all_args.use_render = True
-    all_args.model_dir = '/home/wangdx_lab/cse12211818/mappo1.8.4.2/results/train/run116/models'
+    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run1/models'
     all_args.n_rollout_threads = 1
     all_args.episode_length = 350
     all_args.visualize = False
@@ -97,6 +97,7 @@ def main(args):
             curr_run = 'run1'
         else:
             curr_run = 'run%i' % (max(exst_run_nums) + 1)
+    print(f'================ Results Saved in {curr_run} ================\n')
     run_dir = run_dir / curr_run
     if not run_dir.exists():
         os.makedirs(str(run_dir))
