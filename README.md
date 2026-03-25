@@ -3,6 +3,7 @@ Works based on *Application of LLM Guided Reinforcement Learning in Formation Co
 ## Implemented:
 - Seperated Reward
 - Seperated Dataset
+- Data Generator
 
 ## TODO:
 - Mode that agents' destination not be determined
