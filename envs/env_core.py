@@ -504,7 +504,7 @@ class EnvCore(object):
         for i, robot in enumerate(self.robots):
             sub_agent_obs.append(self.get_obs(robot, self.humans, for_feature)[0])
             sub_agent_obs_render.append(self.get_obs(robot, self.humans, for_feature)[1])
-            sub_agent_reward.append(self.get_reward_new(robot,for_feature))
+            sub_agent_reward.append(self.get_reward_lgpf(robot,for_feature))
             # reward += self.get_reward(robot,for_feature)
 
             sub_agent_done.append(self.get_done(robot))
@@ -610,83 +610,92 @@ class EnvCore(object):
     
     def get_reward_new(self, robot, for_feature, config=None):
         """
-        优化的奖励函数
+        优化的奖励函数 - 各项奖励已scale到相近范围
+        
+        设计原则:
+        1. 各项奖励数值范围相近（约 [-1, 1]）
+        2. 通过权重调整各项的重要性
+        3. 避免某一项压倒性主导
+        
         Args:
             robot: 机器人对象
-            for_feature: 编队特征
-            config: 配置文件路径或配置字典
+            for_feature: 编队特征（拉普拉斯矩阵迹）
+            config: 配置字典
         """
         # 加载配置
         if config is not None:
             if isinstance(config, str):
-                # 如果是文件路径，则加载
                 config = self.load_reward_config(config)
         else:
             config = self.reward_config
 
         # ========================
-        # 1. 初始化
+        # 初始化
         # ========================
-        reward = 0.0
         robot.goal_flag = False
-
+        
         # ========================
-        # 2. 导航奖励（核心）
+        # 1. 导航奖励
         # ========================
+        # 距离变化，归一化到 [-1, 1] 范围
         delta_dist = robot.pre_dist2goal - robot.dist2goal
-        nav_clip_min = config.get('nav_clip_min', -5.0)
-        nav_clip_max = config.get('nav_clip_max', 5.0)
-        r_nav = np.clip(delta_dist, nav_clip_min, nav_clip_max)
-
+        nav_scale = config.get('nav_scale', 2.0)
+        r_nav = np.tanh(delta_dist / nav_scale)
+        
         # ========================
-        # 3. 避障（平滑）
+        # 2. 避障奖励
         # ========================
-        r_avoid = 0.0
         if robot.collision:
-            collision_penalty = config.get('collision_penalty', -50.0)
-            r_avoid = collision_penalty
+            r_avoid = -1.0
         else:
-            avoid_base = config.get('avoid_base', 1.0)
-            avoid_offset = config.get('avoid_offset', 0.2)
-            r_avoid = -avoid_base / (robot.dmin + avoid_offset)
-
+            discomfort_dist = config.get('discomfort_dist_scale', 1.0)
+            r_avoid = -1.0 / (1.0 + np.exp(robot.dmin / discomfort_dist - 2.0))
+        
         # ========================
-        # 4. 编队（弱约束）
+        # 3. 编队奖励
         # ========================
-        formation_use_sqrt = config.get('formation_use_sqrt', False)
-        if formation_use_sqrt:
-            r_formation = -np.sqrt(for_feature)
-        else:
-            r_formation = -for_feature
-
+        robot_num = len(self.robots) if self.robots else 1
+        formation_scale = config.get('formation_scale', robot_num)
+        if formation_scale == 0:
+            formation_scale = robot_num
+        r_formation = -np.tanh(for_feature / formation_scale)
+        
         # ========================
-        # 5. 到达目标（强奖励）
+        # 4. 目标奖励
         # ========================
         r_goal = 0.0
         if reach_goal(robot):
             robot.goal_flag = True
-            goal_reward = config.get('goal_reward', 50.0)
-            r_goal = goal_reward
-
+            r_goal = 1.0
+        
+        # ========================
+        # 5. 时间惩罚
+        # ========================
+        r_time = config.get('time_penalty', -0.01)
+        
         # ========================
         # 6. 权重
         # ========================
-        w_nav = config.get('w_nav', 10.0)
-        w_avoid = config.get('w_avoid', 5.0)
-        w_formation = config.get('w_formation', 2.0)
+        w_nav = config.get('w_nav', 1.0)
+        w_avoid = config.get('w_avoid', 2.0)
+        w_formation = config.get('w_formation', 0.5)
         w_goal = config.get('w_goal', 5.0)
+        w_time = config.get('w_time', 0.1)
 
         # ========================
-        # 7. 总 reward
+        # 7. 总奖励
         # ========================
         reward = (
             w_nav * r_nav +
             w_avoid * r_avoid +
             w_formation * r_formation +
-            w_goal * r_goal
+            w_goal * r_goal +
+            w_time * r_time
         )
 
         return np.array([reward])
+
+
     def get_done(self,agent):
         done = False
         if agent.collision == True:
@@ -717,3 +726,125 @@ class EnvCore(object):
         return info
     
     
+
+    def get_reward_lgpf(self, robot, for_feature):
+        """
+        参考LGPF论文设计的优化奖励函数
+        
+        论文奖励函数设计:
+        - r_p = -Σ ||g_i - N(g_i, B)|| : 模式形成奖励
+        - r_c = -1/2 * Σ 1[||p(i)-p(j)|| ≤ 2R] : 碰撞惩罚
+        - r = r_p + α * r_c
+        
+        优化目标:
+        1. 各项奖励数值范围相近 (约 [-1, 1])
+        2. 奖励随训练进行逐渐增大并收敛
+        3. 设计合理，避免某一项主导
+        
+        Args:
+            robot: 机器人对象
+            for_feature: 编队特征（拉普拉斯矩阵迹）
+        Returns:
+            np.array: 奖励值
+        """
+        config = self.reward_config
+        
+        # ============================================
+        # 1. 模式形成奖励 (Formation Reward)
+        # ============================================
+        # 论文: r_p = -Σ ||g_i - N(g_i, B)||
+        # 计算每个目标点到最近智能体的距离
+        # 这里使用 for_feature (拉普拉斯矩阵差异) 作为编队误差
+        
+        formation_norm = config.get('formation_norm', 10.0)
+        # 归一化到 [-1, 0] 范围，for_feature越小越好
+        r_formation = -np.tanh(np.sqrt(for_feature) / formation_norm)
+        # 当 for_feature=0 时，r_formation=0 (完美编队)
+        # 当 for_feature 很大时，r_formation 接近 -1
+        
+        # ============================================
+        # 2. 碰撞惩罚 (Collision Penalty)
+        # ============================================
+        # 论文: r_c = -1/2 * Σ 1[||p(i)-p(j)|| ≤ 2R]
+        
+        collision_penalty = config.get('collision_penalty', -1.0)
+        danger_threshold = config.get('danger_threshold', 2.0)
+        danger_decay = config.get('danger_decay', 1.0)
+        
+        if robot.collision:
+            # 发生碰撞，最大惩罚
+            r_collision = collision_penalty
+        else:
+            # 根据最近距离计算危险程度
+            # dmin 是到最近障碍物/其他智能体的距离（已减去半径）
+            # 使用 sigmoid 函数平滑过渡
+            if robot.dmin < danger_threshold:
+                # 在危险区域内，给予平滑惩罚
+                r_collision = -np.exp(-robot.dmin / danger_decay)
+            else:
+                # 安全区域，无惩罚
+                r_collision = 0.0
+        
+        # ============================================
+        # 3. 进度奖励 (Progress Reward)
+        # ============================================
+        # 鼓励智能体向目标移动
+        # 这是论文中隐含的奖励，帮助学习
+        
+        progress_scale = config.get('progress_scale', 1.0)
+        max_progress_reward = config.get('max_progress_reward', 0.5)
+        
+        delta_dist = robot.pre_dist2goal - robot.dist2goal
+        # 归一化进度奖励，限制在 [-max_progress_reward, max_progress_reward]
+        r_progress = np.clip(delta_dist / progress_scale, -max_progress_reward, max_progress_reward)
+        
+        # 如果发生碰撞，进度奖励设为0
+        if robot.collision:
+            r_progress = 0.0
+        
+        # ============================================
+        # 4. 目标奖励 (Goal Reward)
+        # ============================================
+        
+        goal_reward = config.get('goal_reward', 1.0)
+        robot.goal_flag = False
+        r_goal = 0.0
+        
+        if reach_goal(robot):
+            robot.goal_flag = True
+            r_goal = goal_reward
+        
+        # 如果发生全局碰撞，目标奖励为0
+        if self.collision_flag:
+            r_goal = 0.0
+        
+        # ============================================
+        # 5. 时间惩罚 (Time Penalty)
+        # ============================================
+        
+        time_penalty = config.get('time_penalty', -0.01)
+        r_time = time_penalty
+        
+        # ============================================
+        # 6. 加权求和
+        # ============================================
+        
+        w_formation = config.get('w_formation', 1.0)
+        w_collision = config.get('w_collision', 2.0)
+        w_progress = config.get('w_progress', 0.5)
+        w_goal = config.get('w_goal', 3.0)
+        w_time = config.get('w_time', 0.1)
+        
+        reward = (
+            w_formation * r_formation +
+            w_collision * r_collision +
+            w_progress * r_progress +
+            w_goal * r_goal +
+            w_time * r_time
+        )
+        
+        # 如果已到达目标，奖励设为正值（鼓励保持）
+        if robot.goal_flag:
+            reward = max(reward, 0.5)
+        
+        return np.array([reward])
