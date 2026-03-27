@@ -20,6 +20,12 @@ class Robot(Agent):
         self.pre_theta = None
         self.goal_flag = None
 
+        self.target_id = 0
+        self.prev_target_id = 0
+        self.prev_px = None
+        self.prev_py = None
+        self.target_switched_this_step = False
+
     def act(self, ob):
         if self.policy is None:
             raise AttributeError('Policy attribute has to be set!')

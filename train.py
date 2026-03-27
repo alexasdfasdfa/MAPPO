@@ -6,11 +6,10 @@ import numpy as np
 from pathlib import Path
 import torch
 
-# Get the parent directory of the current file
-parent_dir = os.path.abspath(os.path.join(os.getcwd(), "."))
-
-# Append the parent directory to sys.path, otherwise the following import will fail
-sys.path.append(parent_dir)
+# Repo root (not cwd) so Slurm / arbitrary launch dirs still find `runner`, `envs`, etc.
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # import rvo2
 from config.config import get_config          
@@ -57,10 +56,26 @@ def make_eval_env(all_args):
 
 
 def parser_args(args, parser):
-    parser.add_argument("--num_agents", type=int, default=15, help="number of players")
+    parser.add_argument(
+        "--num_agents",
+        type=int,
+        default=15,
+        help="number of players (training overrides this to match --train_font_pattern_length)",
+    )
     parser.add_argument("--random_act_prob", type=int, default=0, help="the probability of robot to choice random action")
 
     all_args = parser.parse_known_args(args)[0]
+
+    # Match swarm size to font-pattern length bucket (config --train_font_pattern_length).
+    _pat_len = int(getattr(all_args, "train_font_pattern_length", 10))
+    _prev_n = int(all_args.num_agents)
+    if _prev_n != _pat_len:
+        print(f"[train] num_agents {_prev_n} -> {_pat_len} (aligned to train_font_pattern_length)")
+    all_args.num_agents = _pat_len
+
+    if getattr(all_args, "enable_dynamic_goal_assignment", False):
+        k = int(all_args.num_agents)
+        all_args.robot_obs_dim = 7 + 3 * k + max(0, k - 1)
 
     return all_args
 
@@ -123,6 +138,23 @@ def main(args):
     print("run_dir",run_dir)
     if not run_dir.exists():
         os.makedirs(str(run_dir))
+
+    _notes_path = run_dir / "run_flags.txt"
+    _asm = getattr(all_args, "agent_state_mode", "all")
+    _dyn = bool(getattr(all_args, "enable_dynamic_goal_assignment", False))
+    _ir = bool(getattr(all_args, "randomize_robot_initial_positions", False))
+    _notes = (
+        f"agent_state_mode: {_asm}\n"
+        f"dynamic_target: {_dyn}\n"
+        f"initial_randomize: {_ir}\n"
+        f"num_agents: {int(all_args.num_agents)}\n"
+    )
+    if _asm == "nearest_n_radius":
+        _nn = int(getattr(all_args, "neighbor_n", 5))
+        _nr = float(getattr(all_args, "neighbor_radius", 5.0))
+        _notes += f"neighbor_n: {_nn}\nneighbor_radius: {_nr}\n"
+    with open(_notes_path, "w", encoding="utf-8") as _nf:
+        _nf.write(_notes)
 
     setproctitle.setproctitle("@" + str(all_args.user_name))
     # for i in range(5):

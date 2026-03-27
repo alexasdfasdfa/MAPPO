@@ -1,0 +1,6 @@
+agent_state_mode: all
+dynamic_target: False
+initial_randomize: True
+num_agents: 10
+train_static_preset: conservative_ppo_rw (lr 3e-4, entropy>=0.02, ppo_epoch<=12, ep_len 480, rw_formation=0)
+full_args: run_args.json, run_args.txt

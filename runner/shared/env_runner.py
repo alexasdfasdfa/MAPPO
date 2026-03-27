@@ -5,12 +5,44 @@
 # @File    : env_runner.py
 """
 
+import csv
+import json
 import time
+from pathlib import Path
+
 import numpy as np
 import torch
 from runner.shared.base_runner import Runner
 from envs.utils.utils import reach_goal
 import imageio
+
+
+# Columns for reward_terms.csv (static + dynamic keys; unused cells left blank).
+REWARD_TERMS_CSV_COLUMNS = (
+    "episode",
+    "step",
+    "env_id",
+    "agent_id",
+    "reward_env",
+    "info_type",
+    "reward_mode",
+    "r_avoid_raw",
+    "r_formation_raw",
+    "r_nav_raw",
+    "r_goal_raw",
+    "r_bonus_raw",
+    "c_formation",
+    "c_avoid",
+    "c_nav",
+    "c_goal",
+    "reward_shaped",
+    "nd_terminal_tr",
+    "nd_tr_applied",
+    "goal_entered_from_outside",
+    "goal_flag",
+    "shared_team",
+    "reward_final",
+)
 
 
 def _t2n(x):
@@ -22,6 +54,70 @@ class EnvRunner(Runner):
 
     def __init__(self, config):
         super(EnvRunner, self).__init__(config)
+        self._reward_terms_fp = None
+        self._reward_terms_writer = None
+
+    def _ensure_reward_terms_csv(self):
+        if self._reward_terms_fp is not None:
+            return
+        # Same directory as TensorBoard (SummaryWriter); created in base_runner.__init__
+        log_dir = Path(self.log_dir)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        path = log_dir / "reward_terms.csv"
+        self._reward_terms_fp = open(path, "w", newline="", encoding="utf-8")
+        self._reward_terms_writer = csv.DictWriter(
+            self._reward_terms_fp,
+            fieldnames=REWARD_TERMS_CSV_COLUMNS,
+            extrasaction="ignore",
+            restval="",
+        )
+        self._reward_terms_writer.writeheader()
+        self._reward_terms_fp.flush()
+
+    def _close_reward_terms_log(self):
+        if self._reward_terms_fp is not None:
+            self._reward_terms_fp.close()
+            self._reward_terms_fp = None
+            self._reward_terms_writer = None
+
+    def _maybe_log_reward_terms(self, episode, step, infos, rewards):
+        if not getattr(self.all_args, "save_reward_terms", False):
+            return
+        # Align with TensorBoard / console logging (same episodes as log_train)
+        _li = max(1, int(self.log_interval))
+        if int(episode) % _li != 0:
+            return
+        stride = max(1, int(getattr(self.all_args, "reward_terms_log_stride", 1)))
+        if step % stride != 0:
+            return
+        max_envs = max(0, int(getattr(self.all_args, "reward_terms_max_envs", 1)))
+        if max_envs == 0:
+            return
+        self._ensure_reward_terms_csv()
+        if isinstance(infos, tuple):
+            env_infos = infos
+        else:
+            env_infos = tuple(infos)
+        n_e = min(max_envs, len(env_infos), int(rewards.shape[0]))
+        for env_i in range(n_e):
+            per_agent = env_infos[env_i]
+            if not isinstance(per_agent, (list, tuple)):
+                continue
+            for aid, inf in enumerate(per_agent):
+                terms = getattr(inf, "reward_terms", None) or {}
+                row = {
+                    "episode": episode,
+                    "step": step,
+                    "env_id": env_i,
+                    "agent_id": aid,
+                    "reward_env": float(rewards[env_i, aid, 0]),
+                    "info_type": type(inf).__name__,
+                }
+                for k in REWARD_TERMS_CSV_COLUMNS:
+                    if k in terms:
+                        row[k] = terms[k]
+                self._reward_terms_writer.writerow(row)
+        self._reward_terms_fp.flush()
 
     def run(self):
         self.warmup()
@@ -29,95 +125,99 @@ class EnvRunner(Runner):
         start = time.time()
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
 
-        for episode in range(episodes):
-            if self.use_linear_lr_decay:
-                self.trainer.policy.lr_decay(episode, episodes)
+        try:
+            for episode in range(episodes):
+                if self.use_linear_lr_decay:
+                    self.trainer.policy.lr_decay(episode, episodes)
 
-            for step in range(self.episode_length):
-                # Sample actions
-                (
-                    values,
-                    actions,
-                    action_log_probs,
-                    rnn_states,
-                    rnn_states_critic,
-                    actions_env,
-                ) = self.collect(step)
+                for step in range(self.episode_length):
+                    # Sample actions
+                    (
+                        values,
+                        actions,
+                        action_log_probs,
+                        rnn_states,
+                        rnn_states_critic,
+                        actions_env,
+                    ) = self.collect(step)
 
-                # Obser reward and next obs
-                obs, rewards, dones, infos = self.envs.step(actions_env)
+                    # Obser reward and next obs
+                    obs, rewards, dones, infos = self.envs.step(actions_env)
+                    self._maybe_log_reward_terms(episode, step, infos, rewards)
 
-                data = (
-                    obs,
-                    rewards,
-                    dones,
-                    infos,
-                    values,
-                    actions,
-                    action_log_probs,
-                    rnn_states,
-                    rnn_states_critic,
-                )
-
-                # insert data into buffer
-                self.insert(data)
-
-            # compute return and update network
-            self.compute()
-            train_infos = self.train()
-
-            # post process
-            total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads
-
-            # save model
-            if episode % self.save_interval == 0 or episode == episodes - 1:
-                self.save()
-
-            # log information
-            if episode % self.log_interval == 0:
-                end = time.time()
-                print(
-                    "\n Algo MAPPO Exp test updates {}/{} episodes, total num timesteps {}/{}, FPS {}.\n".format(
-                        # self.algorithm_name,
-                        # self.experiment_name,
-                        episode,
-                        episodes,
-                        total_num_steps,
-                        self.num_env_steps,
-                        int(total_num_steps / (end - start)),
+                    data = (
+                        obs,
+                        rewards,
+                        dones,
+                        infos,
+                        values,
+                        actions,
+                        action_log_probs,
+                        rnn_states,
+                        rnn_states_critic,
                     )
-                )
-                # print(
-                #     "\n Scenario {} Algo {} Exp {} updates {}/{} episodes, total num timesteps {}/{}, FPS {}.\n".format(
-                #         self.all_args.scenario_name,
-                #         self.algorithm_name,
-                #         self.experiment_name,
-                #         episode,
-                #         episodes,
-                #         total_num_steps,
-                #         self.num_env_steps,
-                #         int(total_num_steps / (end - start)),
-                #     )
-                # )
 
-                # if self.env_name == "MPE":
-                #     env_infos = {}
-                #     for agent_id in range(self.num_agents):
-                #         idv_rews = []
-                #         for info in infos:
-                #             if 'individual_reward' in info[agent_id].keys():
-                #                 idv_rews.append(info[agent_id]['individual_reward'])
-                #         agent_k = 'agent%i/individual_rewards' % agent_id
-                #         env_infos[agent_k] = idv_rews
+                    # insert data into buffer
+                    self.insert(data)
 
-                train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards) * self.episode_length
-                print("average episode rewards is {}".format(train_infos["average_episode_rewards"]))
-                self.log_train(train_infos, total_num_steps)
-                # self.log_env(env_infos, total_num_steps)
+                # compute return and update network
+                self.compute()
+                train_infos = self.train()
 
-            # eval
-            if episode % self.eval_interval == 0 and self.use_eval:
-                self.eval(total_num_steps)
+                # post process
+                total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads
+
+                # save model
+                if episode % self.save_interval == 0 or episode == episodes - 1:
+                    self.save()
+
+                # log information
+                if episode % self.log_interval == 0:
+                    end = time.time()
+                    print(
+                        "\n Algo MAPPO Exp test updates {}/{} episodes, total num timesteps {}/{}, FPS {}.\n".format(
+                            # self.algorithm_name,
+                            # self.experiment_name,
+                            episode,
+                            episodes,
+                            total_num_steps,
+                            self.num_env_steps,
+                            int(total_num_steps / (end - start)),
+                        )
+                    )
+                    # print(
+                    #     "\n Scenario {} Algo {} Exp {} updates {}/{} episodes, total num timesteps {}/{}, FPS {}.\n".format(
+                    #         self.all_args.scenario_name,
+                    #         self.algorithm_name,
+                    #         self.experiment_name,
+                    #         episode,
+                    #         episodes,
+                    #         total_num_steps,
+                    #         self.num_env_steps,
+                    #         int(total_num_steps / (end - start)),
+                    #     )
+                    # )
+
+                    # if self.env_name == "MPE":
+                    #     env_infos = {}
+                    #     for agent_id in range(self.num_agents):
+                    #         idv_rews = []
+                    #         for info in infos:
+                    #             if 'individual_reward' in info[agent_id].keys():
+                    #                 idv_rews.append(info[agent_id]['individual_reward'])
+                    #         agent_k = 'agent%i/individual_rewards' % agent_id
+                    #         env_infos[agent_k] = idv_rews
+
+                    train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards) * self.episode_length
+                    print("average episode rewards is {}".format(train_infos["average_episode_rewards"]))
+                    self.log_train(train_infos, total_num_steps)
+                    # self.log_env(env_infos, total_num_steps)
+
+                # eval
+                if episode % self.eval_interval == 0 and self.use_eval:
+                    self.eval(total_num_steps)
+        finally:
+            self._close_reward_terms_log()
 
     def warmup(self):
         # reset env
@@ -363,17 +463,46 @@ class EnvRunner(Runner):
 
         # write render metadata (font pattern name + agent count) into output txt files
         pattern_name = "unknown"
+        pattern_template_len = 0
         try:
             # DummyVecEnv: self.envs.env is DiscreteActionEnv, .env is EnvCore
-            pattern_name = getattr(self.envs.env.env, "pattern_name", pattern_name)
+            core_env = self.envs.env.env
+            pattern_name = getattr(core_env, "pattern_name", pattern_name)
+            st = getattr(core_env, "s_shape_targets", None) or []
+            pattern_template_len = len(st)
         except Exception:
             pass
+        meta_path = os.path.join(str(self.run_dir), "episode_meta.jsonl")
+        with open(meta_path, "w", encoding="utf-8") as _mf:
+            pass
+        header_line2 = (
+            f"# rollout_length={int(self.episode_length)}, "
+            f"pattern_template_len={pattern_template_len}, "
+            f"meta_file=episode_meta.jsonl\n"
+        )
         for fpath in coords_files + success_files:
-            with open(fpath, "w") as f:
+            with open(fpath, "w", encoding="utf-8") as f:
                 f.write(f"# agents={self.num_agents}, pattern={pattern_name}\n")
+                f.write(header_line2)
         all_frames = []
         for episode in range(self.all_args.render_episodes):
             obs = envs.reset()
+            episode_meta_record = None
+            try:
+                core_env = self.envs.env.env
+                episode_meta_record = {
+                    "episode": int(episode + 1),
+                    "pattern": str(getattr(core_env, "pattern_name", pattern_name)),
+                    "episode_length": int(self.episode_length),
+                    "pattern_template_len": int(
+                        len(getattr(core_env, "s_shape_targets", None) or [])
+                    ),
+                    "agent_goals": [
+                        [float(r.gx), float(r.gy)] for r in core_env.robots
+                    ],
+                }
+            except Exception:
+                pass
             if self.all_args.save_gifs:
                 image = envs.render("rgb_array")[0][0]
                 all_frames.append(image)
@@ -415,7 +544,6 @@ class EnvRunner(Runner):
                 for i, robot in enumerate(self.envs.env.env.robots):
                     if reach_goal(robot):
                         episode_succes[step, 0, i, 0] = 1
-                        
 
                 render_robot_obs = robot_rows.reshape(n_envs * n_agents, robot_obs_dim)
 
@@ -446,6 +574,10 @@ class EnvRunner(Runner):
                 # Obser reward and next obs
                 obs, rewards, dones, infos = envs.step(actions_env)
                 episode_rewards.append(rewards)
+                # Also mark success after physics: agents can enter the goal during step().
+                for i, robot in enumerate(self.envs.env.env.robots):
+                    if reach_goal(robot):
+                        episode_succes[step, 0, i, 0] = 1
 
                 rnn_states[dones == True] = np.zeros(
                     ((dones == True).sum(), self.recurrent_N, self.hidden_size),
@@ -480,7 +612,13 @@ class EnvRunner(Runner):
                         coords_list = [("1" if episode_succes[x, env_i, agent_id, 0] else "0") for x in range(episode_succes.shape[0])]
                         env_chunks.append("; ".join(coords_list))  
                     line = f"{episode+1}, " + " | ".join(env_chunks) + "\n"
-                    f.write(line)     
+                    f.write(line)
+
+            if episode_meta_record is not None:
+                with open(meta_path, "a", encoding="utf-8") as mf:
+                    mf.write(
+                        json.dumps(episode_meta_record, ensure_ascii=False) + "\n"
+                    )
 
             print("average episode rewards is: " + str(np.mean(np.sum(np.array(episode_rewards), axis=0))))
 

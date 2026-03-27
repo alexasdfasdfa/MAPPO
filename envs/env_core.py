@@ -10,6 +10,123 @@ from envs.utils.robot import Robot
 import time
 from envs.utils.reward_calculator import RewardCalculator
 
+
+def _parse_csv_ints_arg(s):
+    s = (s or "").strip()
+    if not s:
+        return []
+    return [int(x.strip()) for x in s.split(",") if x.strip()]
+
+
+def _parse_csv_names_arg(s):
+    s = (s or "").strip()
+    if not s:
+        return []
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def select_font_pattern_targets_for_args(args, *, log_selection=True):
+    """
+    Select font pattern (formation template) the same way as EnvCore.
+    Used by render to size num_agents before env construction.
+    Returns (pattern_name, pattern_coords).
+    """
+    from dataset.FontPatternLoader import FontPatternLoader
+
+    use_render = getattr(args, "use_render", False)
+    if use_render:
+        lengths = _parse_csv_ints_arg(getattr(args, "render_font_pattern_lengths", "10"))
+        policy = getattr(args, "render_font_pattern_policy", "all")
+        names = _parse_csv_names_arg(getattr(args, "render_font_pattern_names", ""))
+        allow_repeat = True
+    else:
+        lengths = [int(getattr(args, "train_font_pattern_length", 10))]
+        policy = getattr(args, "train_font_pattern_policy", "all")
+        names = _parse_csv_names_arg(getattr(args, "train_font_pattern_names", ""))
+        allow_repeat = bool(getattr(args, "train_font_pattern_allow_repeat", False))
+
+    env_rank = int(getattr(args, "env_rank", 0))
+    threads = int(getattr(args, "n_rollout_threads", 1))
+
+    loader = FontPatternLoader(
+        target_lengths=lengths,
+        dataset_dir=getattr(args, "font_pattern_dataset_dir", "./dataset"),
+    )
+
+    pool_all = []
+    for L in lengths:
+        pool_all.extend(loader.data_store.get(L, []))
+
+    if not pool_all:
+        raise RuntimeError(f"No font patterns loaded for lengths={lengths}.")
+
+    if policy == "only":
+        if not names:
+            raise RuntimeError("train_font_pattern_policy/render_font_pattern_policy is 'only' but no names provided.")
+        pool_allowed = [p for p in pool_all if p.get("name") in set(names)]
+    else:
+        pool_allowed = list(pool_all)
+
+    if not pool_allowed:
+        raise RuntimeError(f"Font pattern policy '{policy}' produced empty pool. names={names}, lengths={lengths}")
+
+    ordered_pool = []
+    used_names = set()
+    if policy == "must_contain":
+        if not names:
+            raise RuntimeError("Font pattern policy 'must_contain' requires non-empty pattern names.")
+
+        required_set = set(names)
+        found_set = {p.get("name") for p in pool_allowed}
+        missing = required_set - found_set
+        if missing:
+            raise RuntimeError(f"Missing required font patterns: {sorted(list(missing))}")
+
+        if len(names) > threads:
+            raise RuntimeError(
+                f"Not enough env threads (threads={threads}) to include all required patterns (required={names})."
+            )
+
+        for n in names:
+            for p in pool_allowed:
+                if p.get("name") == n:
+                    ordered_pool.append(p)
+                    used_names.add(n)
+                    break
+
+    for p in pool_allowed:
+        n = p.get("name")
+        if n not in used_names:
+            ordered_pool.append(p)
+
+    pattern_count = len(ordered_pool)
+    if threads > pattern_count:
+        allow_repeat = True
+
+    if not allow_repeat and threads > pattern_count:
+        raise RuntimeError("Repetition disabled but env threads exceed available patterns.")
+
+    if allow_repeat:
+        idx = env_rank % pattern_count
+    else:
+        idx = env_rank
+
+    chosen = ordered_pool[idx]
+    pattern_name = chosen.get("name", "unknown")
+    pattern_coords = chosen.get("coordinates", [])
+
+    if not pattern_coords:
+        raise RuntimeError(f"Chosen font pattern '{pattern_name}' has empty coordinates.")
+
+    if log_selection:
+        if not use_render:
+            print(f"[font-pattern][train] env_rank={env_rank}/{threads-1}, length={lengths[0]}, name={pattern_name}")
+        else:
+            print(f"[font-pattern][render] env_rank={env_rank}, length(s)={lengths}, name={pattern_name}")
+
+    return pattern_name, pattern_coords
+
+
 class EnvCore(object):
     """
     # 环境中的智能体
@@ -68,125 +185,19 @@ class EnvCore(object):
         # font pattern selection (used to set robot goals/formation templates)
         self.pattern_name, self.s_shape_targets = self._select_font_pattern_targets()
 
-    def _parse_csv_ints(self, s):
-        s = (s or "").strip()
-        if not s:
-            return []
-        return [int(x.strip()) for x in s.split(",") if x.strip()]
-
-    def _parse_csv_names(self, s):
-        s = (s or "").strip()
-        if not s:
-            return []
-        return [x.strip() for x in s.split(",") if x.strip()]
+        self.dynamic_goal_assignment = bool(getattr(args, "enable_dynamic_goal_assignment", False))
+        self.goal_positions = None
+        self.claimed_by = None
+        self.num_goal_targets = self.robot_num
+        self.goal_centroid_xy = (0.0, 0.0)
+        self.dynamic_step_travel_sum = 0.0
+        self.dynamic_same_target_conflict_pairs = 0
+        self.dynamic_formation_success_once = False
+        self.dynamic_episode_had_collision = False
 
     def _select_font_pattern_targets(self):
-        """
-        Select a font pattern (formation template) from dataset.FontPatternLoader.
-
-        Training (use_render == False):
-          - lengths: single int from args.train_font_pattern_length
-          - threads: args.n_rollout_threads
-          - each env_rank selects a pattern (can repeat based on args/train_font_pattern_allow_repeat)
-
-        Render (use_render == True):
-          - lengths: possibly multiple from args.render_font_pattern_lengths
-          - n_rollout_threads is usually 1; selection still uses env_rank mapping
-        """
-        from dataset.FontPatternLoader import FontPatternLoader
-
-        use_render = getattr(self.args, "use_render", False)
-        if use_render:
-            lengths = self._parse_csv_ints(getattr(self.args, "render_font_pattern_lengths", "10"))
-            policy = getattr(self.args, "render_font_pattern_policy", "all")
-            names = self._parse_csv_names(getattr(self.args, "render_font_pattern_names", ""))
-            allow_repeat = True  # render usually uses 1 env, repetition doesn't matter much
-        else:
-            lengths = [int(getattr(self.args, "train_font_pattern_length", 10))]
-            policy = getattr(self.args, "train_font_pattern_policy", "all")
-            names = self._parse_csv_names(getattr(self.args, "train_font_pattern_names", ""))
-            allow_repeat = bool(getattr(self.args, "train_font_pattern_allow_repeat", False))
-
-        env_rank = int(getattr(self.args, "env_rank", 0))
-        threads = int(getattr(self.args, "n_rollout_threads", 1))
-
-        loader = FontPatternLoader(target_lengths=lengths, dataset_dir=getattr(self.args, "font_pattern_dataset_dir", "./dataset"))
-
-        pool_all = []
-        for L in lengths:
-            pool_all.extend(loader.data_store.get(L, []))
-
-        if not pool_all:
-            raise RuntimeError(f"No font patterns loaded for lengths={lengths}.")
-
-        # apply policy filter
-        if policy == "only":
-            if not names:
-                raise RuntimeError("train_font_pattern_policy/render_font_pattern_policy is 'only' but no names provided.")
-            pool_allowed = [p for p in pool_all if p.get("name") in set(names)]
-        else:
-            pool_allowed = list(pool_all)
-
-        if not pool_allowed:
-            raise RuntimeError(f"Font pattern policy '{policy}' produced empty pool. names={names}, lengths={lengths}")
-
-        # must_contain: reorder so required names come first
-        ordered_pool = []
-        used_names = set()
-        if policy == "must_contain":
-            if not names:
-                raise RuntimeError("Font pattern policy 'must_contain' requires non-empty pattern names.")
-
-            required_set = set(names)
-            found_set = {p.get("name") for p in pool_allowed}
-            missing = required_set - found_set
-            if missing:
-                raise RuntimeError(f"Missing required font patterns: {sorted(list(missing))}")
-
-            if len(names) > threads:
-                raise RuntimeError(
-                    f"Not enough env threads (threads={threads}) to include all required patterns (required={names})."
-                )
-
-            for n in names:
-                # pick first matching pattern (names are expected unique in dataset)
-                for p in pool_allowed:
-                    if p.get("name") == n:
-                        ordered_pool.append(p)
-                        used_names.add(n)
-                        break
-
-        # append the rest
-        for p in pool_allowed:
-            n = p.get("name")
-            if n not in used_names:
-                ordered_pool.append(p)
-
-        pattern_count = len(ordered_pool)
-        if threads > pattern_count:
-            allow_repeat = True  # requirement: can repeat when threads exceed patterns
-
-        if not allow_repeat and threads > pattern_count:
-            raise RuntimeError("Repetition disabled but env threads exceed available patterns.")
-
-        if allow_repeat:
-            idx = env_rank % pattern_count
-        else:
-            idx = env_rank
-
-        chosen = ordered_pool[idx]
-        pattern_name = chosen.get("name", "unknown")
-        pattern_coords = chosen.get("coordinates", [])
-
-        if not pattern_coords:
-            raise RuntimeError(f"Chosen font pattern '{pattern_name}' has empty coordinates.")
-
-        if not use_render:
-            print(f"[font-pattern][train] env_rank={env_rank}/{threads-1}, length={lengths[0]}, name={pattern_name}")
-        else:
-            print(f"[font-pattern][render] env_rank={env_rank}, length(s)={lengths}, name={pattern_name}")
-
-        return pattern_name, pattern_coords
+        """Delegate to module-level selector (shared with render.py)."""
+        return select_font_pattern_targets_for_args(self.args, log_selection=True)
 
     def generate_remote_human_position(self):
         for i,human in enumerate(self.humans):
@@ -329,6 +340,158 @@ class EnvCore(object):
         human.set(px, py, -px, -py, 0, 0, 0)
         return human
         
+
+    def _sample_collision_free_robot_starts(self):
+        args = self.args
+        x0, x1 = args.robot_init_x_min, args.robot_init_x_max
+        y0, y1 = args.robot_init_y_min, args.robot_init_y_max
+        margin = args.robot_init_min_separation_margin
+        rr = self.robots[0].radius
+        positions = []
+        for _i in range(self.robot_num):
+            for _ in range(8000):
+                px = float(np.random.uniform(x0, x1))
+                py = float(np.random.uniform(y0, y1))
+                ok = True
+                for (qx, qy) in positions:
+                    if cal_distance(px, py, qx, qy) < 2 * rr + margin:
+                        ok = False
+                        break
+                if ok:
+                    positions.append((px, py))
+                    break
+            else:
+                raise RuntimeError(
+                    "Failed to sample collision-free robot starts; widen robot_init_* bounds or reduce num_agents."
+                )
+        return positions
+
+    def _pack_robot_obs_row(self, robot_index, robot, for_feature):
+        px, py = robot.px, robot.py
+        if not self.dynamic_goal_assignment:
+            return np.array(
+                [
+                    robot.gx - px,
+                    robot.gy - py,
+                    robot.v,
+                    robot.theta,
+                    for_feature,
+                    robot.vx_formation,
+                    robot.vy_formation,
+                    px,
+                    py,
+                ],
+                dtype=np.float32,
+            ).copy()
+        K = self.num_goal_targets
+        N = self.robot_num
+        cx, cy = self.goal_centroid_xy
+        base = [
+            robot.gx - px,
+            robot.gy - py,
+            robot.v,
+            robot.theta,
+            for_feature,
+            robot.vx_formation,
+            robot.vy_formation,
+        ]
+        tail = []
+        for k in range(K):
+            tx, ty = self.goal_positions[k]
+            tail.extend([tx - px, ty - py])
+        for k in range(K):
+            tail.append(1.0 if self.claimed_by[k] >= 0 else 0.0)
+        norm = float(max(1, K - 1))
+        for j in range(N):
+            if j == robot_index:
+                continue
+            tail.append(float(self.robots[j].target_id) / norm)
+        vec = np.array(base + tail + [px, py], dtype=np.float32)
+        assert vec.shape[0] == self.robot_obs_dim + 2
+        return vec
+
+    def _dynamic_path_sync_and_conflict_count(self):
+        self.dynamic_step_travel_sum = 0.0
+        self.dynamic_same_target_conflict_pairs = 0
+        K = self.num_goal_targets
+        d_thr = float(getattr(self.args, "dynamic_same_target_conflict_dist", 2.0))
+        cx, cy = self.goal_centroid_xy
+        for i, robot in enumerate(self.robots):
+            if robot.prev_px is None:
+                robot.prev_px, robot.prev_py = robot.px, robot.py
+            if not (robot.success or robot.collision):
+                self.dynamic_step_travel_sum += cal_distance(
+                    robot.prev_px, robot.prev_py, robot.px, robot.py
+                )
+            robot.prev_px, robot.prev_py = robot.px, robot.py
+        for robot in self.robots:
+            if robot.success or robot.collision:
+                continue
+            tid = int(robot.target_id) % K
+            gx, gy = self.goal_positions[tid]
+            robot.gx, robot.gy = gx, gy
+            robot.for_std = [gx - cx, gy - cy]
+        for i in range(self.robot_num):
+            for j in range(i + 1, self.robot_num):
+                ri, rj = self.robots[i], self.robots[j]
+                if ri.collision or rj.collision:
+                    continue
+                if int(ri.target_id) % K != int(rj.target_id) % K:
+                    continue
+                if cal_distance(ri.px, ri.py, rj.px, rj.py) < d_thr:
+                    self.dynamic_same_target_conflict_pairs += 1
+
+    def _dynamic_process_claims(self):
+        K = self.num_goal_targets
+        candidates = {k: [] for k in range(K)}
+        for i, r in enumerate(self.robots):
+            if r.collision or r.success:
+                continue
+            k = int(r.target_id) % K
+            gx, gy = self.goal_positions[k]
+            if cal_distance(r.px, r.py, gx, gy) <= r.radius:
+                candidates[k].append(i)
+        for k, S in candidates.items():
+            if not S:
+                continue
+            gx, gy = self.goal_positions[k]
+            if len(S) > 1:
+                continue
+            i = S[0]
+            r = self.robots[i]
+            owner = self.claimed_by[k]
+            if owner >= 0 and owner != i and self.robots[owner].success:
+                r.collision = True
+                r.success = False
+                self.dynamic_episode_had_collision = True
+                continue
+            blocked = False
+            for j, o in enumerate(self.robots):
+                if j == i:
+                    continue
+                if cal_distance(o.px, o.py, gx, gy) <= o.radius + 1e-5:
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            if owner >= 0 and owner != i:
+                r.collision = True
+                r.success = False
+                self.dynamic_episode_had_collision = True
+                continue
+            self.claimed_by[k] = i
+            r.success = True
+            r.px, r.py = gx, gy
+            r.v = 0
+            r.vx = 0
+            r.vy = 0
+        if self.dynamic_goal_assignment and all(
+            self.robots[i].success for i in range(self.robot_num)
+        ):
+            if not self.dynamic_episode_had_collision and not self.collision_flag:
+                self.dynamic_formation_success_once = True
+
+
     def reset(self):
         """
         # self.agent_num设定为2个智能体时，返回值为一个list，每个list里面为一个shape = (self.obs_dim, )的观测数据
@@ -414,17 +577,51 @@ class EnvCore(object):
             used_targets = sorted(used_targets, key= lambda target: ((np.arctan(1/np.divide(*(target-centroid))) + (np.pi if (target-centroid)[0]<0 else 0))*2/np.pi+4)%4)
             rel_targets = [(tx - centroid[0], ty - centroid[1]) for (tx, ty) in used_targets]
 
+            rand_pos = None
+            if getattr(self.args, "randomize_robot_initial_positions", False):
+                rand_pos = self._sample_collision_free_robot_starts()
+
+            if self.dynamic_goal_assignment:
+                self.goal_positions = [
+                    (gx + rel_targets[j][0], gy + rel_targets[j][1])
+                    for j in range(len(rel_targets))
+                ]
+                gcx = float(np.mean([p[0] for p in self.goal_positions]))
+                gcy = float(np.mean([p[1] for p in self.goal_positions]))
+                self.goal_centroid_xy = (gcx, gcy)
+                self.num_goal_targets = len(self.goal_positions)
+                K = self.num_goal_targets
+                self.claimed_by = [-1] * K
+                self.dynamic_formation_success_once = False
+                self.dynamic_episode_had_collision = False
+            else:
+                K = len(rel_targets)
+
+            px_cursor, py_cursor = px, py
             for i, robot in enumerate(self.robots):
                 robot.vx_formation = 0
                 robot.vy_formation = 0
-                # 保持原有的 set 起始位置（可按需调整 px,py/gx,gy 的生成策略）
-                robot.set(px, py, gx, gy, 0, 0, np.pi / 2)
-                px += robot.edge*np.cos(2*np.pi*i/10)#(robot.edge / 2) * np.sqrt(3) * (-1) ** n
-                py += robot.edge*np.sin(2*np.pi*i/10)#(robot.edge / 2)
-                # py += robot.edge
-                robot.gx = gx + rel_targets[i][0]#(robot.edge / 2) * np.sqrt(3) * (-1) ** n
-                robot.gy = gy + rel_targets[i][1]#(robot.edge / 2) 
-                # gy += robot.edge
+                if rand_pos is not None:
+                    px_i, py_i = rand_pos[i]
+                else:
+                    px_i, py_i = px_cursor, py_cursor
+                    px_cursor += robot.edge * np.cos(2 * np.pi * i / 10)
+                    py_cursor += robot.edge * np.sin(2 * np.pi * i / 10)
+                if self.dynamic_goal_assignment:
+                    tid = i % K
+                    gxi, gyi = self.goal_positions[tid]
+                    robot.set(px_i, py_i, gxi, gyi, 0, 0, np.pi / 2)
+                    robot.target_id = int(tid)
+                    robot.prev_target_id = int(tid)
+                    robot.target_switched_this_step = False
+                    robot.prev_px = float(px_i)
+                    robot.prev_py = float(py_i)
+                    robot.for_std = [gxi - self.goal_centroid_xy[0], gyi - self.goal_centroid_xy[1]]
+                else:
+                    robot.set(px_i, py_i, gx, gy, 0, 0, np.pi / 2)
+                    robot.gx = gx + rel_targets[i][0]
+                    robot.gy = gy + rel_targets[i][1]
+                    robot.for_std = [rel_targets[i][0], rel_targets[i][1]]
                 n += 1
                 robot.v = 0
                 robot.theta = 0
@@ -432,8 +629,6 @@ class EnvCore(object):
                 robot.id = 0
                 robot.collision = None
                 robot.success = None
-                # 将 for_std 设为相对于质心的目标位置（用于 formation 误差计算）
-                robot.for_std = [rel_targets[i][0], rel_targets[i][1]]
             
             for robot in self.robots:
                 for r in self.robots:
@@ -470,8 +665,7 @@ class EnvCore(object):
             for i,robot in enumerate(self.robots):
                 temp_obs = np.zeros(((1 + max(self.human_num, self.att_agents)), self.obs_dim+2))
                 #TODO formation compute
-                temp_obs[0,:self.robot_obs_dim+2] = \
-                np.array([robot.gx-robot.px, robot.gy-robot.py, robot.v, robot.theta, 0, robot.vx_formation, robot.vy_formation, robot.px, robot.py]).copy()
+                temp_obs[0,:self.robot_obs_dim+2] = self._pack_robot_obs_row(i, robot, 0.0).copy()
 
                 temp_robot_obs.append(
                 np.array([robot.px, robot.py, robot.gx, robot.gy, robot.v, robot.theta, 0, robot.vx_formation, robot.vy_formation]).copy())
@@ -524,7 +718,10 @@ class EnvCore(object):
             human_obs.append(np.array([human.px, human.py, human.vx, human.vy, human.theta]))
         # for i, human_action in enumerate(human_actions):
         #     self.humans[i].step(human_action)
-        
+
+        if self.dynamic_goal_assignment:
+            self._dynamic_path_sync_and_conflict_count()
+
         #for reward calculate
         W = np.zeros((self.robot_num, self.robot_num))
         for i, robot in enumerate(self.robots):
@@ -549,6 +746,8 @@ class EnvCore(object):
                 # print('collision')
                 robot.success = False
                 self.collision_flag = True
+                if self.dynamic_goal_assignment:
+                    self.dynamic_episode_had_collision = True
             else:
                 robot.dmin = robot.dmin - robot.radius - agent.radius
 
@@ -562,6 +761,9 @@ class EnvCore(object):
                         robot.vx_formation -= (robot.px - r.px - (robot.for_std[0] - r.for_std[0]))
                         robot.vy_formation -= (robot.py - r.py - (robot.for_std[1] - r.for_std[1]))
             # print('robot.px,robot.py',robot.px,robot.py)
+
+        if self.dynamic_goal_assignment:
+            self._dynamic_process_claims()
 
         assert W[-1][-2] != 0,'W compute error!'
 
@@ -579,7 +781,10 @@ class EnvCore(object):
         if (self.L_des is None) or (self.L_des.shape != L_hat.shape):
             # Build W_des from current robots' goal positions (gx, gy)
             try:
-                targets = [(r.gx, r.gy) for r in self.robots]
+                if self.dynamic_goal_assignment:
+                    targets = list(self.goal_positions)
+                else:
+                    targets = [(r.gx, r.gy) for r in self.robots]
                 W_des = np.array([[get_weight(tx1, ty1, tx2, ty2) for (tx1, ty1) in targets] for (tx2, ty2) in targets])
                 row_sums_des = np.sum(W_des, axis=1)
                 inv_sqrt_des = np.power(np.where(row_sums_des > 0, row_sums_des, eps), -0.5)
@@ -612,7 +817,12 @@ class EnvCore(object):
 
             sub_agent_done.append(self.get_done(robot))
             sub_agent_info.append(self.get_info(robot))
-        
+
+        if self.dynamic_goal_assignment:
+            self.dynamic_formation_success_once = False
+            for _r in self.robots:
+                _r.target_switched_this_step = False
+
         # sub_agent_reward = [reward] * len(self.robots)
         sub_agent_obs = np.array(sub_agent_obs)
         #for visualize(all step obs)
@@ -645,7 +855,8 @@ class EnvCore(object):
         vx_for = robot.vx_formation
         vy_for = robot.vy_formation
 
-        obs[0,:self.robot_obs_dim+2] = np.array([gx, gy, v, theta, for_feature, vx_for, vy_for, px, py])
+        ri = self.robots.index(robot)
+        obs[0,:self.robot_obs_dim+2] = self._pack_robot_obs_row(ri, robot, for_feature)
         obs_render = np.array([px, py, gx, gy, v, theta, for_feature, vx_for, vy_for])
 
         for human in humans:
@@ -663,10 +874,18 @@ class EnvCore(object):
         return self.reward_calculator.compute_default_reward(robot, for_feature)
     
     def get_done(self,agent):
+        if self.dynamic_goal_assignment:
+            if agent.collision == True:
+                return True
+            if agent.success == True:
+                return True
+            if self.global_time >= self.time_limit:
+                return True
+            return False
         done = False
         if agent.collision == True:
             done = True
-        
+
         if reach_goal(agent):
             done = True
 
@@ -675,7 +894,25 @@ class EnvCore(object):
 
         return done
     
-    def get_info(self,agent):
+    def _attach_reward_terms(self, agent, info):
+        t = getattr(agent, "_reward_terms", None)
+        if t is not None:
+            info.reward_terms = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in t.items()}
+        else:
+            info.reward_terms = {}
+        return info
+
+    def get_info(self, agent):
+        if self.dynamic_goal_assignment:
+            if agent.collision == True:
+                return self._attach_reward_terms(agent, Collision())
+            if self.global_time >= self.time_limit:
+                return self._attach_reward_terms(agent, Timeout())
+            if agent.dmin < agent.discomfort_dist:
+                return self._attach_reward_terms(agent, Danger())
+            if agent.success == True:
+                return self._attach_reward_terms(agent, ReachGoal())
+            return self._attach_reward_terms(agent, Nothing())
         info = Nothing()
         if agent.collision == True:
             info = Collision()
@@ -685,10 +922,10 @@ class EnvCore(object):
 
         if self.global_time >= self.time_limit:
             info = Timeout()
-        
+
         if reach_goal(agent):
             info = ReachGoal()
 
-        return info
+        return self._attach_reward_terms(agent, info)
     
     

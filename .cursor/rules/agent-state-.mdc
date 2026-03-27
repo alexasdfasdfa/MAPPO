@@ -1,0 +1,8 @@
+---
+alwaysApply: true
+---
+
+agent_state_mode: all
+dynamic_target: True
+initial_randomize: True
+num_agents: 15

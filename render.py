@@ -1,6 +1,11 @@
 #!/usr/bin/env python
 import sys
 import os
+
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
 import setproctitle
 import numpy as np
 from pathlib import Path
@@ -10,6 +15,114 @@ import torch
 from config.config import get_config
 
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv
+
+
+def apply_dynamic_goal_obs_dim(all_args):
+    """Match DiscreteActionEnv / training: dynamic mode needs larger robot_obs_dim."""
+    if getattr(all_args, "enable_dynamic_goal_assignment", False):
+        k = int(all_args.num_agents)
+        all_args.robot_obs_dim = 7 + 3 * k + max(0, k - 1)
+
+
+def align_render_args_from_actor_checkpoint(all_args):
+    """
+    Read results/.../models/actor.pt and set enable_dynamic_goal_assignment,
+    num_agents, and robot_obs_dim so the policy matches the checkpoint.
+    """
+    md = Path(str(getattr(all_args, "model_dir", "") or ""))
+    actor_path = md / "actor.pt"
+    if not actor_path.is_file():
+        print(f"[render] auto_align: no {actor_path}, skip")
+        return
+    try:
+        sd = torch.load(actor_path, map_location="cpu")
+    except Exception as e:
+        print(f"[render] auto_align: failed to load actor.pt: {e}")
+        return
+    feat_key = "base_robot.feature_norm.weight"
+    if feat_key not in sd:
+        print("[render] auto_align: unexpected actor layout, skip")
+        return
+    D = int(sd[feat_key].shape[0])
+    third_bias_key = "act.action_outs.2.linear.bias"
+    if third_bias_key in sd:
+        all_args.enable_dynamic_goal_assignment = True
+        K = int(sd[third_bias_key].shape[0])
+        all_args.num_agents = K
+        all_args.robot_obs_dim = 7 + 3 * K + max(0, K - 1)
+        if all_args.robot_obs_dim + 2 != D:
+            print(
+                f"[render] auto_align WARN: ckpt feat dim {D} vs "
+                f"robot_obs_dim+2={all_args.robot_obs_dim + 2} (num_agents={K})"
+            )
+        print(
+            f"[render] auto_align: dynamic goals, num_agents={K}, "
+            f"robot_obs_dim={all_args.robot_obs_dim} (actor input dim {D})"
+        )
+    else:
+        all_args.enable_dynamic_goal_assignment = False
+        all_args.robot_obs_dim = max(7, D - 2)
+        print(
+            f"[render] auto_align: non-dynamic, robot_obs_dim={all_args.robot_obs_dim} "
+            f"(actor input dim {D})"
+        )
+
+
+def _warn_checkpoint_dynamic_goal_head_mismatch(all_args):
+    if not getattr(all_args, "enable_dynamic_goal_assignment", False):
+        return
+    md = Path(str(getattr(all_args, "model_dir", "") or ""))
+    actor_path = md / "actor.pt"
+    if not actor_path.is_file():
+        return
+    try:
+        sd = torch.load(actor_path, map_location="cpu")
+    except Exception:
+        return
+    key = "act.action_outs.2.linear.bias"
+    if key not in sd:
+        return
+    k_ckpt = int(sd[key].shape[0])
+    n = int(all_args.num_agents)
+    if k_ckpt != n:
+        print(
+            f"[render] WARN: checkpoint third-action head K={k_ckpt} != num_agents={n} "
+            f"after nearest_n_radius pattern align; policy load may fail unless K matches."
+        )
+
+
+def align_num_agents_to_font_pattern_if_nearest_n_radius(all_args):
+    """
+    When critic uses nearest_n_radius slots, set num_agents to the selected render
+    pattern's coordinate count (same selection as EnvCore), independent of dynamic_target.
+    Runs after checkpoint auto-align so pattern length overrides ckpt K for env sizing.
+    """
+    if getattr(all_args, "agent_state_mode", "all") != "nearest_n_radius":
+        return
+    from envs.env_core import select_font_pattern_targets_for_args
+
+    saved_rank = int(getattr(all_args, "env_rank", 0))
+    all_args.env_rank = 0
+    try:
+        name, coords = select_font_pattern_targets_for_args(all_args, log_selection=False)
+    finally:
+        all_args.env_rank = saved_rank
+
+    n = len(coords)
+    prev = int(all_args.num_agents)
+    if n != prev:
+        print(
+            f"[render] nearest_n_radius: num_agents {prev} -> {n} "
+            f"(pattern '{name}', {n} coordinates)"
+        )
+    else:
+        print(
+            f"[render] nearest_n_radius: num_agents={n} (pattern '{name}')"
+        )
+    all_args.num_agents = n
+    apply_dynamic_goal_obs_dim(all_args)
+    _warn_checkpoint_dynamic_goal_head_mismatch(all_args)
+
 
 def make_render_env(all_args):
     def get_env_fn(rank):
@@ -29,8 +142,16 @@ def make_render_env(all_args):
 def parser_args(args, parser):
     parser.add_argument('--num_agents', type=int,default=10, help="number of players")
     parser.add_argument("--random_act_prob", type=int, default=0, help="the probability of robot to choice random action")
-    
+    parser.add_argument(
+        "--no_render_auto_align_checkpoint",
+        action="store_true",
+        default=False,
+        help="Disable reading actor.pt to match dynamic goals / num_agents / robot_obs_dim (auto-align is on by default).",
+    )
+
     all_args = parser.parse_known_args(args)[0]
+
+    apply_dynamic_goal_obs_dim(all_args)
 
     return all_args
 
@@ -39,9 +160,9 @@ def main(args):
     parser = get_config()
     all_args = parser_args(args, parser)
     all_args.use_render = True
-    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run1/models'
+    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run4/models'
     all_args.n_rollout_threads = 1
-    all_args.episode_length = 350
+    all_args.episode_length = 500
     all_args.visualize = False
     all_args.render_episodes = 100
     all_args.num_attention_agents = 5
@@ -70,7 +191,13 @@ def main(args):
     assert all_args.use_render, ("u need to set use_render be True")
     assert not (all_args.model_dir == None or all_args.model_dir == ""), ("set model_dir first")
     assert all_args.n_rollout_threads==1, ("only support to use 1 env to render.")
-    
+
+    # After model_dir is set: match checkpoint (dynamic target head + obs dim) unless disabled.
+    if not getattr(all_args, "no_render_auto_align_checkpoint", False):
+        align_render_args_from_actor_checkpoint(all_args)
+    apply_dynamic_goal_obs_dim(all_args)
+    align_num_agents_to_font_pattern_if_nearest_n_radius(all_args)
+
     # cuda
     if all_args.cuda and torch.cuda.is_available():
         print("choose to use gpu...")

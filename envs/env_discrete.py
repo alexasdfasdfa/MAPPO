@@ -14,6 +14,11 @@ class DiscreteActionEnv(gym.Env):
     """
 
     def __init__(self, all_args):
+        if getattr(all_args, "enable_dynamic_goal_assignment", False):
+            k = int(all_args.num_agents)
+            expected = 7 + 3 * k + max(0, k - 1)
+            if int(getattr(all_args, "robot_obs_dim", 7)) < expected:
+                all_args.robot_obs_dim = expected
         self.env = EnvCore(all_args)
         self.random_act_prob = all_args.random_act_prob
 
@@ -47,7 +52,9 @@ class DiscreteActionEnv(gym.Env):
 
             vel_action_space = spaces.Discrete(self.vel_action_dim)
             total_action_space.append(vel_action_space)
-            
+            if self.env.dynamic_goal_assignment:
+                total_action_space.append(spaces.Discrete(self.env.num_goal_targets))
+
             # total action space 
             if len(total_action_space) > 1:
                 # all action spaces are discrete, so simplify to MultiDiscrete action space
@@ -137,20 +144,29 @@ class DiscreteActionEnv(gym.Env):
     #set each robot actions and update positions
     def _set_action(self, action, robot):
         robot.pre_theta = robot.theta
-        for i in range(self.dir_action_dim):
-            if action[0] == i:
-                robot.theta = 2*np.pi / self.dir_action_dim * i
-                # print(robot.id)
-                # print(i, robot.theta)
-        for i in range(self.vel_action_dim):
-            if action[1] == i:
-                # print(i)
-                robot.v = self.base_v * (i + 1)
+        dyn = self.env.dynamic_goal_assignment
+        if dyn and len(action) > 2:
+            k = int(self.env.num_goal_targets)
+            nt = int(np.clip(int(action[2]), 0, k - 1))
+            old = int(getattr(robot, "target_id", 0))
+            robot.target_switched_this_step = nt != old
+            robot.prev_target_id = old
+            robot.target_id = nt
 
-            if reach_goal(robot):
+        for i in range(self.dir_action_dim):
+            if int(action[0]) == i:
+                robot.theta = 2 * np.pi / self.dir_action_dim * i
+        for i in range(self.vel_action_dim):
+            if int(action[1]) == i:
+                robot.v = self.base_v * (i + 1)
+            if not dyn and reach_goal(robot):
                 robot.v = 0
-                if robot.success == None:
+                if robot.success is None:
                     robot.success = True
+
+        if dyn and (robot.success == True or robot.collision == True):
+            robot.v = 0
+            return
 
         robot.px = robot.px + self.time_step * robot.v * np.cos(robot.theta)
         robot.py = robot.py + self.time_step * robot.v * np.sin(robot.theta)

@@ -1,0 +1,20 @@
+/var/spool/slurm/d/job73287/slurm_script: line 10: activate: No such file or directory
+/var/spool/slurm/d/job73287/slurm_script: line 11: cd: MAPPO: No such file or directory
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+u are choosing to use mappo, we set use_recurrent_policy & use_naive_recurrent_policy to be False
+[render] auto_align: dynamic goals, num_agents=15, robot_obs_dim=66 (actor input dim 68)
+choose to use gpu...
+================ Results Saved in run4 ================
+
+成功加载长度 10: 26 个图案。
+初始化完成：内存中可用长度 -> [10]
+[font-pattern][render] env_rank=0, length(s)=[10], name=S
+Traceback (most recent call last):
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 211, in <module>
+    main(sys.argv[1:])
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 192, in main
+    from runner.shared.env_runner import EnvRunner as Runner
+ModuleNotFoundError: No module named 'runner'

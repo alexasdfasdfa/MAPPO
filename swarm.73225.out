@@ -1,0 +1,22 @@
+/var/spool/slurm/d/job73225/slurm_script: line 11: cd: MAPPO: No such file or directory
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+u are choosing to use mappo, we set use_recurrent_policy & use_naive_recurrent_policy to be False
+choose to use gpu...
+================ Results Saved in run8 ================
+
+成功加载长度 10: 26 个图案。
+初始化完成：内存中可用长度 -> [10]
+[font-pattern][render] env_rank=0, length(s)=[10], name=S
+Traceback (most recent call last):
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 150, in <module>
+    main(sys.argv[1:])
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 134, in main
+    runner.render()
+  File "/home/wangdx_lab/cse12211818/.conda/envs/swE2/lib/python3.9/site-packages/torch/utils/_contextlib.py", line 120, in decorate_context
+    return func(*args, **kwargs)
+  File "/home/wangdx_lab/cse12211818/MAPPO/runner/shared/env_runner.py", line 537, in render
+    "dones0": bool(dones[0]) if hasattr(dones, "__getitem__") else None,
+ValueError: The truth value of an array with more than one element is ambiguous. Use a.any() or a.all()

@@ -44,6 +44,100 @@ def get_config():
     parser.add_argument("--vel_action_dim",type=int,default=5,help="dimension of velocity action space")
     parser.add_argument("--dir_action_dim",type=int,default=18,help="dimension of direction action space")
 
+    # Dynamic multi-goal assignment (optional)
+    parser.add_argument(
+        "--enable_dynamic_goal_assignment",
+        action="store_true",
+        default=False,
+        help="Robots choose a discrete target index each step; claims + path-length / conflict shaping rewards.",
+    )
+    parser.add_argument(
+        "--dynamic_same_target_conflict_dist",
+        type=float,
+        default=2.0,
+        help="Same target_id and pairwise distance below this triggers shaping penalty.",
+    )
+    parser.add_argument("--dynamic_path_reward_scale", type=float, default=1.0, help="Scale for -sum(step distances) team term.")
+    parser.add_argument(
+        "--dynamic_same_target_penalty_scale",
+        type=float,
+        default=2.0,
+        help="Scale for same-target proximity penalty (per pair, split across agents).",
+    )
+    parser.add_argument(
+        "--dynamic_target_switch_penalty",
+        type=float,
+        default=0.05,
+        help="Penalty when an agent changes target_id.",
+    )
+    parser.add_argument(
+        "--dynamic_formation_success_bonus",
+        type=float,
+        default=50.0,
+        help="Per-agent bonus when all claimed distinct goals with no episode collision.",
+    )
+
+    # Non-dynamic mode: denser shaping for decentralized / local-obs goal reaching (ignored when dynamic is on)
+    parser.add_argument(
+        "--nd_goal_progress_coef",
+        type=float,
+        default=6.0,
+        help="Scales (pre_dist2goal - dist2goal) before discount_nav (legacy used 5).",
+    )
+    parser.add_argument(
+        "--nd_proximity_reward_scale",
+        type=float,
+        default=0.25,
+        help="Adds scale*exp(-dist2goal/sigma) each step (0 to disable).",
+    )
+    parser.add_argument(
+        "--nd_proximity_sigma",
+        type=float,
+        default=10.0,
+        help="Distance scale for nd_proximity_reward (larger = reward extends farther).",
+    )
+    parser.add_argument(
+        "--nd_heading_reward_scale",
+        type=float,
+        default=0.2,
+        help="Bonus for heading aligned with goal vector, scaled by normalized speed (0 to disable).",
+    )
+    parser.add_argument(
+        "--nd_heading_v_ref",
+        type=float,
+        default=1.0,
+        help="Speed normalization for nd_heading_reward.",
+    )
+    parser.add_argument(
+        "--nd_arrival_reward",
+        type=float,
+        default=4.0,
+        help="Extra r_goal when inside goal disk (any speed); still multiplied by discount_goal.",
+    )
+    parser.add_argument(
+        "--nd_goal_terminal_reward",
+        type=float,
+        default=8.0,
+        help="One-shot bonus the first step the agent enters the goal disk (adds to weighted reward). 0 = legacy (reward 0 every step while in goal).",
+    )
+
+    parser.add_argument(
+        "--randomize_robot_initial_positions",
+        action="store_true",
+        default=True,
+        help="Sample robot starts in a box with minimum separation (dynamic and non-dynamic mode).",
+    )
+    parser.add_argument("--robot_init_x_min", type=float, default=-8.0)
+    parser.add_argument("--robot_init_x_max", type=float, default=8.0)
+    parser.add_argument("--robot_init_y_min", type=float, default=-8.0)
+    parser.add_argument("--robot_init_y_max", type=float, default=8.0)
+    parser.add_argument(
+        "--robot_init_min_separation_margin",
+        type=float,
+        default=0.15,
+        help="Margin beyond r_i+r_j for collision-free init sampling.",
+    )
+
     parser.add_argument(
         "--use_human_obs",
         action="store_false",
@@ -67,7 +161,7 @@ def get_config():
     parser.add_argument(
         "--neighbor_n",
         type=int,
-        default=5,
+        default=10,
         help="Number of neighbour agents to use when agent_state_mode is 'nearest_n' or 'nearest_n_radius'.",
     )
     parser.add_argument(
@@ -236,6 +330,24 @@ def get_config():
         type=int,
         default=5,
         help="time duration between contiunous twice log printing.",
+    )
+    parser.add_argument(
+        "--save_reward_terms",
+        action="store_true",
+        default=True,
+        help="If set, append per-step reward breakdown to logs/reward_terms.csv on the same episodes as TensorBoard (log_interval); use reward_terms_log_stride to subsample steps.",
+    )
+    parser.add_argument(
+        "--reward_terms_max_envs",
+        type=int,
+        default=1,
+        help="When save_reward_terms: only log this many parallel envs (indices 0..N-1).",
+    )
+    parser.add_argument(
+        "--reward_terms_log_stride",
+        type=int,
+        default=1,
+        help="When save_reward_terms: log every k-th env step (1 = every step).",
     )
 
     # eval parameters

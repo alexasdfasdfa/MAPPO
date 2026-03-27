@@ -1,0 +1,31 @@
+/var/spool/slurm/d/job73276/slurm_script: line 10: activate: No such file or directory
+/var/spool/slurm/d/job73276/slurm_script: line 11: cd: MAPPO: No such file or directory
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+u are choosing to use mappo, we set use_recurrent_policy & use_naive_recurrent_policy to be False
+choose to use gpu...
+================ Results Saved in run2 ================
+
+成功加载长度 10: 26 个图案。
+初始化完成：内存中可用长度 -> [10]
+[font-pattern][render] env_rank=0, length(s)=[10], name=S
+Traceback (most recent call last):
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 150, in <module>
+    main(sys.argv[1:])
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 133, in main
+    runner = Runner(config)
+  File "/home/wangdx_lab/cse12211818/MAPPO/runner/shared/env_runner.py", line 25, in __init__
+    super(EnvRunner, self).__init__(config)
+  File "/home/wangdx_lab/cse12211818/MAPPO/runner/shared/base_runner.py", line 76, in __init__
+    self.restore()
+  File "/home/wangdx_lab/cse12211818/MAPPO/runner/shared/base_runner.py", line 134, in restore
+    self.policy.actor.load_state_dict(policy_actor_state_dict)
+  File "/home/wangdx_lab/cse12211818/.conda/envs/swE2/lib/python3.9/site-packages/torch/nn/modules/module.py", line 2624, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for R_Actor:
+	Missing key(s) in state_dict: "act.action_outs.2.linear.weight", "act.action_outs.2.linear.bias". 
+	size mismatch for base_robot.feature_norm.weight: copying a param with shape torch.Size([9]) from checkpoint, the shape in current model is torch.Size([48]).
+	size mismatch for base_robot.feature_norm.bias: copying a param with shape torch.Size([9]) from checkpoint, the shape in current model is torch.Size([48]).
+	size mismatch for base_robot.mlp.fc1.0.weight: copying a param with shape torch.Size([128, 9]) from checkpoint, the shape in current model is torch.Size([128, 48]).
