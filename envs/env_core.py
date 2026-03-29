@@ -185,15 +185,57 @@ class EnvCore(object):
         # font pattern selection (used to set robot goals/formation templates)
         self.pattern_name, self.s_shape_targets = self._select_font_pattern_targets()
 
+        # K == swarm size here; reset() may set len(goal_positions) when dynamic goals are built
+        self.num_goal_targets = self.robot_num
+
         self.dynamic_goal_assignment = bool(getattr(args, "enable_dynamic_goal_assignment", False))
+        self.dynamic_obs_pack_version = str(
+            getattr(args, "dynamic_obs_pack_version", "slots")
+        )
+        self.dynamic_slot_m = 1
+        self.dynamic_vis_radius = float(getattr(args, "dynamic_target_vis_radius", 5.0))
+        if self.dynamic_goal_assignment:
+            if self.dynamic_obs_pack_version == "legacy":
+                self.dynamic_slot_m = self.num_goal_targets
+            else:
+                sc = int(getattr(args, "dynamic_target_slot_count", 10))
+                self.dynamic_slot_m = max(1, min(sc, self.num_goal_targets))
+        self.use_neighbor_attn_actor = (
+            bool(self.dynamic_goal_assignment)
+            and self.dynamic_obs_pack_version != "legacy"
+            and bool(getattr(args, "use_neighbor_attn_lstm_actor", False))
+        )
+        self.actor_neighbor_p = 0
+        if self.use_neighbor_attn_actor:
+            self.actor_neighbor_p = min(
+                int(getattr(args, "actor_neighbor_n", 10)),
+                max(0, self.robot_num - 1),
+            )
+        self.neighbor_actor_feat_dim = 7
+        self.use_attn_comm_actor = bool(getattr(args, "use_attn_comm_actor", False)) and (
+            not self.dynamic_goal_assignment
+        )
+        _nn_def = int(getattr(args, "neighbor_n", 10))
+        _as = getattr(args, "attn_comm_ally_slots", None)
+        _hs = getattr(args, "attn_comm_human_slots", None)
+        self.attn_comm_P = max(0, int(_as if _as is not None else _nn_def))
+        self.attn_comm_H = max(0, int(_hs if _hs is not None else _nn_def))
+        _ar = getattr(args, "attn_comm_radius", None)
+        self.attn_comm_radius = float(
+            _ar if _ar is not None else float(getattr(args, "neighbor_radius", 5.0))
+        )
+        self.attn_comm_msg_dim = max(8, int(getattr(args, "attn_comm_message_dim", 16)))
+        self.agent_broadcast_msg = np.zeros((self.robot_num, self.attn_comm_msg_dim), dtype=np.float32)
+        self.agent_broadcast_msg_prev = np.zeros((self.robot_num, self.attn_comm_msg_dim), dtype=np.float32)
         self.goal_positions = None
         self.claimed_by = None
-        self.num_goal_targets = self.robot_num
         self.goal_centroid_xy = (0.0, 0.0)
         self.dynamic_step_travel_sum = 0.0
         self.dynamic_same_target_conflict_pairs = 0
         self.dynamic_formation_success_once = False
         self.dynamic_episode_had_collision = False
+        self.dynamic_team_dist_sum_prev = None
+        self.dynamic_team_dist_sum_this_step = 0.0
 
     def _select_font_pattern_targets(self):
         """Delegate to module-level selector (shared with render.py)."""
@@ -366,9 +408,94 @@ class EnvCore(object):
                 )
         return positions
 
+    def _pack_robot_obs_row_attn_comm(self, robot_index, robot, for_feature):
+        """Fixed targets: self + in-radius allies/humans (nearest-first, capped by slots) + summary."""
+        px, py = float(robot.px), float(robot.py)
+        theta = float(robot.theta)
+        P, H = self.attn_comm_P, self.attn_comm_H
+        Rc = max(float(self.attn_comm_radius), 1e-6)
+        scale = max(Rc, 1.0)
+        base = [
+            robot.gx - px,
+            robot.gy - py,
+            robot.v,
+            robot.theta,
+            for_feature,
+            robot.vx_formation,
+            robot.vy_formation,
+        ]
+        others = []
+        for j, oj in enumerate(self.robots):
+            if j == robot_index:
+                continue
+            d = float(cal_distance(px, py, oj.px, oj.py))
+            if d > Rc + 1e-9:
+                continue
+            others.append(
+                (
+                    d,
+                    j,
+                    float(oj.px - px) / scale,
+                    float(oj.py - py) / scale,
+                    d / scale,
+                    float(oj.v),
+                    float(np.cos(float(oj.theta) - theta)),
+                    float(np.sin(float(oj.theta) - theta)),
+                )
+            )
+        others.sort(key=lambda t: t[0])
+        ally_feats = []
+        recv_feats = []
+        for idx in range(P):
+            if idx < len(others):
+                t = others[idx]
+                ally_feats.extend(t[2:8])
+                jid = int(t[1])
+                recv_feats.extend(self.agent_broadcast_msg[jid].tolist())
+            else:
+                ally_feats.extend([0.0] * 6)
+                recv_feats.extend([0.0] * self.attn_comm_msg_dim)
+        hum_list = []
+        for human in self.humans:
+            d = float(cal_distance(px, py, human.px, human.py))
+            if d > Rc + 1e-9:
+                continue
+            spd = float(np.hypot(float(human.vx), float(human.vy)))
+            phi = float(np.arctan2(float(human.py) - py, float(human.px) - px))
+            rel_ang = float(np.arctan2(np.sin(phi - theta), np.cos(phi - theta)) / np.pi)
+            hum_list.append(
+                (
+                    d,
+                    float(human.px - px) / scale,
+                    float(human.py - py) / scale,
+                    d / scale,
+                    spd / 2.0,
+                    rel_ang,
+                )
+            )
+        hum_list.sort(key=lambda t: t[0])
+        hum_feats = []
+        for idx in range(H):
+            if idx < len(hum_list):
+                hum_feats.extend(hum_list[idx][1:6])
+            else:
+                hum_feats.extend([0.0] * 5)
+        dmin = float(getattr(robot, "dmin", 1e6))
+        obst = [
+            float(for_feature) / 100.0,
+            min(dmin, 30.0) / 30.0,
+            float(robot.vx_formation),
+            float(robot.vy_formation),
+        ]
+        vec = np.array(base + ally_feats + recv_feats + hum_feats + obst + [px, py], dtype=np.float32)
+        assert vec.shape[0] == self.robot_obs_dim + 2
+        return vec.copy()
+
     def _pack_robot_obs_row(self, robot_index, robot, for_feature):
         px, py = robot.px, robot.py
         if not self.dynamic_goal_assignment:
+            if self.use_attn_comm_actor:
+                return self._pack_robot_obs_row_attn_comm(robot_index, robot, for_feature)
             return np.array(
                 [
                     robot.gx - px,
@@ -385,7 +512,7 @@ class EnvCore(object):
             ).copy()
         K = self.num_goal_targets
         N = self.robot_num
-        cx, cy = self.goal_centroid_xy
+        theta = float(robot.theta)
         base = [
             robot.gx - px,
             robot.gy - py,
@@ -396,16 +523,72 @@ class EnvCore(object):
             robot.vy_formation,
         ]
         tail = []
-        for k in range(K):
-            tx, ty = self.goal_positions[k]
-            tail.extend([tx - px, ty - py])
-        for k in range(K):
-            tail.append(1.0 if self.claimed_by[k] >= 0 else 0.0)
+        if self.dynamic_obs_pack_version == "legacy":
+            for k in range(K):
+                tx, ty = self.goal_positions[k]
+                tail.extend([tx - px, ty - py])
+            for k in range(K):
+                tail.append(1.0 if self.claimed_by[k] >= 0 else 0.0)
+        else:
+            M = self.dynamic_slot_m
+            Rv = self.dynamic_vis_radius
+            dist_idx = []
+            for k in range(K):
+                tx, ty = self.goal_positions[k]
+                dist_idx.append((cal_distance(px, py, tx, ty), k))
+            dist_idx.sort(key=lambda t: t[0])
+            c = float(np.cos(theta))
+            s = float(np.sin(theta))
+            for slot in range(M):
+                _, k = dist_idx[slot]
+                tx, ty = self.goal_positions[k]
+                dx = float(tx - px)
+                dy = float(ty - py)
+                dist = cal_distance(px, py, tx, ty)
+                in_r = 1.0 if float(dist) <= Rv else 0.0
+                if K > 1:
+                    k_norm = float(k) / float(K - 1)
+                else:
+                    k_norm = 0.0
+                bx = c * dx + s * dy
+                by = -s * dx + c * dy
+                claimed = 1.0 if self.claimed_by[k] >= 0 else 0.0
+                tail.extend([in_r, k_norm, bx, by, float(tx), float(ty), claimed])
         norm = float(max(1, K - 1))
-        for j in range(N):
-            if j == robot_index:
-                continue
-            tail.append(float(self.robots[j].target_id) / norm)
+        if self.use_neighbor_attn_actor and self.dynamic_obs_pack_version != "legacy":
+            others = []
+            rvx = float(robot.vx) if robot.vx is not None else 0.0
+            rvy = float(robot.vy) if robot.vy is not None else 0.0
+            rtid = int(robot.target_id) % K
+            for j in range(N):
+                if j == robot_index:
+                    continue
+                oj = self.robots[j]
+                dx = float(oj.px - px)
+                dy = float(oj.py - py)
+                dist = float(cal_distance(px, py, oj.px, oj.py))
+                dist_n = dist / 25.0
+                ovx = float(oj.vx) if oj.vx is not None else 0.0
+                ovy = float(oj.vy) if oj.vy is not None else 0.0
+                tid = int(oj.target_id) % K
+                if K > 1:
+                    tid_n = float(tid) / float(K - 1)
+                else:
+                    tid_n = 0.0
+                same = 1.0 if tid == rtid else 0.0
+                others.append((dist, [dx, dy, dist_n, ovx - rvx, ovy - rvy, tid_n, same]))
+            others.sort(key=lambda t: t[0])
+            P = self.actor_neighbor_p
+            for idx in range(P):
+                if idx < len(others):
+                    tail.extend(others[idx][1])
+                else:
+                    tail.extend([0.0] * self.neighbor_actor_feat_dim)
+        else:
+            for j in range(N):
+                if j == robot_index:
+                    continue
+                tail.append(float(self.robots[j].target_id) / norm)
         vec = np.array(base + tail + [px, py], dtype=np.float32)
         assert vec.shape[0] == self.robot_obs_dim + 2
         return vec
@@ -480,6 +663,15 @@ class EnvCore(object):
                 self.dynamic_episode_had_collision = True
                 continue
             self.claimed_by[k] = i
+            if r.success is not True:
+                gate = int(getattr(self.args, "dynamic_arrival_require_outside_entry", 1)) != 0
+                if not gate:
+                    r.dynamic_just_arrived = True
+                elif r.prev_px is None or r.prev_py is None:
+                    r.dynamic_just_arrived = True
+                else:
+                    prev_d = cal_distance(float(r.prev_px), float(r.prev_py), gx, gy)
+                    r.dynamic_just_arrived = prev_d > r.radius + 1e-6
             r.success = True
             r.px, r.py = gx, gy
             r.v = 0
@@ -491,6 +683,11 @@ class EnvCore(object):
             if not self.dynamic_episode_had_collision and not self.collision_flag:
                 self.dynamic_formation_success_once = True
 
+    def set_comm_broadcasts(self, msgs):
+        """Last-step intent vectors per robot; shape (robot_num, attn_comm_msg_dim)."""
+        arr = np.asarray(msgs, dtype=np.float32).reshape(self.robot_num, self.attn_comm_msg_dim)
+        np.copyto(self.agent_broadcast_msg_prev, self.agent_broadcast_msg)
+        np.copyto(self.agent_broadcast_msg, arr)
 
     def reset(self):
         """
@@ -498,6 +695,8 @@ class EnvCore(object):
         # When self.agent_num is set to 2 agents, the return value is a list, each list contains a shape = (self.obs_dim, ) observation data
         """
         self.robots = [Robot(self.args) for i in range(self.robot_num)]
+        self.agent_broadcast_msg.fill(0.0)
+        self.agent_broadcast_msg_prev.fill(0.0)
         self.total_obs = []
         # print('env has reset!')
         if self.robots is None:
@@ -629,12 +828,24 @@ class EnvCore(object):
                 robot.id = 0
                 robot.collision = None
                 robot.success = None
+                robot.dynamic_just_arrived = False
+                robot.dynamic_hold_target_steps = 0
+                robot.dynamic_hold_at_switch = 0
             
             for robot in self.robots:
                 for r in self.robots:
                     if robot != r:
                         robot.vx_formation -= (robot.px - r.px - (robot.for_std[0] - r.for_std[0]))
                         robot.vy_formation -= (robot.py - r.py - (robot.for_std[1] - r.for_std[1]))
+
+            if self.dynamic_goal_assignment:
+                _td0 = 0.0
+                for _r in self.robots:
+                    if _r.collision is True:
+                        continue
+                    _td0 += float(cal_distance(_r.px, _r.py, _r.gx, _r.gy))
+                self.dynamic_team_dist_sum_prev = _td0
+                self.dynamic_team_dist_sum_this_step = _td0
             
             # W = (np.ones((self.robot_num, self.robot_num)) - np.eye(self.robot_num)) * self.for_edge
             
@@ -807,6 +1018,14 @@ class EnvCore(object):
             robot.pre_dist2goal = robot.dist2goal
             robot.dist2goal = cal_distance(robot.px,robot.py,robot.gx,robot.gy)
 
+        if self.dynamic_goal_assignment:
+            _td = 0.0
+            for _r in self.robots:
+                if _r.collision is True:
+                    continue
+                _td += float(cal_distance(_r.px, _r.py, _r.gx, _r.gy))
+            self.dynamic_team_dist_sum_this_step = _td
+
         self.global_time += self.time_step
         reward = 0
         for i, robot in enumerate(self.robots):
@@ -819,9 +1038,11 @@ class EnvCore(object):
             sub_agent_info.append(self.get_info(robot))
 
         if self.dynamic_goal_assignment:
+            self.dynamic_team_dist_sum_prev = self.dynamic_team_dist_sum_this_step
             self.dynamic_formation_success_once = False
             for _r in self.robots:
                 _r.target_switched_this_step = False
+                _r.dynamic_just_arrived = False
 
         # sub_agent_reward = [reward] * len(self.robots)
         sub_agent_obs = np.array(sub_agent_obs)

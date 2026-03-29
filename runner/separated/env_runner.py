@@ -166,7 +166,9 @@ class EnvRunner(Runner):
 
         for agent_id in range(self.num_robots):
             self.trainer[agent_id].prep_rollout()
-            value, action, action_log_prob, rnn_state, rnn_state_critic = self.trainer[agent_id].policy.get_actions(
+            value, action, action_log_prob, rnn_state, rnn_state_critic, _, _ = self.trainer[
+                agent_id
+            ].policy.get_actions(
                 self.buffer[agent_id].share_obs[step],
                 self.buffer[agent_id].robot_obs[step],
                 self.buffer[agent_id].human_obs[step],

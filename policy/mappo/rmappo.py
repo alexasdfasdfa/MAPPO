@@ -105,9 +105,9 @@ class RMAPPO():
         :return actor_grad_norm: (torch.Tensor) gradient norm from actor update.
         :return imp_weights: (torch.Tensor) importance sampling weights.
         """
-        share_obs_batch, robot_obs_batch, human_obs_batch, rnn_states_batch, rnn_states_critic_batch, actions_batch, \
-        value_preds_batch, return_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, \
-        adv_targ, available_actions_batch = sample
+        share_obs_batch, robot_obs_batch, human_obs_batch, rnn_states_batch, rnn_states_critic_batch, \
+        comm_rnn_states_batch, actions_batch, value_preds_batch, return_batch, masks_batch, active_masks_batch, \
+        old_action_log_probs_batch, adv_targ, available_actions_batch = sample
 
         old_action_log_probs_batch = check(old_action_log_probs_batch).to(**self.tpdv)
         adv_targ = check(adv_targ).to(**self.tpdv)
@@ -116,15 +116,19 @@ class RMAPPO():
         active_masks_batch = check(active_masks_batch).to(**self.tpdv)
 
         # Reshape to do in a single forward pass for all steps
-        values, action_log_probs, dist_entropy = self.policy.evaluate_actions(share_obs_batch,
-                                                                              robot_obs_batch,
-                                                                              human_obs_batch,
-                                                                              rnn_states_batch,
-                                                                              rnn_states_critic_batch,
-                                                                              actions_batch,
-                                                                              masks_batch,
-                                                                              available_actions_batch,
-                                                                              active_masks_batch)
+        comm_arg = None if comm_rnn_states_batch is None else check(comm_rnn_states_batch).to(**self.tpdv)
+        values, action_log_probs, dist_entropy = self.policy.evaluate_actions(
+            share_obs_batch,
+            robot_obs_batch,
+            human_obs_batch,
+            rnn_states_batch,
+            rnn_states_critic_batch,
+            actions_batch,
+            masks_batch,
+            available_actions_batch,
+            active_masks_batch,
+            comm_rnn_states_actor=comm_arg,
+        )
         # actor update
         imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
 

@@ -7,6 +7,8 @@ from policy.mappo.utils.mlp import MLPBase
 from policy.mappo.utils.rnn import RNNLayer
 from policy.mappo.utils.act import ACTLayer
 from policy.mappo.utils.lstm import LSTMLayer
+from policy.mappo.utils.neighbor_attn_lstm import NeighborSelfAttnLSTM
+from policy.mappo.utils.attn_comm_encoder import AttnCommActorEncoder
 from policy.mappo.utils.popart import PopArt
 from policy.utils.util import get_shape_from_obs_space
 from policy.mappo.utils.util import transform
@@ -39,8 +41,51 @@ class R_Actor(nn.Module):
         self.robot_obs_shape = args.robot_obs_dim + 2
         self.human_obs_shape = args.human_obs_dim
 
+        self.use_attn_comm = bool(getattr(args, "use_attn_comm_actor", False)) and not getattr(
+            args, "enable_dynamic_goal_assignment", False
+        )
+        self.use_neighbor_attn = (
+            bool(
+                getattr(args, "use_neighbor_attn_lstm_actor", False)
+                and getattr(args, "enable_dynamic_goal_assignment", False)
+            )
+            and not self.use_attn_comm
+        )
+        k_ag = int(args.num_agents)
+        self.slot_m_for_actor = min(
+            max(int(getattr(args, "dynamic_target_slot_count", 1)), 1),
+            k_ag,
+        )
+        self.neighbor_p_actor = min(
+            int(getattr(args, "actor_neighbor_n", 10)),
+            max(0, k_ag - 1),
+        )
+        self.ego_mlp_dim = 7 + 7 * self.slot_m_for_actor + 2
+
         base = MLPBase
-        self.base_robot = base(args, self.robot_obs_shape)
+        if self.use_attn_comm:
+            self.attn_comm_encoder = AttnCommActorEncoder(args)
+            self.comm_state_dim = int(self.attn_comm_encoder.state_dim)
+            self.base_robot = None
+            self.neighbor_branch = None
+        elif self.use_neighbor_attn:
+            self.base_robot = base(args, self.ego_mlp_dim)
+            nh = max(1, min(4, self.hidden_size // 32))
+            while self.hidden_size % nh != 0 and nh > 1:
+                nh -= 1
+            self.neighbor_branch = NeighborSelfAttnLSTM(
+                feat_dim=7,
+                embed_dim=self.hidden_size,
+                hidden_size=self.hidden_size,
+                n_heads=nh,
+                lstm_layers=self._recurrent_N,
+            )
+            self.attn_comm_encoder = None
+        else:
+            self.base_robot = base(args, self.robot_obs_shape)
+            self.neighbor_branch = None
+            self.attn_comm_encoder = None
+
         self.base_human = base(args) # Used to make the order of magnitude of both robot_feature and human_feature
 
         self.lstm = LSTMLayer(self.human_obs_shape, self.hidden_size, self._recurrent_N)
@@ -51,7 +96,16 @@ class R_Actor(nn.Module):
 
         self.to(device)
 
-    def forward(self, robot_obs, human_obs, rnn_states, masks, available_actions=None, deterministic=False):
+    def forward(
+        self,
+        robot_obs,
+        human_obs,
+        rnn_states,
+        masks,
+        available_actions=None,
+        deterministic=False,
+        comm_rnn_states=None,
+    ):
         """
         Compute actions from the given inputs.
         :param obs: (np.ndarray / torch.Tensor) observation inputs into network.[batch, obs_dim]
@@ -80,8 +134,35 @@ class R_Actor(nn.Module):
             # when human observations are disabled, use a zero vector as the human branch feature
             human_features = torch.zeros((robot_obs.shape[0], self.hidden_size), device=robot_obs.device, dtype=robot_obs.dtype)
 
-        robot_obs = robot_obs[:,:self.robot_obs_shape]
-        actor_features = self.base_robot(robot_obs)
+        robot_obs = robot_obs[:, : self.robot_obs_shape]
+        if self.use_attn_comm:
+            B = robot_obs.shape[0]
+            if comm_rnn_states is None:
+                comm_rnn_states = torch.zeros(B, self.comm_state_dim, device=robot_obs.device, dtype=robot_obs.dtype)
+            else:
+                comm_rnn_states = check(comm_rnn_states).to(**self.tpdv)
+            actor_features, comm_out, broadcast_msg = self.attn_comm_encoder(
+                robot_obs, comm_rnn_states, masks
+            )
+        elif self.neighbor_branch is not None:
+            ego = torch.cat(
+                (
+                    robot_obs[:, : 7 + 7 * self.slot_m_for_actor],
+                    robot_obs[:, -2:],
+                ),
+                dim=1,
+            )
+            if self.neighbor_p_actor > 0:
+                s = 7 + 7 * self.slot_m_for_actor
+                nb = robot_obs[:, s : s + self.neighbor_p_actor * 7].reshape(
+                    -1, self.neighbor_p_actor, 7
+                )
+                n_out = self.neighbor_branch(nb)
+            else:
+                n_out = robot_obs.new_zeros(robot_obs.shape[0], self.hidden_size)
+            actor_features = self.base_robot(ego) + n_out
+        else:
+            actor_features = self.base_robot(robot_obs)
         total_features = torch.cat((actor_features,human_features), dim=1)  #[thread 128]
 
         # if self._use_naive_recurrent_policy or self._use_recurrent_policy:
@@ -89,9 +170,21 @@ class R_Actor(nn.Module):
 
         actions, action_log_probs = self.act(total_features, available_actions, deterministic)
 
-        return actions, action_log_probs, rnn_states
+        if self.use_attn_comm:
+            return actions, action_log_probs, rnn_states, comm_out, broadcast_msg
+        return actions, action_log_probs, rnn_states, None, None
 
-    def evaluate_actions(self, robot_obs, human_obs, rnn_states, action, masks, available_actions=None, active_masks=None):
+    def evaluate_actions(
+        self,
+        robot_obs,
+        human_obs,
+        rnn_states,
+        action,
+        masks,
+        available_actions=None,
+        active_masks=None,
+        comm_rnn_states=None,
+    ):
         """
         Compute log probability and entropy of given actions.
         :param obs: (torch.Tensor) observation inputs into network.
@@ -123,8 +216,33 @@ class R_Actor(nn.Module):
         else:
             human_features = torch.zeros((robot_obs.shape[0], self.hidden_size), device=robot_obs.device, dtype=robot_obs.dtype)
 
-        robot_obs = robot_obs[:,:self.robot_obs_shape]
-        actor_features = self.base_robot(robot_obs)
+        robot_obs = robot_obs[:, : self.robot_obs_shape]
+        if self.use_attn_comm:
+            B = robot_obs.shape[0]
+            if comm_rnn_states is None:
+                comm_rnn_states = torch.zeros(B, self.comm_state_dim, device=robot_obs.device, dtype=robot_obs.dtype)
+            else:
+                comm_rnn_states = check(comm_rnn_states).to(**self.tpdv)
+            actor_features, _, _ = self.attn_comm_encoder(robot_obs, comm_rnn_states, masks)
+        elif self.neighbor_branch is not None:
+            ego = torch.cat(
+                (
+                    robot_obs[:, : 7 + 7 * self.slot_m_for_actor],
+                    robot_obs[:, -2:],
+                ),
+                dim=1,
+            )
+            if self.neighbor_p_actor > 0:
+                s = 7 + 7 * self.slot_m_for_actor
+                nb = robot_obs[:, s : s + self.neighbor_p_actor * 7].reshape(
+                    -1, self.neighbor_p_actor, 7
+                )
+                n_out = self.neighbor_branch(nb)
+            else:
+                n_out = robot_obs.new_zeros(robot_obs.shape[0], self.hidden_size)
+            actor_features = self.base_robot(ego) + n_out
+        else:
+            actor_features = self.base_robot(robot_obs)
         total_features = torch.cat((actor_features,human_features), dim=1)
 
         # if self._use_naive_recurrent_policy or self._use_recurrent_policy:

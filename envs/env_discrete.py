@@ -2,6 +2,12 @@ import gym
 from gym import spaces
 import numpy as np
 from envs.env_core import EnvCore
+from config.config import (
+    compute_attn_comm_robot_obs_dim,
+    compute_dynamic_robot_obs_dim,
+    compute_dynamic_robot_obs_dim_legacy_full_k,
+    resolve_attn_comm_args,
+)
 import configparser
 from .multi_discrete import MultiDiscrete
 from envs.utils.utils import reach_goal
@@ -14,9 +20,34 @@ class DiscreteActionEnv(gym.Env):
     """
 
     def __init__(self, all_args):
+        if getattr(all_args, "use_attn_comm_actor", False):
+            if getattr(all_args, "enable_dynamic_goal_assignment", False):
+                raise ValueError(
+                    "use_attn_comm_actor requires fixed (pre-assigned) targets; "
+                    "disable --enable_dynamic_goal_assignment."
+                )
+            resolve_attn_comm_args(all_args)
+            exp = compute_attn_comm_robot_obs_dim(
+                int(all_args.attn_comm_ally_slots),
+                int(all_args.attn_comm_human_slots),
+                message_dim=int(getattr(all_args, "attn_comm_message_dim", 16)),
+            )
+            if int(getattr(all_args, "robot_obs_dim", 7)) != exp:
+                all_args.robot_obs_dim = exp
         if getattr(all_args, "enable_dynamic_goal_assignment", False):
             k = int(all_args.num_agents)
-            expected = 7 + 3 * k + max(0, k - 1)
+            ver = getattr(all_args, "dynamic_obs_pack_version", "slots")
+            if ver == "legacy":
+                expected = compute_dynamic_robot_obs_dim_legacy_full_k(k)
+            else:
+                expected = compute_dynamic_robot_obs_dim(
+                    k,
+                    int(getattr(all_args, "dynamic_target_slot_count", 1)),
+                    use_neighbor_attn_lstm_actor=bool(
+                        getattr(all_args, "use_neighbor_attn_lstm_actor", False)
+                    ),
+                    actor_neighbor_n=int(getattr(all_args, "actor_neighbor_n", 10)),
+                )
             if int(getattr(all_args, "robot_obs_dim", 7)) < expected:
                 all_args.robot_obs_dim = expected
         self.env = EnvCore(all_args)
@@ -131,6 +162,9 @@ class DiscreteActionEnv(gym.Env):
                 robot.py += robot.vy * self.time_step
             return self.env.step()
 
+    def set_comm_broadcasts(self, msgs):
+        self.env.set_comm_broadcasts(msgs)
+
     def reset(self):
         obs = self.env.reset()
         return obs
@@ -152,6 +186,11 @@ class DiscreteActionEnv(gym.Env):
             robot.target_switched_this_step = nt != old
             robot.prev_target_id = old
             robot.target_id = nt
+            if robot.target_switched_this_step:
+                robot.dynamic_hold_at_switch = int(getattr(robot, "dynamic_hold_target_steps", 0))
+                robot.dynamic_hold_target_steps = 0
+            else:
+                robot.dynamic_hold_target_steps = int(getattr(robot, "dynamic_hold_target_steps", 0)) + 1
 
         for i in range(self.dir_action_dim):
             if int(action[0]) == i:

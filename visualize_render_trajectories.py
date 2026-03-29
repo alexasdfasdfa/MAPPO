@@ -3,8 +3,10 @@
 Build one multi-agent trajectory GIF per episode from render coord logs.
 
 Reads:  <repo>/results/render/run{n}/coords/coords_agent*.txt,
-        run{n}/episode_meta.jsonl (pattern, lengths, per-agent goals; optional for old runs)
-Writes: <cwd>/fig/render/n/{ep_id}.gif  (all agents + hollow goal markers when meta exists)
+        run{n}/episode_meta.jsonl (pattern, goals; dynamic runs add goal_positions + target_ids_by_step)
+Writes: <cwd>/fig/render/n/{ep_id}.gif
+        Dynamic: colors follow current target_id (shared palette over K slots); rings match that target.
+        Static: ring at goal slot k uses palette[k]; agent i uses palette[i % K]. Coords files sorted by agent id (not lexicographic).
 
 Example:
   python visualize_render_trajectories.py 13
@@ -22,12 +24,38 @@ import imageio.v2 as imageio
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parent
+
+
+def target_slot_colors(num_slots: int) -> np.ndarray:
+    """
+    RGBA (K, 4): one deterministic color per target slot id 0..K-1.
+    Dynamic: trajectory/dot/ring use color[target_ids_by_step[t,i]].
+    Static: ring at slot k uses color[k]; agent i uses color[i % K]. No meta: K=A, same as i % K.
+    """
+    k = max(int(num_slots), 0)
+    if k == 0:
+        return np.zeros((0, 4), dtype=np.float64)
+    cmap = getattr(plt.cm, "turbo", None) or plt.cm.hsv
+    return cmap(np.linspace(0.0, 0.95, k, endpoint=True))
+
+
+def _coords_files_in_agent_order(coords_dir: Path) -> list[Path]:
+    """Numeric order: 0,1,2,...,10,... not lexicographic (0,1,10,2,...)."""
+    pat = re.compile(r"coords_agent(\d+)\.txt$")
+    found: list[tuple[int, Path]] = []
+    for p in coords_dir.glob("coords_agent*.txt"):
+        m = pat.search(p.name)
+        if m:
+            found.append((int(m.group(1)), p))
+    found.sort(key=lambda x: x[0])
+    return [p for _, p in found]
 
 
 def _parse_meta_header(line: str) -> int | None:
@@ -107,7 +135,7 @@ def _parse_episode_line(line: str) -> tuple[int, np.ndarray] | None:
 
 
 def load_agent_trajectories(coords_dir: Path) -> tuple[int | None, list[tuple[int, np.ndarray]]]:
-    files = sorted(coords_dir.glob("coords_agent*.txt"))
+    files = _coords_files_in_agent_order(coords_dir)
     if not files:
         raise FileNotFoundError(f"No coords_agent*.txt under {coords_dir}")
 
@@ -195,11 +223,21 @@ def render_all_agents_gif(
     stride: int,
     dpi: int,
     duration: float,
-    colors: np.ndarray,
     episode_meta: dict | None,
     header_fallback: dict | None,
+    target_colors: np.ndarray,
+    K: int,
+    use_dynamic_goals: bool,
+    goal_positions: np.ndarray | None = None,
+    target_ids_by_step: np.ndarray | None = None,
+    static_goals: list | None = None,
 ) -> None:
-    """traj: (T, A, 2); colors: (A, 4) RGBA from colormap."""
+    """
+    traj: (T, A, 2).
+    target_colors: (K, 4) RGBA — color for target slot id in [0, K).
+    Dynamic: each frame agent i uses target_colors[target_ids_by_step[t, i] % K]; ring follows same tid.
+    Static: ring at static_goals[k] uses target_colors[k]; agent i uses target_colors[i % K].
+    """
     T, A, _ = traj.shape
     indices = list(range(0, T, max(stride, 1)))
     if indices[-1] != T - 1:
@@ -226,14 +264,33 @@ def render_all_agents_gif(
         y=0.98,
     )
 
-    goals = None
-    if episode_meta and isinstance(episode_meta.get("agent_goals"), list):
-        goals = episode_meta["agent_goals"]
-    if goals:
-        for i, g in enumerate(goals):
+    K = max(int(K), 1)
+    if target_colors.shape[0] < K:
+        raise ValueError(f"target_colors rows {target_colors.shape[0]} < K={K}")
+
+    goal_scats: list = []
+    if use_dynamic_goals:
+        assert goal_positions is not None and target_ids_by_step is not None
+        for i in range(A):
+            tid0 = int(target_ids_by_step[0, i]) % K
+            gx, gy = float(goal_positions[tid0, 0]), float(goal_positions[tid0, 1])
+            hex_t = mcolors.to_hex(target_colors[tid0])
+            gsc = ax.scatter(
+                [gx],
+                [gy],
+                s=130,
+                facecolors="none",
+                edgecolors=hex_t,
+                linewidths=2.0,
+                zorder=4,
+            )
+            goal_scats.append(gsc)
+    elif static_goals:
+        for k, g in enumerate(static_goals):
             if len(g) < 2:
                 continue
-            hex_c = matplotlib.colors.to_hex(colors[i % A])
+            kk = k % K
+            hex_c = mcolors.to_hex(target_colors[kk])
             ax.scatter(
                 [float(g[0])],
                 [float(g[1])],
@@ -247,7 +304,12 @@ def render_all_agents_gif(
     lines = []
     scats = []
     for i in range(A):
-        hex_c = matplotlib.colors.to_hex(colors[i])
+        tid_init = (
+            int(target_ids_by_step[0, i]) % K
+            if use_dynamic_goals and target_ids_by_step is not None
+            else (i % K)
+        )
+        hex_c = mcolors.to_hex(target_colors[tid_init])
         (ln,) = ax.plot([], [], color=hex_c, linewidth=1.4, alpha=0.88)
         sc = ax.scatter(
             [],
@@ -268,6 +330,22 @@ def render_all_agents_gif(
             seg = traj[: t + 1, i, :]
             lines[i].set_data(seg[:, 0], seg[:, 1])
             scats[i].set_offsets(seg[-1:])
+            if use_dynamic_goals and target_ids_by_step is not None and goal_positions is not None:
+                tid = int(target_ids_by_step[t, i]) % K
+                hex_t = mcolors.to_hex(target_colors[tid])
+                lines[i].set_color(hex_t)
+                scats[i].set_facecolors([hex_t])
+            else:
+                hex_s = mcolors.to_hex(target_colors[i % K])
+                lines[i].set_color(hex_s)
+                scats[i].set_facecolors([hex_s])
+        if use_dynamic_goals and goal_scats:
+            assert goal_positions is not None and target_ids_by_step is not None
+            for i in range(A):
+                tid = int(target_ids_by_step[t, i]) % K
+                gx, gy = float(goal_positions[tid, 0]), float(goal_positions[tid, 1])
+                goal_scats[i].set_offsets(np.array([[gx, gy]]))
+                goal_scats[i].set_edgecolors([mcolors.to_hex(target_colors[tid])])
         title_artist.set_text(
             f"episode {episode_id}  |  steps 0–{t} / {T - 1}  |  agents 0..{A - 1}"
         )
@@ -343,11 +421,44 @@ def main() -> None:
     for ep_id, traj in to_run:
         T, A, _ = traj.shape
         ep_meta = meta_by_ep.get(ep_id)
-        extra = None
+        bounds_extras: list[np.ndarray] = []
         if ep_meta and isinstance(ep_meta.get("agent_goals"), list):
-            extra = np.array(ep_meta["agent_goals"], dtype=np.float64)
-        bounds = _axis_bounds(traj, extra_xy=extra)
-        colors = plt.cm.tab10(np.linspace(0, 1, max(A, 10)))[:A]
+            bounds_extras.append(
+                np.asarray(ep_meta["agent_goals"], dtype=np.float64).reshape(-1, 2)
+            )
+
+        goal_positions = None
+        target_ids_by_step = None
+        use_dynamic = False
+        static_goals: list | None = None
+        if (
+            ep_meta
+            and ep_meta.get("dynamic_target")
+            and isinstance(ep_meta.get("goal_positions"), list)
+            and isinstance(ep_meta.get("target_ids_by_step"), list)
+        ):
+            gp = np.asarray(ep_meta["goal_positions"], dtype=np.float64)
+            tid = np.asarray(ep_meta["target_ids_by_step"], dtype=np.int64)
+            if gp.ndim == 2 and gp.shape[1] == 2 and tid.shape == (T, A):
+                goal_positions = gp
+                target_ids_by_step = tid
+                use_dynamic = True
+                bounds_extras.append(gp)
+
+        if use_dynamic:
+            K = int(goal_positions.shape[0])
+            target_colors = target_slot_colors(K)
+        elif ep_meta and isinstance(ep_meta.get("agent_goals"), list) and ep_meta["agent_goals"]:
+            static_goals = ep_meta["agent_goals"]
+            K = len(static_goals)
+            target_colors = target_slot_colors(K)
+        else:
+            K = max(A, 1)
+            target_colors = target_slot_colors(K)
+            static_goals = None
+
+        extra_xy = np.vstack(bounds_extras) if bounds_extras else None
+        bounds = _axis_bounds(traj, extra_xy=extra_xy)
         out_path = out_dir / f"{ep_id}.gif"
         render_all_agents_gif(
             traj,
@@ -357,9 +468,14 @@ def main() -> None:
             stride=args.stride,
             dpi=args.dpi,
             duration=args.duration,
-            colors=colors,
             episode_meta=ep_meta,
             header_fallback=header_fallback if ep_meta is None else None,
+            target_colors=target_colors,
+            K=K,
+            use_dynamic_goals=use_dynamic,
+            goal_positions=goal_positions,
+            target_ids_by_step=target_ids_by_step,
+            static_goals=static_goals if not use_dynamic else None,
         )
         print(f"Wrote {out_path} ({A} agents, {T} steps)")
 

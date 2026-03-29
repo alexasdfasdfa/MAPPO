@@ -1,0 +1,119 @@
+/var/spool/slurm/d/job73401/slurm_script: line 10: activate: No such file or directory
+/var/spool/slurm/d/job73401/slurm_script: line 11: cd: MAPPO: No such file or directory
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+u are choosing to use mappo, we set use_recurrent_policy & use_naive_recurrent_policy to be False
+[render] auto_align: dynamic goals (M=10 slots + neighbor P=0), num_agents=10, robot_obs_dim=77
+[render] auto_align: actor input dim 79, robot_obs_dim=77
+成功加载长度 10: 26 个图案。
+初始化完成：内存中可用长度 -> [10]
+[render] nearest_n_radius: num_agents=10 (pattern 'S')
+choose to use gpu...
+================ Results Saved in run10 ================
+
+成功加载长度 10: 26 个图案。
+初始化完成：内存中可用长度 -> [10]
+[font-pattern][render] env_rank=0, length(s)=[10], name=S
+average episode rewards is: -221549.21339475884
+average episode rewards is: -506.7324902686354
+average episode rewards is: -135851.200086073
+average episode rewards is: -168566.045977937
+average episode rewards is: -408050.60097080155
+average episode rewards is: -63527.66205710512
+average episode rewards is: -308148.5142039935
+average episode rewards is: -4729.611285560907
+average episode rewards is: -371834.29086983344
+average episode rewards is: -275552.8935485925
+average episode rewards is: -159481.11699269636
+average episode rewards is: -207230.7353610107
+average episode rewards is: -177692.31128269865
+average episode rewards is: -233187.98422019772
+average episode rewards is: -225667.26847667116
+average episode rewards is: -96730.13764597845
+average episode rewards is: -279637.0631877249
+average episode rewards is: -133923.74277487904
+average episode rewards is: -62950.56354716474
+average episode rewards is: -151348.36586248738
+average episode rewards is: -100329.2534342728
+average episode rewards is: -167932.88471864283
+average episode rewards is: -166249.07020046868
+average episode rewards is: -126759.60764140585
+average episode rewards is: -299410.5328835993
+average episode rewards is: -209591.684686151
+average episode rewards is: -105086.14130541561
+average episode rewards is: -133844.79021835257
+average episode rewards is: -140001.24420879202
+average episode rewards is: -113502.17941318886
+average episode rewards is: -1317.825260174105
+average episode rewards is: -230794.05287633976
+average episode rewards is: -180676.38122252605
+average episode rewards is: -267321.95405667194
+average episode rewards is: -204009.77799172566
+average episode rewards is: -460766.9406198451
+average episode rewards is: -80842.88250872595
+average episode rewards is: -1763.6398185023413
+average episode rewards is: -156696.51375855715
+average episode rewards is: -227967.1013936125
+average episode rewards is: -315331.8190184598
+average episode rewards is: -82649.64388722382
+average episode rewards is: -245267.1428667571
+average episode rewards is: -364346.14400190953
+average episode rewards is: -452376.0199870821
+average episode rewards is: -167113.85865398543
+average episode rewards is: -408205.10884779063
+average episode rewards is: -256245.15356024803
+average episode rewards is: -75150.12013403482
+average episode rewards is: -182934.49123410002
+average episode rewards is: -150641.95188518372
+average episode rewards is: -100468.02775312739
+average episode rewards is: -2914.236387439266
+average episode rewards is: -409386.7757396988
+average episode rewards is: -142065.42382938974
+average episode rewards is: -172846.55860319245
+average episode rewards is: -283452.79117013514
+average episode rewards is: -91741.429246598
+average episode rewards is: -277574.0971508143
+average episode rewards is: -294840.92177919217
+average episode rewards is: -193119.33555909194
+average episode rewards is: -161244.80164733622
+average episode rewards is: -151101.89501436363
+average episode rewards is: -23452.74178997532
+average episode rewards is: -139450.51949533733
+average episode rewards is: -193737.4654568091
+average episode rewards is: -189683.20877487637
+average episode rewards is: -261180.3059991242
+average episode rewards is: -55168.02375993484
+average episode rewards is: -255813.0878002111
+average episode rewards is: -213607.20236047957
+average episode rewards is: -133272.2997723015
+average episode rewards is: -575.9645178107387
+average episode rewards is: -234857.70906735925
+average episode rewards is: -282034.72777505446
+average episode rewards is: -157658.6660661775
+average episode rewards is: -1693.6353447983117
+average episode rewards is: -189559.31616189153
+average episode rewards is: -160203.85840267118
+average episode rewards is: -121492.21993381684
+average episode rewards is: -212509.76619674134
+average episode rewards is: -412224.4450892034
+average episode rewards is: -2041.320308151176
+average episode rewards is: -245726.58604732188
+average episode rewards is: -140879.6780361614
+average episode rewards is: -487473.69522471615
+average episode rewards is: -337135.259972097
+average episode rewards is: -179950.7017253758
+average episode rewards is: -153031.17646611342
+average episode rewards is: -724.2177382670072
+average episode rewards is: -114317.80577702235
+average episode rewards is: -278345.27728534845
+average episode rewards is: -244630.28575468095
+average episode rewards is: -93187.02762151582
+average episode rewards is: -47249.433285891144
+average episode rewards is: -1346.8330301129004
+average episode rewards is: -426.98147261714786
+average episode rewards is: -80930.71300067769
+average episode rewards is: -136289.1751996919
+average episode rewards is: -146026.8354045115
+accomplish test,test episode: 100

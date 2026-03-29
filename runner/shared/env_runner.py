@@ -32,21 +32,67 @@ REWARD_TERMS_CSV_COLUMNS = (
     "r_goal_raw",
     "r_bonus_raw",
     "c_formation",
+    "formation_time_w",
     "c_avoid",
     "c_nav",
     "c_goal",
     "reward_shaped",
+    "r_attn_comm_raw",
+    "c_attn_comm",
+    "attn_comm_align",
+    "attn_comm_diversity",
+    "attn_comm_smooth_term",
     "nd_terminal_tr",
     "nd_tr_applied",
     "goal_entered_from_outside",
     "goal_flag",
     "shared_team",
+    "dynamic_team_dist_now",
+    "dynamic_team_dist_delta",
+    "r_prox_raw",
+    "r_arrive_raw",
+    "c_prox",
+    "dynamic_conflict_weighted",
+    "dynamic_crowding_sq",
+    "c_dynamic_crowding",
+    "dynamic_switch_near_goal_extra",
+    "dynamic_nav_scale",
+    "r_explore_undervisible_raw",
+    "dynamic_explore_shortfall",
+    "dynamic_explore_n_in_view",
+    "dynamic_explore_align",
+    "dynamic_explore_density_mult",
+    "dynamic_local_neighbors",
+    "dynamic_sparse_urgency_mult",
+    "r_claimed_target_raw",
+    "c_claimed_target",
+    "c_explore_undervisible",
+    "dynamic_in_reciprocal_swap",
+    "r_reciprocal_swap_raw",
+    "c_reciprocal_swap",
+    "dynamic_goal_contention_excess",
+    "c_goal_contention",
     "reward_final",
 )
 
 
 def _t2n(x):
     return x.detach().cpu().numpy()
+
+
+def _comm_broadcasts_to_env_shape(broadcast_msg, n_rollout_threads, num_agents):
+    """
+    Actor returns (n_envs * n_agents, msg_dim). VecEnv / EnvCore expect
+    (n_envs, n_agents, msg_dim) so SubprocVecEnv can send one slice per worker.
+    """
+    b = np.asarray(broadcast_msg, dtype=np.float32)
+    if b.ndim == 3:
+        return b
+    if b.ndim == 2 and b.shape[0] == n_rollout_threads * num_agents:
+        return b.reshape(n_rollout_threads, num_agents, b.shape[1])
+    if b.ndim == 2 and n_rollout_threads == 1:
+        return b[np.newaxis, ...]
+    return b
 
 
 class EnvRunner(Runner):
@@ -139,7 +185,19 @@ class EnvRunner(Runner):
                         rnn_states,
                         rnn_states_critic,
                         actions_env,
+                        broadcast_msg,
+                        comm_rnn_out,
                     ) = self.collect(step)
+
+                    if (
+                        getattr(self.all_args, "use_attn_comm_actor", False)
+                        and broadcast_msg is not None
+                        and hasattr(self.envs, "set_comm_broadcasts")
+                    ):
+                        b = _comm_broadcasts_to_env_shape(
+                            broadcast_msg, self.n_rollout_threads, self.num_agents
+                        )
+                        self.envs.set_comm_broadcasts(b)
 
                     # Obser reward and next obs
                     obs, rewards, dones, infos = self.envs.step(actions_env)
@@ -155,6 +213,7 @@ class EnvRunner(Runner):
                         action_log_probs,
                         rnn_states,
                         rnn_states_critic,
+                        comm_rnn_out,
                     )
 
                     # insert data into buffer
@@ -234,6 +293,8 @@ class EnvRunner(Runner):
 
         self.buffer.share_obs[0] = share_obs.copy()
         self.buffer.obs[0] = obs.copy()
+        if self.buffer.comm_rnn_states is not None:
+            self.buffer.comm_rnn_states[0].fill(0.0)
 
     @torch.no_grad()
     def collect(self, step):
@@ -261,12 +322,17 @@ class EnvRunner(Runner):
         else:
             human_obs = np.zeros((n_envs * n_agents, 0, human_obs_dim), dtype=np.float32)
         self.trainer.prep_rollout()
+        comm_flat = None
+        if self.buffer.comm_rnn_states is not None:
+            comm_flat = np.concatenate(self.buffer.comm_rnn_states[step])
         (
             value,
             action,
             action_log_prob,
             rnn_states,
             rnn_states_critic,
+            comm_rnn_out,
+            broadcast_msg,
         ) = self.trainer.policy.get_actions(
             np.concatenate(self.buffer.share_obs[step]),
             robot_obs,
@@ -276,6 +342,7 @@ class EnvRunner(Runner):
             np.concatenate(self.buffer.rnn_states[step]),
             np.concatenate(self.buffer.rnn_states_critic[step]),
             np.concatenate(self.buffer.masks[step]),
+            comm_rnn_states_actor=comm_flat,
         )
         # [self.envs, agents, dim]
         values = np.array(np.split(_t2n(value), self.n_rollout_threads))  # [env_num, agent_num, 1]
@@ -289,6 +356,10 @@ class EnvRunner(Runner):
         rnn_states_critic = np.array(
             np.split(_t2n(rnn_states_critic), self.n_rollout_threads)
         )  # [env_num, agent_num, 1, hidden_size]
+        bm = _t2n(broadcast_msg) if broadcast_msg is not None else None
+        cr = None
+        if self.buffer.comm_rnn_states is not None:
+            cr = np.array(np.split(_t2n(comm_rnn_out), self.n_rollout_threads))
         # rearrange action
         if self.envs.action_space[0].__class__.__name__ == "MultiDiscrete":
             # actions shape: [n_envs, num_agents, dims]
@@ -310,6 +381,8 @@ class EnvRunner(Runner):
             rnn_states,
             rnn_states_critic,
             actions_env,
+            bm,
+            cr,
         )
 
     def insert(self, data):
@@ -323,6 +396,7 @@ class EnvRunner(Runner):
             action_log_probs,
             rnn_states,
             rnn_states_critic,
+            comm_rnn_out,
         ) = data
 
         rnn_states[dones == True] = np.zeros(
@@ -333,6 +407,12 @@ class EnvRunner(Runner):
             ((dones == True).sum(), *self.buffer.rnn_states_critic.shape[3:]),
             dtype=np.float32,
         )
+        if self.buffer.comm_rnn_states is not None and comm_rnn_out is not None:
+            comm_rnn_out = np.asarray(comm_rnn_out, dtype=np.float32)
+            comm_rnn_out[dones == True] = np.zeros(
+                ((dones == True).sum(), self.buffer.comm_state_dim),
+                dtype=np.float32,
+            )
         masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
         masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
 
@@ -352,6 +432,7 @@ class EnvRunner(Runner):
             values,
             rewards,
             masks,
+            comm_rnn_states_actor=comm_rnn_out if self.buffer.comm_rnn_states is not None else None,
         )
 
     # @torch.no_grad()
@@ -501,6 +582,14 @@ class EnvRunner(Runner):
                         [float(r.gx), float(r.gy)] for r in core_env.robots
                     ],
                 }
+                if getattr(core_env, "dynamic_goal_assignment", False) and getattr(
+                    core_env, "goal_positions", None
+                ):
+                    episode_meta_record["dynamic_target"] = True
+                    episode_meta_record["goal_positions"] = [
+                        [float(x), float(y)]
+                        for (x, y) in core_env.goal_positions
+                    ]
             except Exception:
                 pass
             if self.all_args.save_gifs:
@@ -518,17 +607,40 @@ class EnvRunner(Runner):
                 ),
                 dtype=np.float32,
             )
+            rnn_states_critic = np.zeros_like(rnn_states)
             masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+            comm_rnn = None
+            if getattr(self.all_args, "use_attn_comm_actor", False):
+                comm_rnn = np.zeros(
+                    (
+                        self.n_rollout_threads,
+                        self.num_agents,
+                        int(self.trainer.policy.actor.comm_state_dim),
+                    ),
+                    dtype=np.float32,
+                )
 
             episode_rewards = []
             # buffer to store (px, py) per step: shape = (episode_length, n_envs, num_agents, 2)
             episode_coords = np.zeros((self.episode_length, self.n_rollout_threads, self.num_agents, 2), dtype=np.float32)
             episode_succes = np.zeros((self.episode_length, self.n_rollout_threads, self.num_agents, 1))
+            target_ids_trace = []
 
             for step in range(self.episode_length):
                 calc_start = time.time()
 
                 self.trainer.prep_rollout()
+                try:
+                    _ce = self.envs.env.env
+                    if getattr(_ce, "dynamic_goal_assignment", False) and getattr(
+                        _ce, "goal_positions", None
+                    ):
+                        _K = max(1, int(getattr(_ce, "num_goal_targets", 1)))
+                        target_ids_trace.append(
+                            [int(r.target_id) % _K for r in _ce.robots]
+                        )
+                except Exception:
+                    pass
                 # Split obs into robot-local and human observations (same convention as collect())
                 obs_raw = obs  # shape: (n_rollout_threads, num_agents, R, C)
                 n_envs = self.n_rollout_threads
@@ -553,15 +665,45 @@ class EnvRunner(Runner):
                 else:
                     render_human_obs = np.zeros((n_envs * n_agents, 0, human_obs_dim), dtype=np.float32)
 
-                action, rnn_states = self.trainer.policy.act(
+                if self.use_centralized_V:
+                    share_obs = obs.reshape(self.n_rollout_threads, -1)
+                    share_obs = np.expand_dims(share_obs, 1).repeat(self.num_agents, axis=1)
+                else:
+                    share_obs = obs
+                cent_flat = np.concatenate(share_obs)
+                comm_flat = np.concatenate(comm_rnn) if comm_rnn is not None else None
+                (
+                    _v,
+                    action,
+                    _lp,
+                    rnn_states,
+                    rnn_states_critic,
+                    comm_rnn_next,
+                    bm,
+                ) = self.trainer.policy.get_actions(
+                    cent_flat,
                     render_robot_obs,
                     render_human_obs,
                     np.concatenate(rnn_states),
+                    np.concatenate(rnn_states_critic),
                     np.concatenate(masks),
                     deterministic=True,
+                    comm_rnn_states_actor=comm_flat,
                 )
                 actions = np.array(np.split(_t2n(action), self.n_rollout_threads))
                 rnn_states = np.array(np.split(_t2n(rnn_states), self.n_rollout_threads))
+                rnn_states_critic = np.array(np.split(_t2n(rnn_states_critic), self.n_rollout_threads))
+                if comm_rnn is not None:
+                    comm_rnn = np.array(np.split(_t2n(comm_rnn_next), self.n_rollout_threads))
+                if (
+                    bm is not None
+                    and getattr(self.all_args, "use_attn_comm_actor", False)
+                    and hasattr(self.envs, "set_comm_broadcasts")
+                ):
+                    b = _comm_broadcasts_to_env_shape(
+                        _t2n(bm), self.n_rollout_threads, self.num_agents
+                    )
+                    self.envs.set_comm_broadcasts(b)
 
                 if envs.action_space[0].__class__.__name__ == "MultiDiscrete":
                     actions_env = actions[0] if self.n_rollout_threads == 1 else actions
@@ -583,8 +725,17 @@ class EnvRunner(Runner):
                     ((dones == True).sum(), self.recurrent_N, self.hidden_size),
                     dtype=np.float32,
                 )
+                rnn_states_critic[dones == True] = np.zeros(
+                    ((dones == True).sum(), self.recurrent_N, self.hidden_size),
+                    dtype=np.float32,
+                )
                 masks = np.ones((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
                 masks[dones == True] = np.zeros(((dones == True).sum(), 1), dtype=np.float32)
+                if comm_rnn is not None:
+                    comm_rnn[dones == True] = np.zeros(
+                        ((dones == True).sum(), int(self.trainer.policy.actor.comm_state_dim)),
+                        dtype=np.float32,
+                    )
 
                 if self.all_args.save_gifs:
                     image = envs.render("rgb_array")[0][0]
@@ -615,6 +766,10 @@ class EnvRunner(Runner):
                     f.write(line)
 
             if episode_meta_record is not None:
+                if episode_meta_record.get("dynamic_target") and len(target_ids_trace) == int(
+                    self.episode_length
+                ):
+                    episode_meta_record["target_ids_by_step"] = target_ids_trace
                 with open(meta_path, "a", encoding="utf-8") as mf:
                     mf.write(
                         json.dumps(episode_meta_record, ensure_ascii=False) + "\n"

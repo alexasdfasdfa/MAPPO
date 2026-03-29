@@ -48,8 +48,18 @@ class RMAPPOPolicy:
         update_linear_schedule(self.actor_optimizer, episode, episodes, self.lr)
         update_linear_schedule(self.critic_optimizer, episode, episodes, self.critic_lr)
 
-    def get_actions(self, cent_obs, robot_obs, human_obs, rnn_states_actor, rnn_states_critic, masks, available_actions=None,
-                    deterministic=False):
+    def get_actions(
+        self,
+        cent_obs,
+        robot_obs,
+        human_obs,
+        rnn_states_actor,
+        rnn_states_critic,
+        masks,
+        available_actions=None,
+        deterministic=False,
+        comm_rnn_states_actor=None,
+    ):
         """
         Compute actions and value function predictions for the given inputs.
         :param cent_obs (np.ndarray): centralized input to the critic.
@@ -67,15 +77,18 @@ class RMAPPOPolicy:
         :return rnn_states_actor: (torch.Tensor) updated actor network RNN states.
         :return rnn_states_critic: (torch.Tensor) updated critic network RNN states.
         """
-        actions, action_log_probs, rnn_states_actor = self.actor(robot_obs,
-                                                                 human_obs,
-                                                                 rnn_states_actor,
-                                                                 masks,
-                                                                 available_actions,
-                                                                 deterministic)
+        actions, action_log_probs, rnn_states_actor, comm_rnn_out, broadcast_msg = self.actor(
+            robot_obs,
+            human_obs,
+            rnn_states_actor,
+            masks,
+            available_actions,
+            deterministic,
+            comm_rnn_states=comm_rnn_states_actor,
+        )
 
         values, rnn_states_critic = self.critic(cent_obs, rnn_states_critic, masks)
-        return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic
+        return values, actions, action_log_probs, rnn_states_actor, rnn_states_critic, comm_rnn_out, broadcast_msg
 
     def get_values(self, cent_obs, rnn_states_critic, masks):
         """
@@ -89,8 +102,19 @@ class RMAPPOPolicy:
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         return values
 
-    def evaluate_actions(self, cent_obs, robot_obs, human_obs, rnn_states_actor, rnn_states_critic, action, masks,
-                         available_actions=None, active_masks=None):
+    def evaluate_actions(
+        self,
+        cent_obs,
+        robot_obs,
+        human_obs,
+        rnn_states_actor,
+        rnn_states_critic,
+        action,
+        masks,
+        available_actions=None,
+        active_masks=None,
+        comm_rnn_states_actor=None,
+    ):
         """
         Get action logprobs / entropy and value function predictions for actor update.
         :param cent_obs (np.ndarray): centralized input to the critic.
@@ -108,18 +132,22 @@ class RMAPPOPolicy:
         :return dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
         """
         #耗时约1s
-        action_log_probs, dist_entropy = self.actor.evaluate_actions(robot_obs, 
-                                                                     human_obs,
-                                                                     rnn_states_actor,
-                                                                     action,
-                                                                     masks,
-                                                                     available_actions,
-                                                                     active_masks)
+        action_log_probs, dist_entropy = self.actor.evaluate_actions(
+            robot_obs,
+            human_obs,
+            rnn_states_actor,
+            action,
+            masks,
+            available_actions,
+            active_masks,
+            comm_rnn_states=comm_rnn_states_actor,
+        )
 
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         return values, action_log_probs, dist_entropy
 
-    def act(self, robot_obs, human_obs, rnn_states_actor, masks, available_actions=None, deterministic=False):
+    def act(self, robot_obs, human_obs, rnn_states_actor, masks, available_actions=None, deterministic=False,
+            comm_rnn_states_actor=None):
         """
         Compute actions using the given inputs.
         :param obs (np.ndarray): local agent inputs to the actor.
@@ -129,5 +157,13 @@ class RMAPPOPolicy:
                                   (if None, all actions available)
         :param deterministic: (bool) whether the action should be mode of distribution or should be sampled.
         """
-        actions, _, rnn_states_actor = self.actor(robot_obs, human_obs, rnn_states_actor, masks, available_actions, deterministic)
+        actions, _, rnn_states_actor, _, _ = self.actor(
+            robot_obs,
+            human_obs,
+            rnn_states_actor,
+            masks,
+            available_actions,
+            deterministic,
+            comm_rnn_states=comm_rnn_states_actor,
+        )
         return actions, rnn_states_actor

@@ -12,16 +12,37 @@ from pathlib import Path
 
 import torch
 
-from config.config import get_config
+from config.config import (
+    get_config,
+    resolve_attn_comm_args,
+    resolve_dynamic_target_reasoning_args,
+    compute_attn_comm_robot_obs_dim,
+    compute_dynamic_robot_obs_dim,
+    compute_dynamic_robot_obs_dim_legacy_full_k,
+    infer_dynamic_pack_from_actor_feat_dim,
+)
 
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv
 
 
 def apply_dynamic_goal_obs_dim(all_args):
     """Match DiscreteActionEnv / training: dynamic mode needs larger robot_obs_dim."""
+    if getattr(all_args, "use_attn_comm_actor", False):
+        return
     if getattr(all_args, "enable_dynamic_goal_assignment", False):
         k = int(all_args.num_agents)
-        all_args.robot_obs_dim = 7 + 3 * k + max(0, k - 1)
+        ver = getattr(all_args, "dynamic_obs_pack_version", "slots")
+        if ver == "legacy":
+            all_args.robot_obs_dim = compute_dynamic_robot_obs_dim_legacy_full_k(k)
+        else:
+            all_args.robot_obs_dim = compute_dynamic_robot_obs_dim(
+                k,
+                int(getattr(all_args, "dynamic_target_slot_count", 1)),
+                use_neighbor_attn_lstm_actor=bool(
+                    getattr(all_args, "use_neighbor_attn_lstm_actor", False)
+                ),
+                actor_neighbor_n=int(getattr(all_args, "actor_neighbor_n", 10)),
+            )
 
 
 def align_render_args_from_actor_checkpoint(all_args):
@@ -40,6 +61,28 @@ def align_render_args_from_actor_checkpoint(all_args):
         print(f"[render] auto_align: failed to load actor.pt: {e}")
         return
     feat_key = "base_robot.feature_norm.weight"
+    if feat_key not in sd and "attn_comm_encoder.embed_self.weight" in sd:
+        all_args.use_attn_comm_actor = True
+        all_args.enable_dynamic_goal_assignment = False
+        P = int(sd["attn_comm_encoder._attn_comm_p"].item())
+        H = int(sd["attn_comm_encoder._attn_comm_h"].item())
+        K = int(getattr(all_args, "num_agents", 10))
+        Mkey = "attn_comm_encoder.embed_recv.weight"
+        M = int(sd[Mkey].shape[1]) if Mkey in sd else int(getattr(all_args, "attn_comm_message_dim", 16))
+        all_args.attn_comm_message_dim = M
+        d_emb = int(sd["attn_comm_encoder.embed_self.weight"].shape[0])
+        hs = int(getattr(all_args, "hidden_size", d_emb))
+        if d_emb != hs:
+            all_args.attn_comm_hidden_dim = d_emb
+        rod = compute_attn_comm_robot_obs_dim(P, H, message_dim=M)
+        all_args.attn_comm_ally_slots = P
+        all_args.attn_comm_human_slots = H
+        all_args.robot_obs_dim = rod
+        print(
+            f"[render] auto_align: attn_comm actor (fixed targets) P={P} H={H} "
+            f"num_agents={K} robot_obs_dim={rod}"
+        )
+        return
     if feat_key not in sd:
         print("[render] auto_align: unexpected actor layout, skip")
         return
@@ -49,15 +92,55 @@ def align_render_args_from_actor_checkpoint(all_args):
         all_args.enable_dynamic_goal_assignment = True
         K = int(sd[third_bias_key].shape[0])
         all_args.num_agents = K
-        all_args.robot_obs_dim = 7 + 3 * K + max(0, K - 1)
+        pref_m = int(getattr(all_args, "dynamic_target_slot_count", K))
+        pack, m_slot, p_nbr, rod = infer_dynamic_pack_from_actor_feat_dim(
+            D, K, preferred_slot_m=pref_m
+        )
+        if pack is None:
+            print(
+                f"[render] auto_align WARN: feat dim {D} does not match known dynamic layouts "
+                f"(K={K}); using current slot-based dim from args (load may fail)."
+            )
+            all_args.dynamic_obs_pack_version = "slots"
+            all_args.robot_obs_dim = compute_dynamic_robot_obs_dim(
+                K,
+                int(getattr(all_args, "dynamic_target_slot_count", 1)),
+                use_neighbor_attn_lstm_actor=bool(
+                    getattr(all_args, "use_neighbor_attn_lstm_actor", False)
+                ),
+                actor_neighbor_n=int(getattr(all_args, "actor_neighbor_n", 10)),
+            )
+        elif pack == "legacy":
+            all_args.dynamic_obs_pack_version = "legacy"
+            all_args.use_neighbor_attn_lstm_actor = False
+            all_args.robot_obs_dim = rod
+            print(f"[render] auto_align: dynamic goals (legacy full-K obs), num_agents={K}")
+        elif pack == "slots_attn":
+            all_args.dynamic_obs_pack_version = "slots"
+            all_args.use_neighbor_attn_lstm_actor = True
+            all_args.dynamic_target_slot_count = int(m_slot)
+            all_args.actor_neighbor_n = int(p_nbr)
+            all_args.robot_obs_dim = rod
+            print(
+                f"[render] auto_align: dynamic goals (M={m_slot} slots + neighbor P={p_nbr}), "
+                f"num_agents={K}, robot_obs_dim={rod}"
+            )
+        else:
+            all_args.dynamic_obs_pack_version = "slots"
+            all_args.use_neighbor_attn_lstm_actor = False
+            all_args.dynamic_target_slot_count = int(m_slot)
+            all_args.robot_obs_dim = rod
+            print(
+                f"[render] auto_align: dynamic goals (M={m_slot} slots), num_agents={K}, "
+                f"robot_obs_dim={rod}"
+            )
         if all_args.robot_obs_dim + 2 != D:
             print(
                 f"[render] auto_align WARN: ckpt feat dim {D} vs "
                 f"robot_obs_dim+2={all_args.robot_obs_dim + 2} (num_agents={K})"
             )
         print(
-            f"[render] auto_align: dynamic goals, num_agents={K}, "
-            f"robot_obs_dim={all_args.robot_obs_dim} (actor input dim {D})"
+            f"[render] auto_align: actor input dim {D}, robot_obs_dim={all_args.robot_obs_dim}"
         )
     else:
         all_args.enable_dynamic_goal_assignment = False
@@ -150,6 +233,20 @@ def parser_args(args, parser):
     )
 
     all_args = parser.parse_known_args(args)[0]
+    resolve_dynamic_target_reasoning_args(all_args)
+    if getattr(all_args, "use_attn_comm_actor", False):
+        resolve_attn_comm_args(all_args)
+        all_args.robot_obs_dim = compute_attn_comm_robot_obs_dim(
+            int(all_args.attn_comm_ally_slots),
+            int(all_args.attn_comm_human_slots),
+            message_dim=int(getattr(all_args, "attn_comm_message_dim", 16)),
+        )
+    if getattr(all_args, "enable_dynamic_goal_assignment", False):
+        all_args.use_neighbor_attn_lstm_actor = not getattr(
+            all_args, "disable_neighbor_attn_lstm_actor", False
+        )
+    else:
+        all_args.use_neighbor_attn_lstm_actor = False
 
     apply_dynamic_goal_obs_dim(all_args)
 
@@ -160,7 +257,7 @@ def main(args):
     parser = get_config()
     all_args = parser_args(args, parser)
     all_args.use_render = True
-    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run4/models'
+    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run49/models'
     all_args.n_rollout_threads = 1
     all_args.episode_length = 500
     all_args.visualize = False
@@ -195,6 +292,8 @@ def main(args):
     # After model_dir is set: match checkpoint (dynamic target head + obs dim) unless disabled.
     if not getattr(all_args, "no_render_auto_align_checkpoint", False):
         align_render_args_from_actor_checkpoint(all_args)
+    if getattr(all_args, "use_attn_comm_actor", False):
+        resolve_attn_comm_args(all_args)
     apply_dynamic_goal_obs_dim(all_args)
     align_num_agents_to_font_pattern_if_nearest_n_radius(all_args)
 

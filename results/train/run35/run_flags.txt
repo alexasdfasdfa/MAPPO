@@ -1,0 +1,12 @@
+agent_state_mode: nearest_n_radius
+dynamic_target: False
+initial_randomize: True
+num_agents: 10
+neighbor_n: 10
+neighbor_radius: 5.0
+use_attn_comm_actor: True
+attn_comm_radius: 5.0
+attn_comm_ally_slots: 10
+attn_comm_human_slots: 10
+attn_comm_reward_coef: 0.0 (w_align=1.0, w_div=0.25, w_smooth=0.08)
+num_mini_batch: 400

@@ -12,7 +12,14 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 # import rvo2
-from config.config import get_config          
+from config.config import (
+    get_config,
+    resolve_attn_comm_args,
+    resolve_attn_comm_ppo_batch_args,
+    resolve_dynamic_target_reasoning_args,
+    compute_attn_comm_robot_obs_dim,
+    compute_dynamic_robot_obs_dim,
+)
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv
 
 """Train script for MPEs."""
@@ -65,6 +72,7 @@ def parser_args(args, parser):
     parser.add_argument("--random_act_prob", type=int, default=0, help="the probability of robot to choice random action")
 
     all_args = parser.parse_known_args(args)[0]
+    resolve_dynamic_target_reasoning_args(all_args)
 
     # Match swarm size to font-pattern length bucket (config --train_font_pattern_length).
     _pat_len = int(getattr(all_args, "train_font_pattern_length", 10))
@@ -73,9 +81,39 @@ def parser_args(args, parser):
         print(f"[train] num_agents {_prev_n} -> {_pat_len} (aligned to train_font_pattern_length)")
     all_args.num_agents = _pat_len
 
+    if getattr(all_args, "use_attn_comm_actor", False):
+        if getattr(all_args, "enable_dynamic_goal_assignment", False):
+            raise ValueError(
+                "use_attn_comm_actor requires fixed (pre-assigned) targets; "
+                "disable --enable_dynamic_goal_assignment."
+            )
+        resolve_attn_comm_args(all_args)
+        all_args.robot_obs_dim = compute_attn_comm_robot_obs_dim(
+            int(all_args.attn_comm_ally_slots),
+            int(all_args.attn_comm_human_slots),
+            message_dim=int(getattr(all_args, "attn_comm_message_dim", 16)),
+        )
+        resolve_attn_comm_ppo_batch_args(all_args)
+
     if getattr(all_args, "enable_dynamic_goal_assignment", False):
         k = int(all_args.num_agents)
-        all_args.robot_obs_dim = 7 + 3 * k + max(0, k - 1)
+        all_args.dynamic_obs_pack_version = getattr(all_args, "dynamic_obs_pack_version", "slots")
+        all_args.use_neighbor_attn_lstm_actor = not getattr(
+            all_args, "disable_neighbor_attn_lstm_actor", False
+        )
+        all_args.robot_obs_dim = compute_dynamic_robot_obs_dim(
+            k,
+            int(all_args.dynamic_target_slot_count),
+            use_neighbor_attn_lstm_actor=bool(all_args.use_neighbor_attn_lstm_actor),
+            actor_neighbor_n=int(all_args.actor_neighbor_n),
+        )
+        if all_args.use_neighbor_attn_lstm_actor:
+            print(
+                f"[train] actor neighbor self-attn+LSTM: P={min(int(all_args.actor_neighbor_n), max(0, k - 1))} "
+                f"nearest teammates (slot_m={min(max(int(all_args.dynamic_target_slot_count), 1), k)})"
+            )
+    else:
+        all_args.use_neighbor_attn_lstm_actor = False
 
     return all_args
 
@@ -88,7 +126,10 @@ def main(args):
     all_args.n_rollout_threads = 200
     all_args.episode_length = 400
     all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 1200
-    all_args.num_mini_batch = 10
+    # PPO: mini_batch_size = (n_rollout_threads * episode_length * num_agents) / num_mini_batch.
+    # Too few mini-batches => huge CUDA batches and OOM (e.g. 10 -> ~80k samples/step on 200x400x10).
+    # Slightly fewer splits than 400 => larger per-GPU minibatch (stabler grads for formation shaping).
+    all_args.num_mini_batch = 400
     all_args.save_interval = 1
     all_args.log_interval = 1
     all_args.model_dir = None
@@ -153,6 +194,33 @@ def main(args):
         _nn = int(getattr(all_args, "neighbor_n", 5))
         _nr = float(getattr(all_args, "neighbor_radius", 5.0))
         _notes += f"neighbor_n: {_nn}\nneighbor_radius: {_nr}\n"
+    if _dyn:
+        _notes += (
+            f"dynamic_target_slot_count: {int(getattr(all_args, 'dynamic_target_slot_count', 0))}\n"
+            f"dynamic_target_vis_radius: {float(getattr(all_args, 'dynamic_target_vis_radius', 0.0))}\n"
+            f"use_neighbor_attn_lstm_actor: {bool(getattr(all_args, 'use_neighbor_attn_lstm_actor', False))}\n"
+            f"actor_neighbor_n: {int(getattr(all_args, 'actor_neighbor_n', 0))}\n"
+            f"dynamic_discount_formation: {float(getattr(all_args, 'dynamic_discount_formation', 0.0))}\n"
+            f"formation_time_weight: {float(getattr(all_args, 'formation_time_weight_start', 1.0))}"
+            f" -> {float(getattr(all_args, 'formation_time_weight_end', 1.0))}\n"
+            f"dynamic_arrival_require_outside_entry: {int(getattr(all_args, 'dynamic_arrival_require_outside_entry', 1))}\n"
+            f"dynamic_crowding_dist/penalty: {float(getattr(all_args, 'dynamic_crowding_dist', 0.0))}"
+            f" / {float(getattr(all_args, 'dynamic_crowding_penalty_scale', 0.0))}\n"
+            f"dynamic_cluster_same_target_boost: {float(getattr(all_args, 'dynamic_cluster_same_target_boost', 1.0))}\n"
+            f"dynamic_explore_undervisible_scale: {float(getattr(all_args, 'dynamic_explore_undervisible_scale', 0.0))}\n"
+            f"dynamic_reciprocal_swap_reward_scale: {float(getattr(all_args, 'dynamic_reciprocal_swap_reward_scale', 0.0))}\n"
+            f"dynamic_goal_contention_penalty_scale: {float(getattr(all_args, 'dynamic_goal_contention_penalty_scale', 0.0))}\n"
+            f"dynamic_claimed_target_penalty_scale: {float(getattr(all_args, 'dynamic_claimed_target_penalty_scale', 0.0))}\n"
+        )
+    if bool(getattr(all_args, "use_attn_comm_actor", False)):
+        _notes += (
+            f"use_attn_comm_actor: True\n"
+            f"attn_comm_radius: {float(getattr(all_args, 'attn_comm_radius', 0.0))}\n"
+            f"attn_comm_ally_slots: {int(getattr(all_args, 'attn_comm_ally_slots', 0))}\n"
+            f"attn_comm_human_slots: {int(getattr(all_args, 'attn_comm_human_slots', 0))}\n"
+            f"attn_comm_max_ppo_samples_per_gpu: {int(getattr(all_args, 'attn_comm_max_ppo_samples_per_gpu', 0))}\n"
+        )
+    _notes += f"num_mini_batch: {int(all_args.num_mini_batch)}\n"
     with open(_notes_path, "w", encoding="utf-8") as _nf:
         _nf.write(_notes)
 

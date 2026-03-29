@@ -173,6 +173,9 @@ def worker(remote, parent_remote, env_fn_wrapper):
             break
         elif cmd == 'get_spaces':
             remote.send((env.robot_observation_space, env.human_observation_space, env.share_observation_space, env.action_space))
+        elif cmd == 'set_comm_broadcasts':
+            env.set_comm_broadcasts(data)
+            remote.send(None)
         else:
             raise NotImplementedError
 
@@ -232,7 +235,13 @@ class SubprocVecEnv(ShareVecEnv):   #多线程环境，一般用于训练
     def step(self, actions):    #和抽象类的step是一样的，写在这里方便看
         self.step_async(actions)
         return self.step_wait()
-  
+
+    def set_comm_broadcasts(self, broadcasts):
+        """broadcasts: (num_envs, num_agents, msg_dim) float array."""
+        for remote, row in zip(self.remotes, np.asarray(broadcasts, dtype=np.float32)):
+            remote.send(('set_comm_broadcasts', row))
+        for remote in self.remotes:
+            remote.recv()
 
 class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测试
     def __init__(self, env_fns, args):
@@ -270,6 +279,14 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
     def step(self, actions):
         self.step_async(actions)
         return self.step_wait()
+
+    def set_comm_broadcasts(self, broadcasts):
+        b = np.asarray(broadcasts, dtype=np.float32)
+        if b.ndim == 2:
+            self.envs[0].set_comm_broadcasts(b)
+        else:
+            for i, env in enumerate(self.envs):
+                env.set_comm_broadcasts(b[i])
 
     def render(self, mode="vedio", visualize=False):
         episode_success = self.envs[0].render(mode=mode,visualize=visualize)

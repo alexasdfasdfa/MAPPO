@@ -961,3 +961,4 @@ See the migration guide at https://gymnasium.farama.org/introduction/migration_g
   used_targets = sorted(used_targets, key= lambda target: ((np.arctan(1/np.divide(*(target-centroid))) + (np.pi if (target-centroid)[0]<0 else 0))*2/np.pi+4)%4)
 /home/wangdx_lab/cse12211818/MAPPO/envs/env_core.py:577: RuntimeWarning: divide by zero encountered in scalar divide
   used_targets = sorted(used_targets, key= lambda target: ((np.arctan(1/np.divide(*(target-centroid))) + (np.pi if (target-centroid)[0]<0 else 0))*2/np.pi+4)%4)
+slurmstepd: error: *** JOB 73339 ON v100gpu001 CANCELLED AT 2026-03-27T19:18:52 ***
