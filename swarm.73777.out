@@ -1,0 +1,30 @@
+/var/spool/slurm/d/job73777/slurm_script: line 11: cd: MAPPO: No such file or directory
+Gym has been unmaintained since 2022 and does not support NumPy 2.0 amongst other critical functionality.
+Please upgrade to Gymnasium, the maintained drop-in replacement of Gym, or contact the authors of your software and request that they upgrade.
+Users of this version of Gym should be able to simply replace 'import gym' with 'import gymnasium as gym' in the vast majority of cases.
+See the migration guide at https://gymnasium.farama.org/introduction/migration_guide/ for additional information.
+u are choosing to use mappo, we set use_recurrent_policy & use_naive_recurrent_policy to be False
+[render] auto_align: dynamic goals (M=10 slots + neighbor P=0), num_agents=10, robot_obs_dim=77
+[render] auto_align: actor input dim 79, robot_obs_dim=77
+成功加载长度 10: 26 个图案。
+初始化完成：内存中可用长度 -> [10]
+[render] nearest_n_radius: num_agents=10 (pattern 'S')
+choose to use gpu...
+================ Results Saved in run20 ================
+
+Traceback (most recent call last):
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 372, in <module>
+    main(sys.argv[1:])
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 339, in main
+    envs = make_render_env(all_args)
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 221, in make_render_env
+    return DummyVecEnv([get_env_fn(0)], all_args)
+  File "/home/wangdx_lab/cse12211818/MAPPO/envs/env_wrappers.py", line 248, in __init__
+    self.envs = [fn() for fn in env_fns]
+  File "/home/wangdx_lab/cse12211818/MAPPO/envs/env_wrappers.py", line 248, in <listcomp>
+    self.envs = [fn() for fn in env_fns]
+  File "/home/wangdx_lab/cse12211818/MAPPO/render.py", line 215, in init_env
+    env = DiscreteActionEnv(all_args)
+  File "/home/wangdx_lab/cse12211818/MAPPO/envs/env_discrete.py", line 25, in __init__
+    raise ValueError(
+ValueError: use_attn_comm_actor requires fixed (pre-assigned) targets; disable --enable_dynamic_goal_assignment.

@@ -62,13 +62,13 @@ def get_config():
     parser.add_argument(
         "--dynamic_same_target_penalty_scale",
         type=float,
-        default=2.0,
+        default=3.6,
         help="Scale for same-target proximity penalty (per pair, split across agents).",
     )
     parser.add_argument(
         "--dynamic_target_switch_penalty",
         type=float,
-        default=0.45,
+        default=1.48,
         help="Base penalty when an agent changes target_id (per step, on the switching agent).",
     )
     parser.add_argument(
@@ -87,25 +87,25 @@ def get_config():
     parser.add_argument(
         "--dynamic_team_dist_progress_scale",
         type=float,
-        default=0.15,
+        default=0.175,
         help="Shared shaping: reward drop in sum of distances-to-assigned-goals (÷n per agent). Encourages coordinated assignment.",
     )
     parser.add_argument(
         "--dynamic_target_overcommit_scale",
         type=float,
-        default=0.4,
-        help="Shared penalty for extra agents (beyond one) choosing the same target before success (÷n). Mild negotiation signal.",
+        default=0.88,
+        help="Shared penalty for extra agents (beyond one) choosing the same target before success (÷n).",
     )
     parser.add_argument(
         "--dynamic_arrival_reward",
         type=float,
-        default=25.0,
+        default=28.0,
         help="Per-agent bonus the step a robot successfully claims its goal (ensures reaching is reinforced).",
     )
     parser.add_argument(
         "--dynamic_proximity_reward_scale",
         type=float,
-        default=0.12,
+        default=0.15,
         help="Per-agent exp(-dist/sigma) toward current goal while not yet successful (0 to disable).",
     )
     parser.add_argument(
@@ -137,13 +137,13 @@ def get_config():
     parser.add_argument(
         "--dynamic_prox_scale_on_target_switch",
         type=float,
-        default=0.2,
+        default=0.12,
         help="Multiply proximity shaping when target switched this step (reduces reward churn near goals). Use 0 to zero.",
     )
     parser.add_argument(
         "--dynamic_switch_near_goal_extra",
         type=float,
-        default=0.55,
+        default=0.85,
         help="Added to switch penalty when robot is within margin of any goal center (discourages in-zone target flicker). 0 disables extra.",
     )
     parser.add_argument(
@@ -161,7 +161,7 @@ def get_config():
     parser.add_argument(
         "--dynamic_crowding_penalty_scale",
         type=float,
-        default=0.18,
+        default=0.24,
         help="Shared term: subtract scale × Σ_{i<j} w_ij² / n with w_ij=max(0,1-d_ij/crowding_dist). Encourages spreading out.",
     )
     parser.add_argument(
@@ -225,10 +225,19 @@ def get_config():
         help="Min multiplier on explore_undervisible when locally sparse (see explore_density_*).",
     )
     parser.add_argument(
+        "--dynamic_shaping_commit_rvis_mult",
+        type=float,
+        default=1.0,
+        help="When dist2goal to the assigned target ≤ this × dynamic_target_vis_radius, turn off exploration shaping "
+        "that points at other goals (undervisible explore, low-density flee unless chasing a claimed target, "
+        "CTDE nearest-unclaimed progress, cluster-v2 explore role). 0 disables the commit zone.",
+    )
+    parser.add_argument(
         "--dynamic_sparse_urgency_max_mult",
         type=float,
-        default=1.24,
-        help="Max multiplier on r_nav and r_prox when locally sparse (few neighbors within local_density_radius).",
+        default=1.32,
+        help="Max multiplier on r_nav and r_prox when locally sparse, only if not losing a same-target race to a closer "
+        "neighbor (see sparse_urgency_only_when_uncontested).",
     )
     parser.add_argument(
         "--dynamic_sparse_urgency_neighbors_max",
@@ -250,6 +259,71 @@ def get_config():
         "0=off.",
     )
     parser.add_argument(
+        "--dynamic_ctde_remaining_target_shaping_scale",
+        type=float,
+        default=0.28,
+        help="CTDE-oriented training bonus: progress toward the nearest *unclaimed* goal (global claimed_by). "
+        "Near → +reward, away → penalty via (pre_dist - dist)×coef. 0=off.",
+    )
+    parser.add_argument(
+        "--dynamic_ctde_remaining_target_progress_coef",
+        type=float,
+        default=5.0,
+        help="Multiplies (pre_dist_nearest_unclaimed - dist_nearest_unclaimed) before shaping_scale.",
+    )
+    parser.add_argument(
+        "--dynamic_ctde_remaining_shaping_require_centralized_v",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: only apply remaining-target shaping when --use_centralized_V (CTDE critic). 0: always apply when scale>0.",
+    )
+    parser.add_argument(
+        "--dynamic_sparse_contest_margin",
+        type=float,
+        default=0.18,
+        help="Local contest: another agent within local_density_radius with the same target_id and closer to that goal "
+        "by more than this margin (world units) counts as stronger competition → no sparse urgency bonus.",
+    )
+    parser.add_argument(
+        "--dynamic_sparse_urgency_only_when_uncontested",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: apply sparse nav/prox urgency only when not locally contested on current target (see sparse_contest_margin).",
+    )
+    parser.add_argument(
+        "--dynamic_low_density_explore_scale",
+        type=float,
+        default=0.36,
+        help="When locally contested on same target OR chasing another agent's claimed goal, reward heading toward "
+        "lower agent density (away from neighbor centroid, or sparsest angular sector). 0=off.",
+    )
+    parser.add_argument(
+        "--dynamic_low_density_explore_v_ref",
+        type=float,
+        default=1.0,
+        help="Caps low-density explore bonus with min(v/v_ref, 1).",
+    )
+    parser.add_argument(
+        "--dynamic_low_density_sector_radius",
+        type=float,
+        default=0.0,
+        help="Radius for counting agents in sparsest-sector heuristic; 0 → max(2×local_density_radius, 8).",
+    )
+    parser.add_argument(
+        "--dynamic_low_density_sector_cos",
+        type=float,
+        default=0.707,
+        help="Cosine threshold for forward wedge (e.g. 0.707 ≈ 45° half-angle) when scoring sector occupancy.",
+    )
+    parser.add_argument(
+        "--dynamic_low_density_sector_count",
+        type=int,
+        default=8,
+        help="Number of angular bins for sparsest-direction search.",
+    )
+    parser.add_argument(
         "--dynamic_reciprocal_swap_reward_scale",
         type=float,
         default=0.55,
@@ -259,7 +333,7 @@ def get_config():
     parser.add_argument(
         "--dynamic_reciprocal_swap_switch_penalty_mult",
         type=float,
-        default=0.22,
+        default=0.45,
         help="Multiply target-switch penalty by this when the step is a reciprocal swap (after other switch mods). "
         "1.0=no relief.",
     )
@@ -292,8 +366,171 @@ def get_config():
     parser.add_argument(
         "--dynamic_switch_low_hold_boost_scale",
         type=float,
-        default=2.5,
+        default=3.2,
         help="Extra switch penalty multiplier ~ (1 + scale/(1+hold_steps)) where hold_steps is time on previous target before switch; discourages rapid target oscillation.",
+    )
+    # CTDE cluster reward v2 (global clustering + roles; requires centralized V unless overridden)
+    parser.add_argument(
+        "--dynamic_reward_cluster_v2",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: use spatial-cluster roles + stronger penalties (see dynamic_spatial_cluster_*). 0: legacy dynamic reward mix.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_reward_requires_centralized_v",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: cluster v2 only when --use_centralized_V. 0: cluster v2 always when dynamic_reward_cluster_v2=1.",
+    )
+    parser.add_argument(
+        "--dynamic_spatial_cluster_link_dist",
+        type=float,
+        default=4.0,
+        help="Agents within this distance (active only) merge into one spatial cluster.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_target_neighborhood_radius",
+        type=float,
+        default=10.0,
+        help="Unclaimed goal counts as 'near cluster' if within this radius of cluster centroid.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_unclaimed_quota_match_agents",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: 'enough' nearby unclaimed targets iff count >= active agents in cluster. 0: use min_quota only.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_unclaimed_near_min_quota",
+        type=int,
+        default=2,
+        help="When quota_match_agents=0, need at least this many unclaimed goals near cluster.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_far_agent_fraction",
+        type=float,
+        default=0.35,
+        help="When nearby unclaimed are insufficient, this fraction (ceil) of cluster is explore role: agents closest to unclaimed targets outside the cluster neighborhood head for those; if none exist outside, selection falls back to farthest-from-nearest-unclaimed.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_local_unc_shaping_scale",
+        type=float,
+        default=0.44,
+        help="v2: progress toward nearest unclaimed goal near cluster centroid (× progress_coef).",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_explore_shaping_scale",
+        type=float,
+        default=0.4,
+        help="v2: explorers progress toward global nearest unclaimed goal.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_explorer_no_target_penalty",
+        type=float,
+        default=0.58,
+        help="v2: per-step penalty for explorer role when no unclaimed goal remains anywhere.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_progress_coef",
+        type=float,
+        default=5.0,
+        help="v2: multiplies (pre_dist - dist) for local_unc / explore shaping.",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_rest_nav_prox_mult",
+        type=float,
+        default=1.28,
+        help="v2: multiply r_nav and r_prox for 'rest' cluster agents (occupy nearest assigned target).",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_rest_dispersion_scale",
+        type=float,
+        default=0.14,
+        help="v2: penalty scale exp(-d/sigma) sum over cluster mates (encourage sparse spread).",
+    )
+    parser.add_argument(
+        "--dynamic_cluster_rest_dispersion_sigma",
+        type=float,
+        default=4.0,
+        help="v2: length scale for rest-role dispersion penalty.",
+    )
+    parser.add_argument(
+        "--dynamic_v2_shared_conflict_mult",
+        type=float,
+        default=1.55,
+        help="v2: multiply same-target conflict penalty weight.",
+    )
+    parser.add_argument(
+        "--dynamic_v2_shared_overcommit_mult",
+        type=float,
+        default=1.75,
+        help="v2: multiply overcommit penalty scale.",
+    )
+    parser.add_argument(
+        "--dynamic_v2_collision_hard_penalty",
+        type=float,
+        default=-95.0,
+        help="v2: r_avoid when robot.collision (replaces -60).",
+    )
+    parser.add_argument(
+        "--dynamic_v2_dmin_avoid_mult",
+        type=float,
+        default=1.5,
+        help="v2: multiply soft dmin avoidance exp term.",
+    )
+    parser.add_argument(
+        "--dynamic_formation_time_invariant",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: dynamic formation Laplacian term ignores formation_time_weight schedule (constant 1.0).",
+    )
+    parser.add_argument(
+        "--dynamic_loiter_goal_dist_thresh",
+        type=float,
+        default=2.5,
+        help="Distance to current gx,gy below this accumulates loiter steps (for switch-after-loiter penalty).",
+    )
+    parser.add_argument(
+        "--dynamic_loiter_steps_for_switch_penalty",
+        type=int,
+        default=6,
+        help="If agent switches target after at least this many consecutive near-goal steps, add extra switch penalty.",
+    )
+    parser.add_argument(
+        "--dynamic_switch_after_loiter_extra",
+        type=float,
+        default=1.7,
+        help="Added to switch penalty when loiter threshold exceeded at switch.",
+    )
+    parser.add_argument(
+        "--dynamic_switch_sparse_neighbor_max",
+        type=int,
+        default=2,
+        help="If local neighbor count ≤ this and agent switches target, add sparse churn penalty.",
+    )
+    parser.add_argument(
+        "--dynamic_switch_sparse_extra",
+        type=float,
+        default=1.2,
+        help="Extra switch penalty when locally sparse but still churning targets.",
+    )
+    parser.add_argument(
+        "--dynamic_switch_episode_prior_coef",
+        type=float,
+        default=0.12,
+        help="Add this × (number of prior target switches this episode) to switch penalty when switching "
+        "(0=off). First switch in episode adds 0; ramps up for chronic churn.",
+    )
+    parser.add_argument(
+        "--dynamic_v2_disable_reciprocal_swap_bonus",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="1: v2 mode zeroes reciprocal-swap reward (keep switch relief mult if desired).",
     )
     # Local target reasoning (e.g. fixed-M slots / possi): M and R_vis are separate knobs; defaults follow
     # the same neighbourhood hyperparameters as agent_state_mode (not hard-coded literals).

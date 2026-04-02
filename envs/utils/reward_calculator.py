@@ -32,6 +32,25 @@ class RewardCalculator:
 
     def __init__(self, env_core: Any):
         self.env = env_core
+        self._dynamic_step_cache: Optional[dict[str, Any]] = None
+
+    def _dynamic_v2_enabled(self, a: Any) -> bool:
+        if int(getattr(a, "dynamic_reward_cluster_v2", 1)) == 0:
+            return False
+        if int(getattr(a, "dynamic_cluster_reward_requires_centralized_v", 1)) != 0:
+            return bool(getattr(a, "use_centralized_V", False))
+        return True
+
+    def begin_dynamic_reward_step(self, env: Any, for_feature: float) -> None:
+        if not getattr(env, "dynamic_goal_assignment", False):
+            self._dynamic_step_cache = None
+            return
+        if not self._dynamic_v2_enabled(env.args):
+            self._dynamic_step_cache = None
+            return
+        from envs.utils.dynamic_ctde_cluster import build_step_cache
+
+        self._dynamic_step_cache = build_step_cache(env, for_feature)
 
     def _attn_comm_shaping_reward(self, robot: Any) -> tuple[float, dict[str, float]]:
         """
@@ -135,6 +154,7 @@ class RewardCalculator:
             "dynamic_explore_n_in_view": 0.0,
             "dynamic_explore_align": 0.0,
             "dynamic_explore_density_mult": float(dm0),
+            "dynamic_explore_commit_suppressed": 0.0,
         }
         if not getattr(env, "dynamic_goal_assignment", False):
             return 0.0, z
@@ -144,6 +164,9 @@ class RewardCalculator:
         if scale <= 0.0:
             return 0.0, z
         if robot.collision is True or robot.success is True:
+            return 0.0, z
+        if self._dynamic_in_assigned_goal_commit_zone(robot):
+            z["dynamic_explore_commit_suppressed"] = 1.0
             return 0.0, z
         M = int(env.dynamic_slot_m)
         K = int(env.num_goal_targets)
@@ -195,16 +218,40 @@ class RewardCalculator:
         z["r_explore_undervisible_raw"] = float(raw)
         return float(raw), z
 
-    def _dynamic_local_active_neighbor_count(self, ridx: int) -> int:
-        if ridx < 0:
-            return 0
+    def _dynamic_in_assigned_goal_commit_zone(self, robot: Any) -> bool:
+        """
+        Near the current assignment (gx, gy): suppress rewards that encourage looking/sprinting toward *other* goals,
+        which otherwise spike when neighbors crowd (full explore scale) or when same-target contest turns on flee shaping.
+        """
         env = self.env
-        a = env.args
+        if not getattr(env, "dynamic_goal_assignment", False):
+            return False
+        mult = float(getattr(env.args, "dynamic_shaping_commit_rvis_mult", 1.0))
+        if mult <= 1e-9:
+            return False
+        if robot.collision or robot.success:
+            return False
+        Rv = float(getattr(env, "dynamic_vis_radius", 5.0))
+        thr = mult * Rv
+        d = getattr(robot, "dist2goal", None)
+        if d is None:
+            return False
+        return float(d) <= thr + 1e-9
+
+    def _dynamic_local_radius(self) -> float:
+        a = self.env.args
         R = float(getattr(a, "dynamic_local_density_radius", 0.0))
         if R <= 1e-9:
             R = float(getattr(a, "dynamic_crowding_dist", 0.0))
         if R <= 1e-9:
             R = 3.0
+        return R
+
+    def _dynamic_local_active_neighbor_count(self, ridx: int) -> int:
+        if ridx < 0:
+            return 0
+        env = self.env
+        R = self._dynamic_local_radius()
         robots = env.robots
         if ridx >= len(robots):
             return 0
@@ -249,6 +296,131 @@ class RewardCalculator:
             return 1.0
         t = (float(n_nb) - float(n_u)) / float(n_n - n_u)
         return base + (1.0 - base) * t
+
+    def _dynamic_chasing_claimed_target(self, ridx: int, robot: Any, K: int) -> bool:
+        if ridx < 0 or robot.collision or robot.success:
+            return False
+        cb = getattr(self.env, "claimed_by", None)
+        if cb is None or len(cb) != K:
+            return False
+        tk = int(robot.target_id) % K
+        owner = int(cb[tk])
+        return owner >= 0 and owner != ridx
+
+    def _dynamic_same_target_locally_contested(self, ridx: int, robot: Any, K: int) -> bool:
+        """
+        True if some active teammate within local_radius shares our target_id and is closer to that goal
+        by more than dynamic_sparse_contest_margin (stronger local claim to the same target).
+        """
+        if ridx < 0 or robot.collision or robot.success:
+            return False
+        tid = int(robot.target_id) % K
+        gx, gy = self.env.goal_positions[tid]
+        d_self = cal_distance(robot.px, robot.py, gx, gy)
+        margin = float(getattr(self.env.args, "dynamic_sparse_contest_margin", 0.15))
+        R = self._dynamic_local_radius()
+        robots = self.env.robots
+        for j, rj in enumerate(robots):
+            if j == ridx or rj.collision or rj.success:
+                continue
+            if cal_distance(robot.px, robot.py, rj.px, rj.py) > R + 1e-9:
+                continue
+            if int(rj.target_id) % K != tid:
+                continue
+            if cal_distance(rj.px, rj.py, gx, gy) < d_self - margin:
+                return True
+        return False
+
+    def _dynamic_low_density_explore_bonus(
+        self,
+        robot: Any,
+        ridx: int,
+        *,
+        active: bool,
+        n_nb: int,
+        chasing_claimed: bool = False,
+    ) -> tuple[float, dict[str, float]]:
+        """
+        Reward moving toward lower agent density when active (contested same-target or chasing claimed goal).
+        With local neighbors: direction away from their centroid; otherwise sparsest forward sector.
+        """
+        z = {
+            "r_low_density_explore_raw": 0.0,
+            "dynamic_low_density_mode": 0.0,
+            "dynamic_low_density_commit_suppressed": 0.0,
+        }
+        if not active:
+            return 0.0, z
+        a = self.env.args
+        scale = float(getattr(a, "dynamic_low_density_explore_scale", 0.0))
+        if scale <= 0.0:
+            return 0.0, z
+        if robot.collision or robot.success:
+            return 0.0, z
+        if self._dynamic_in_assigned_goal_commit_zone(robot) and not chasing_claimed:
+            z["dynamic_low_density_commit_suppressed"] = 1.0
+            return 0.0, z
+        px, py = float(robot.px), float(robot.py)
+        theta = float(robot.theta)
+        vref = max(float(getattr(a, "dynamic_low_density_explore_v_ref", 1.0)), 1e-6)
+        v = float(getattr(robot, "v", 0.0))
+        robots = self.env.robots
+        Rloc = self._dynamic_local_radius()
+
+        gdx, gdy = 0.0, 0.0
+        mode = 0.0
+        if n_nb >= 1:
+            sx, sy = 0.0, 0.0
+            c = 0
+            for j, rj in enumerate(robots):
+                if j == ridx or rj.collision or rj.success:
+                    continue
+                if cal_distance(px, py, rj.px, rj.py) <= Rloc + 1e-9:
+                    sx += float(rj.px)
+                    sy += float(rj.py)
+                    c += 1
+            if c >= 1:
+                cx, cy = sx / float(c), sy / float(c)
+                gdx, gdy = px - cx, py - cy
+                mode = 1.0
+
+        if mode < 0.5 or math.hypot(gdx, gdy) < 1e-6:
+            Rsec = float(getattr(a, "dynamic_low_density_sector_radius", 0.0))
+            if Rsec <= 1e-9:
+                Rsec = max(2.0 * Rloc, 8.0)
+            cos_half = float(getattr(a, "dynamic_low_density_sector_cos", 0.707))
+            nsect = max(4, int(getattr(a, "dynamic_low_density_sector_count", 8)))
+            best_c = 10**9
+            best_ux, best_uy = 1.0, 0.0
+            for s in range(nsect):
+                ang = (2.0 * math.pi * s) / float(nsect)
+                ux, uy = math.cos(ang), math.sin(ang)
+                cnt = 0
+                for j, oj in enumerate(robots):
+                    if j == ridx or oj.collision or oj.success:
+                        continue
+                    dx, dy = float(oj.px) - px, float(oj.py) - py
+                    dist = math.hypot(dx, dy)
+                    if dist <= 1e-6 or dist > Rsec:
+                        continue
+                    cs = (dx * ux + dy * uy) / dist
+                    if cs >= cos_half:
+                        cnt += 1
+                if cnt < best_c:
+                    best_c = cnt
+                    best_ux, best_uy = ux, uy
+            gdx, gdy = best_ux, best_uy
+            mode = 2.0
+
+        ng = math.hypot(gdx, gdy)
+        if ng < 1e-9:
+            return 0.0, z
+        hx, hy = math.cos(theta), math.sin(theta)
+        align = (hx * gdx + hy * gdy) / ng
+        raw = scale * max(0.0, align) * min(v / vref, 1.0)
+        z["dynamic_low_density_mode"] = float(mode)
+        z["r_low_density_explore_raw"] = float(raw)
+        return float(raw), z
 
     def _dynamic_find_reciprocal_swap_indices(self) -> set[int]:
         """
@@ -469,7 +641,8 @@ class RewardCalculator:
         extra; r_nav is suppressed on target switches (gx,gy discontinuity).
 
         Local density: many nearby teammates → stronger explore outside R_vis; few neighbors →
-        higher nav/prox urgency toward current target; choosing another agent's claimed goal → penalty.
+        higher nav/prox urgency only when no stronger local competitor for the same target; chasing a
+        claimed goal or losing a same-target race → penalty plus low-density exploration (toward fewer agents).
         """
         a = self.env.args
         n = max(1, self.env.robot_num)
@@ -478,7 +651,14 @@ class RewardCalculator:
         except ValueError:
             ridx = -1
         n_nb = self._dynamic_local_active_neighbor_count(ridx)
+        K = int(self.env.num_goal_targets)
+        contested = self._dynamic_same_target_locally_contested(ridx, robot, K)
+        chasing_claimed = self._dynamic_chasing_claimed_target(ridx, robot, K)
+        use_v2 = self._dynamic_v2_enabled(a)
+        cache = self._dynamic_step_cache if use_v2 else None
         explore_dm = self._dynamic_explore_density_multiplier(n_nb)
+        if use_v2:
+            explore_dm = 0.0
 
         shared = 0.0
         shared -= float(getattr(a, "dynamic_path_reward_scale", 1.0)) * self.env.dynamic_step_travel_sum / n
@@ -491,9 +671,10 @@ class RewardCalculator:
 
         d_thr = float(getattr(a, "dynamic_same_target_conflict_dist", 2.0))
         pen_scale = float(getattr(a, "dynamic_same_target_penalty_scale", 2.0))
+        if use_v2:
+            pen_scale *= float(getattr(a, "dynamic_v2_shared_conflict_mult", 1.0))
         Dc = float(getattr(a, "dynamic_crowding_dist", 0.0))
         cl_boost = float(getattr(a, "dynamic_cluster_same_target_boost", 1.0))
-        K = int(self.env.num_goal_targets)
         robots = self.env.robots
         nr = len(robots)
         conflict_w = 0.0
@@ -531,8 +712,9 @@ class RewardCalculator:
             shared += tp_scale * (float(td_prev) - td_now) / n
 
         oc_scale = float(getattr(a, "dynamic_target_overcommit_scale", 0.4))
+        if use_v2:
+            oc_scale *= float(getattr(a, "dynamic_v2_shared_overcommit_mult", 1.0))
         if oc_scale != 0.0:
-            K = int(self.env.num_goal_targets)
             counts = {}
             for r in self.env.robots:
                 if r.collision is True or r.success is True:
@@ -569,13 +751,27 @@ class RewardCalculator:
             if in_swap:
                 swm = float(getattr(a, "dynamic_reciprocal_swap_switch_penalty_mult", 1.0))
                 sw_cost *= swm
+            if use_v2:
+                if n_nb <= int(getattr(a, "dynamic_switch_sparse_neighbor_max", 1)):
+                    sw_cost += float(getattr(a, "dynamic_switch_sparse_extra", 0.9))
+                ls = int(getattr(robot, "dynamic_loiter_at_switch", 0))
+                if ls >= int(getattr(a, "dynamic_loiter_steps_for_switch_penalty", 6)):
+                    sw_cost += float(getattr(a, "dynamic_switch_after_loiter_extra", 1.25))
+            ep_c = float(getattr(a, "dynamic_switch_episode_prior_coef", 0.0))
+            if ep_c > 0.0:
+                sw_cost += ep_c * float(
+                    max(0, int(getattr(robot, "dynamic_episode_target_switch_prior", 0)))
+                )
             if sw_cost != 0.0:
                 shared -= sw_cost
 
         if self.env.dynamic_formation_success_once:
             shared += float(getattr(a, "dynamic_formation_success_bonus", 50.0)) / n
 
-        w_form = self._formation_time_weight()
+        if use_v2 and int(getattr(a, "dynamic_formation_time_invariant", 1)) != 0:
+            w_form = 1.0
+        else:
+            w_form = self._formation_time_weight()
         df = float(getattr(a, "dynamic_discount_formation", 0.0))
         ff = max(float(for_feature), 0.0)
         r_formation = -np.sqrt(ff)
@@ -583,10 +779,11 @@ class RewardCalculator:
 
         r_avoid = 0.0
         if robot.collision == True:
-            r_avoid = -60.0
+            r_avoid = float(getattr(a, "dynamic_v2_collision_hard_penalty", -95.0)) if use_v2 else -60.0
         else:
             if robot.dmin < robot.discomfort_dist * 2:
-                r_avoid = -np.exp(-robot.dmin / 3)
+                dm = float(getattr(a, "dynamic_v2_dmin_avoid_mult", 1.5)) if use_v2 else 1.0
+                r_avoid = -dm * np.exp(-robot.dmin / 3)
 
         switched = bool(getattr(robot, "target_switched_this_step", False))
         if switched and int(getattr(a, "dynamic_zero_nav_on_target_switch", 1)) != 0:
@@ -612,35 +809,125 @@ class RewardCalculator:
             sig = max(float(getattr(a, "dynamic_proximity_sigma", 8.0)), 1e-6)
             r_prox = pr * float(np.exp(-float(robot.dist2goal) / sig)) * prox_sw
 
-        urg = self._dynamic_sparse_urgency_multiplier(n_nb)
+        urg_base = self._dynamic_sparse_urgency_multiplier(n_nb)
+        if int(getattr(a, "dynamic_sparse_urgency_only_when_uncontested", 1)) != 0 and contested:
+            urg = 1.0
+        else:
+            urg = urg_base
         r_nav *= urg
         r_prox *= urg
+        if use_v2 and cache is not None and cache["role"].get(ridx) == "rest":
+            rm = float(getattr(a, "dynamic_cluster_rest_nav_prox_mult", 1.2))
+            r_nav *= rm
+            r_prox *= rm
 
         r_arrive = 0.0
         if getattr(robot, "dynamic_just_arrived", False):
             r_arrive = float(getattr(a, "dynamic_arrival_reward", 25.0))
 
-        r_explore, explore_z = self._dynamic_explore_undervisible_bonus(
-            robot, density_mult=explore_dm
-        )
+        if use_v2:
+            explore_z = {
+                "r_explore_undervisible_raw": 0.0,
+                "dynamic_explore_shortfall": 0.0,
+                "dynamic_explore_n_in_view": 0.0,
+                "dynamic_explore_align": 0.0,
+                "dynamic_explore_density_mult": 0.0,
+                "dynamic_explore_commit_suppressed": 0.0,
+            }
+            r_explore = 0.0
+        else:
+            r_explore, explore_z = self._dynamic_explore_undervisible_bonus(
+                robot, density_mult=explore_dm
+            )
         explore_z = {**explore_z, "dynamic_local_neighbors": float(n_nb)}
 
-        r_swap = float(getattr(a, "dynamic_reciprocal_swap_reward_scale", 0.0)) if in_swap else 0.0
-
-        r_claimed = 0.0
-        pcs = float(getattr(a, "dynamic_claimed_target_penalty_scale", 0.0))
-        if (
-            pcs > 0.0
-            and ridx >= 0
-            and robot.collision is not True
-            and robot.success is not True
+        if in_swap and not (
+            use_v2 and int(getattr(a, "dynamic_v2_disable_reciprocal_swap_bonus", 1)) != 0
         ):
-            cb = getattr(self.env, "claimed_by", None)
-            if cb is not None and len(cb) == K:
-                tk = int(robot.target_id) % K
-                owner = int(cb[tk])
-                if owner >= 0 and owner != ridx:
-                    r_claimed = -pcs
+            r_swap = float(getattr(a, "dynamic_reciprocal_swap_reward_scale", 0.0))
+        else:
+            r_swap = 0.0
+
+        pcs = float(getattr(a, "dynamic_claimed_target_penalty_scale", 0.0))
+        r_claimed = -pcs if (pcs > 0.0 and chasing_claimed) else 0.0
+
+        if use_v2:
+            flee_z = {
+                "r_low_density_explore_raw": 0.0,
+                "dynamic_low_density_mode": 0.0,
+                "dynamic_low_density_commit_suppressed": 0.0,
+            }
+            r_flee = 0.0
+        else:
+            low_density_active = contested or chasing_claimed
+            r_flee, flee_z = self._dynamic_low_density_explore_bonus(
+                robot,
+                ridx,
+                active=low_density_active,
+                n_nb=n_nb,
+                chasing_claimed=chasing_claimed,
+            )
+
+        r_ctde_remain = 0.0
+        if not use_v2:
+            s_ctde = float(getattr(a, "dynamic_ctde_remaining_target_shaping_scale", 0.0))
+            req_cv = int(getattr(a, "dynamic_ctde_remaining_shaping_require_centralized_v", 1)) != 0
+            use_cv = bool(getattr(a, "use_centralized_V", False))
+            if (
+                s_ctde != 0.0
+                and (not req_cv or use_cv)
+                and robot.collision is not True
+                and robot.success is not True
+            ):
+                p0 = getattr(robot, "pre_dist_nearest_unclaimed", None)
+                d0 = getattr(robot, "dist_nearest_unclaimed", None)
+                if p0 is not None and d0 is not None:
+                    coef = float(getattr(a, "dynamic_ctde_remaining_target_progress_coef", 5.0))
+                    r_ctde_remain = s_ctde * coef * (float(p0) - float(d0))
+                    if self._dynamic_in_assigned_goal_commit_zone(robot):
+                        r_ctde_remain = 0.0
+
+        r_cluster = 0.0
+        r_disp = 0.0
+        role_s = "none"
+        if use_v2 and cache is not None and robot.collision is not True and robot.success is not True:
+            role_s = str(cache["role"].get(ridx, "rest"))
+            prog_c = float(getattr(a, "dynamic_cluster_progress_coef", 5.0))
+            sl = float(getattr(a, "dynamic_cluster_local_unc_shaping_scale", 0.0))
+            se = float(getattr(a, "dynamic_cluster_explore_shaping_scale", 0.0))
+            pe = float(getattr(a, "dynamic_cluster_explorer_no_target_penalty", 0.0))
+            puc = getattr(robot, "pre_dist_unc_near_cluster", None)
+            duc = getattr(robot, "dist_unc_near_cluster", None)
+            pn = getattr(robot, "pre_dist_nearest_unclaimed", None)
+            dn = getattr(robot, "dist_nearest_unclaimed", None)
+            if role_s == "local_unc":
+                if sl > 0.0 and puc is not None and duc is not None:
+                    r_cluster = sl * prog_c * (float(puc) - float(duc))
+            elif role_s == "explore":
+                if not self._dynamic_in_assigned_goal_commit_zone(robot):
+                    po = getattr(robot, "pre_dist_unclaimed_outside_near", None)
+                    do = getattr(robot, "dist_unclaimed_outside_near", None)
+                    if se > 0.0 and po is not None and do is not None:
+                        r_cluster = se * prog_c * (float(po) - float(do))
+                    elif se > 0.0 and pn is not None and dn is not None:
+                        r_cluster = se * prog_c * (float(pn) - float(dn))
+                    elif pe > 0.0:
+                        r_cluster = -pe
+            elif role_s == "rest":
+                beta = float(getattr(a, "dynamic_cluster_rest_dispersion_scale", 0.0))
+                sig = max(float(getattr(a, "dynamic_cluster_rest_dispersion_sigma", 4.0)), 1e-6)
+                cid = int(cache["cluster_of"].get(ridx, -1))
+                if beta > 0.0 and cid >= 0:
+                    ssum = 0.0
+                    for j in cache["members"].get(cid, []):
+                        if j == ridx:
+                            continue
+                        rj = robots[j]
+                        if rj.collision or rj.success:
+                            continue
+                        d_ij = cal_distance(robot.px, robot.py, rj.px, rj.py)
+                        ssum += math.exp(-d_ij / sig)
+                    r_disp = -beta * ssum
 
         discount_avoid = float(getattr(a, "nd_discount_avoid", 50.0))
         discount_nav = float(getattr(a, "nd_discount_nav", 20.0))
@@ -650,6 +937,9 @@ class RewardCalculator:
         c_explore = discount_nav * r_explore
         c_swap = discount_nav * r_swap
         c_claimed = discount_nav * r_claimed
+        c_flee = discount_nav * r_flee
+        c_ctde_remain = discount_nav * r_ctde_remain
+        c_cluster = discount_nav * (r_cluster + r_disp)
         reward = (
             shared
             + c_formation
@@ -660,7 +950,13 @@ class RewardCalculator:
             + c_explore
             + c_swap
             + c_claimed
+            + c_flee
+            + c_ctde_remain
+            + c_cluster
         )
+        _dn_u = getattr(robot, "dist_nearest_unclaimed", None)
+        _pd_nu = getattr(robot, "pre_dist_nearest_unclaimed", None)
+        _commit_zone = self._dynamic_in_assigned_goal_commit_zone(robot)
         robot._reward_terms = {
             "reward_mode": "dynamic",
             "shared_team": float(shared),
@@ -682,10 +978,31 @@ class RewardCalculator:
             "dynamic_explore_n_in_view": float(explore_z["dynamic_explore_n_in_view"]),
             "dynamic_explore_align": float(explore_z["dynamic_explore_align"]),
             "dynamic_explore_density_mult": float(explore_z.get("dynamic_explore_density_mult", 1.0)),
+            "dynamic_explore_commit_suppressed": float(
+                explore_z.get("dynamic_explore_commit_suppressed", 0.0)
+            ),
+            "dynamic_in_commit_zone": float(1.0 if _commit_zone else 0.0),
             "dynamic_local_neighbors": float(explore_z.get("dynamic_local_neighbors", 0.0)),
             "dynamic_sparse_urgency_mult": float(urg),
+            "dynamic_same_target_contested": float(1.0 if contested else 0.0),
+            "dynamic_chasing_claimed": float(1.0 if chasing_claimed else 0.0),
             "r_claimed_target_raw": float(r_claimed),
             "c_claimed_target": float(c_claimed),
+            "r_low_density_explore_raw": float(flee_z["r_low_density_explore_raw"]),
+            "dynamic_low_density_mode": float(flee_z["dynamic_low_density_mode"]),
+            "dynamic_low_density_commit_suppressed": float(
+                flee_z.get("dynamic_low_density_commit_suppressed", 0.0)
+            ),
+            "c_low_density_explore": float(c_flee),
+            "dist_nearest_unclaimed": float(_dn_u) if _dn_u is not None else float("nan"),
+            "pre_dist_nearest_unclaimed": float(_pd_nu) if _pd_nu is not None else float("nan"),
+            "r_ctde_remaining_raw": float(r_ctde_remain),
+            "c_ctde_remaining_target": float(c_ctde_remain),
+            "dynamic_reward_v2": float(1.0 if use_v2 else 0.0),
+            "dynamic_cluster_role": role_s,
+            "r_cluster_shaping_raw": float(r_cluster),
+            "r_cluster_dispersion_raw": float(r_disp),
+            "c_cluster_shaping": float(c_cluster),
             "c_formation": float(c_formation),
             "formation_time_w": float(w_form),
             "c_avoid": float(c_avoid),

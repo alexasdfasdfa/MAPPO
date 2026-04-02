@@ -831,6 +831,16 @@ class EnvCore(object):
                 robot.dynamic_just_arrived = False
                 robot.dynamic_hold_target_steps = 0
                 robot.dynamic_hold_at_switch = 0
+                robot.dynamic_episode_target_switch_count = 0
+                robot.dynamic_episode_target_switch_prior = 0
+                robot.dist_nearest_unclaimed = None
+                robot.pre_dist_nearest_unclaimed = None
+                robot.dist_unc_near_cluster = None
+                robot.pre_dist_unc_near_cluster = None
+                robot.dist_unclaimed_outside_near = None
+                robot.pre_dist_unclaimed_outside_near = None
+                robot.dynamic_loiter_near_accum = 0
+                robot.dynamic_loiter_at_switch = 0
             
             for robot in self.robots:
                 for r in self.robots:
@@ -1017,6 +1027,45 @@ class EnvCore(object):
             
             robot.pre_dist2goal = robot.dist2goal
             robot.dist2goal = cal_distance(robot.px,robot.py,robot.gx,robot.gy)
+
+        if self.dynamic_goal_assignment and self.claimed_by is not None:
+            cb = self.claimed_by
+            K = self.num_goal_targets
+            unclaimed = [k for k in range(K) if int(cb[k]) < 0]
+            for robot in self.robots:
+                robot.pre_dist_nearest_unclaimed = getattr(
+                    robot, "dist_nearest_unclaimed", None
+                )
+                if not unclaimed:
+                    robot.dist_nearest_unclaimed = None
+                else:
+                    bd = float("inf")
+                    for kk in unclaimed:
+                        gx, gy = self.goal_positions[kk]
+                        d = cal_distance(robot.px, robot.py, gx, gy)
+                        if d < bd:
+                            bd = d
+                    robot.dist_nearest_unclaimed = float(bd)
+
+        if self.dynamic_goal_assignment:
+            thr_l = float(getattr(self.args, "dynamic_loiter_goal_dist_thresh", 2.5))
+            for robot in self.robots:
+                if robot.collision or robot.success:
+                    robot.dynamic_loiter_near_accum = 0
+                    robot.dynamic_loiter_at_switch = 0
+                    continue
+                sw = bool(getattr(robot, "target_switched_this_step", False))
+                if sw:
+                    robot.dynamic_loiter_at_switch = int(getattr(robot, "dynamic_loiter_near_accum", 0))
+                    robot.dynamic_loiter_near_accum = 0
+                else:
+                    robot.dynamic_loiter_at_switch = 0
+                    if robot.dist2goal is not None and float(robot.dist2goal) < thr_l:
+                        robot.dynamic_loiter_near_accum = int(getattr(robot, "dynamic_loiter_near_accum", 0)) + 1
+                    else:
+                        robot.dynamic_loiter_near_accum = 0
+
+            self.reward_calculator.begin_dynamic_reward_step(self, for_feature)
 
         if self.dynamic_goal_assignment:
             _td = 0.0

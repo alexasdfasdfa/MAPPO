@@ -257,7 +257,7 @@ def main(args):
     parser = get_config()
     all_args = parser_args(args, parser)
     all_args.use_render = True
-    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run49/models'
+    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run60/models'
     all_args.n_rollout_threads = 1
     all_args.episode_length = 500
     all_args.visualize = False

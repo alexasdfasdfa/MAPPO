@@ -208,9 +208,13 @@ def main(args):
             f" / {float(getattr(all_args, 'dynamic_crowding_penalty_scale', 0.0))}\n"
             f"dynamic_cluster_same_target_boost: {float(getattr(all_args, 'dynamic_cluster_same_target_boost', 1.0))}\n"
             f"dynamic_explore_undervisible_scale: {float(getattr(all_args, 'dynamic_explore_undervisible_scale', 0.0))}\n"
+            f"dynamic_shaping_commit_rvis_mult: {float(getattr(all_args, 'dynamic_shaping_commit_rvis_mult', 0.0))}\n"
             f"dynamic_reciprocal_swap_reward_scale: {float(getattr(all_args, 'dynamic_reciprocal_swap_reward_scale', 0.0))}\n"
             f"dynamic_goal_contention_penalty_scale: {float(getattr(all_args, 'dynamic_goal_contention_penalty_scale', 0.0))}\n"
             f"dynamic_claimed_target_penalty_scale: {float(getattr(all_args, 'dynamic_claimed_target_penalty_scale', 0.0))}\n"
+            f"dynamic_low_density_explore_scale: {float(getattr(all_args, 'dynamic_low_density_explore_scale', 0.0))}\n"
+            f"use_centralized_V: {bool(getattr(all_args, 'use_centralized_V', False))}\n"
+            f"dynamic_ctde_remaining_target_shaping_scale: {float(getattr(all_args, 'dynamic_ctde_remaining_target_shaping_scale', 0.0))}\n"
         )
     if bool(getattr(all_args, "use_attn_comm_actor", False)):
         _notes += (

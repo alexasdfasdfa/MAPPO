@@ -187,6 +187,9 @@ class DiscreteActionEnv(gym.Env):
             robot.prev_target_id = old
             robot.target_id = nt
             if robot.target_switched_this_step:
+                prior_sw = int(getattr(robot, "dynamic_episode_target_switch_count", 0))
+                robot.dynamic_episode_target_switch_prior = prior_sw
+                robot.dynamic_episode_target_switch_count = prior_sw + 1
                 robot.dynamic_hold_at_switch = int(getattr(robot, "dynamic_hold_target_steps", 0))
                 robot.dynamic_hold_target_steps = 0
             else:
