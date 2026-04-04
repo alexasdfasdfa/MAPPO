@@ -5,6 +5,8 @@ import setproctitle
 import numpy as np
 from pathlib import Path
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Get the parent directory of the current file
 parent_dir = os.path.abspath(os.path.join(os.getcwd(), "."))
@@ -61,6 +63,12 @@ def parser_args(args, parser):
 
     all_args = parser.parse_known_args(args)[0]
 
+    # DDP: get local_rank from environment variable (set by torchrun)
+    if 'LOCAL_RANK' in os.environ:
+        all_args.local_rank = int(os.environ['LOCAL_RANK'])
+    else:
+        all_args.local_rank = 0
+
     return all_args
 
 
@@ -69,10 +77,10 @@ def main(args):
     all_args = parser_args(args, parser)
     all_args.num_humans = 2
     all_args.num_attention_agents = 10
-    all_args.n_rollout_threads = 200
+    all_args.n_rollout_threads = 100
     all_args.episode_length = 400
     all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 1200
-    all_args.num_mini_batch = 10
+    all_args.num_mini_batch = 8
     all_args.save_interval = 1
     all_args.log_interval = 1
     all_args.model_dir = None
@@ -88,10 +96,27 @@ def main(args):
         raise NotImplementedError
 
 
-    # cuda
+    # cuda and DDP setup
     if all_args.cuda and torch.cuda.is_available():
-        print("choose to use gpu...")
-        device = torch.device("cuda:0")
+        if all_args.use_ddp:
+            # DDP mode: initialize distributed training
+            dist.init_process_group(backend='nccl')
+            local_rank = all_args.local_rank
+            torch.cuda.set_device(local_rank)
+            device = torch.device('cuda:{}'.format(local_rank))
+            world_size = dist.get_world_size()
+            print("DDP mode: using GPU {} (world_size={})".format(local_rank, world_size))
+            # DDP: 分割环境数到各GPU，保持episodes不变
+            # 单卡: 100环境 × 1200 episodes，总时间T
+            # DDP双卡: 每卡50环境 × 1200 episodes，两卡并行，总时间T/2
+            original_threads = all_args.n_rollout_threads
+            all_args.n_rollout_threads = all_args.n_rollout_threads // world_size
+            # 重新计算num_env_steps，保持episodes=1200不变
+            all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 1200
+            print("DDP: n_rollout_threads {} -> {}, num_env_steps adjusted to keep episodes=1200".format(original_threads, all_args.n_rollout_threads))
+        else:
+            print("choose to use gpu...")
+            device = torch.device("cuda:0")
         torch.set_num_threads(all_args.n_training_threads)
         if all_args.cuda_deterministic:
             torch.backends.cudnn.benchmark = False
@@ -101,14 +126,40 @@ def main(args):
         device = torch.device("cpu")
         torch.set_num_threads(all_args.n_training_threads)
 
-    # run dir
-    run_dir = (Path(os.path.dirname(os.path.abspath(__file__)) + "/results" + "/train")) # split表示拆分路径，索引为0表示返回拆分后的路径
-    if not run_dir.exists():
-        os.makedirs(str(run_dir))
+    # run dir - only rank 0 creates directory in DDP mode
+    run_dir = (Path(os.path.dirname(os.path.abspath(__file__)) + "/results" + "/train"))
 
-    if not run_dir.exists():
-        curr_run = "run1"
+    if all_args.use_ddp:
+        # DDP mode: only rank 0 determines and creates run_dir
+        if all_args.local_rank == 0:
+            if not run_dir.exists():
+                os.makedirs(str(run_dir))
+            exst_run_nums = [
+                int(str(folder.name).split("run")[1])
+                for folder in run_dir.iterdir()
+                if str(folder.name).startswith("run")
+            ]
+            if len(exst_run_nums) == 0:
+                curr_run = "run1"
+            else:
+                curr_run = "run%i" % (max(exst_run_nums) + 1)
+            run_dir = run_dir / curr_run
+            if not run_dir.exists():
+                os.makedirs(str(run_dir))
+            # Broadcast run_dir string to other ranks
+            run_dir_str = str(run_dir)
+            run_dir_list = [run_dir_str]
+            dist.broadcast_object_list(run_dir_list, src=0)
+        else:
+            # Non-rank-0 processes receive run_dir from rank 0
+            run_dir_list = [""]
+            dist.broadcast_object_list(run_dir_list, src=0)
+            run_dir = Path(run_dir_list[0])
+        print("run_dir", run_dir)
     else:
+        # Single GPU mode: original logic
+        if not run_dir.exists():
+            os.makedirs(str(run_dir))
         exst_run_nums = [
             int(str(folder.name).split("run")[1])
             for folder in run_dir.iterdir()
@@ -118,18 +169,20 @@ def main(args):
             curr_run = "run1"
         else:
             curr_run = "run%i" % (max(exst_run_nums) + 1)
-    run_dir = run_dir / curr_run
-    print("run_dir",run_dir)
-    if not run_dir.exists():
-        os.makedirs(str(run_dir))
+        run_dir = run_dir / curr_run
+        print("run_dir", run_dir)
+        if not run_dir.exists():
+            os.makedirs(str(run_dir))
 
     setproctitle.setproctitle("@" + str(all_args.user_name))
     # for i in range(5):
     # seed
     # all_args.num_humans = 3 + i
-    torch.manual_seed(all_args.seed*200)
-    torch.cuda.manual_seed_all(all_args.seed*200)
-    np.random.seed(all_args.seed*200)
+    # DDP: 每个进程使用不同的seed，确保环境多样性
+    seed_offset = all_args.local_rank if all_args.use_ddp else 0
+    torch.manual_seed((all_args.seed + seed_offset) * 200)
+    torch.cuda.manual_seed_all((all_args.seed + seed_offset) * 200)
+    np.random.seed((all_args.seed + seed_offset) * 200)
 
     # env init
     envs = make_train_env(all_args)
@@ -143,6 +196,8 @@ def main(args):
         "num_agents": num_agents,
         "device": device,
         "run_dir": run_dir,
+        "use_ddp": all_args.use_ddp,
+        "local_rank": all_args.local_rank if all_args.use_ddp else 0,
     }
 
     # run experimentsFalse
@@ -164,10 +219,15 @@ def main(args):
     if all_args.use_eval and eval_envs is not envs:
         eval_envs.close()
 
-    runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
-    runner.writter.close()
+    # Only rank 0 saves summary and prints
+    if not all_args.use_ddp or all_args.local_rank == 0:
+        runner.writter.export_scalars_to_json(str(runner.log_dir + "/summary.json"))
+        runner.writter.close()
+        print('model save in:',run_dir)
 
-    print('model save in:',run_dir)
+    # Clean up DDP
+    if all_args.use_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

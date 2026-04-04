@@ -117,6 +117,8 @@ def get_config():
     parser.add_argument("--hidden_size",type=int,default=128,help="Dimension of hidden layers for actor/critic networks",)
     parser.add_argument("--layer_N",type=int,default=1,help="Number of layers for actor/critic networks",)
     parser.add_argument("--use_ReLU", action="store_false", default=True, help="Whether to use ReLU")
+    parser.add_argument("--use_ddp", action="store_true", default=False, help="whether to use DistributedDataParallel for multi-GPU")
+    parser.add_argument("--local_rank", type=int, default=0, help="local rank for DDP (auto set by torchrun)")
     parser.add_argument("--use_popart",
         action="store_true",
         default=False,
@@ -152,7 +154,7 @@ def get_config():
     parser.add_argument("--weight_decay", type=float, default=0)
 
     # ppo parameters
-    parser.add_argument("--ppo_epoch", type=int, default=15, help="number of ppo-update epochs (default: 15)")
+    parser.add_argument("--ppo_epoch", type=int, default=10, help="number of ppo-update epochs (default: 15)")
     parser.add_argument("--use_clipped_value_loss",action="store_false",default=True,
                         help="by default, clip loss value. If set, do not clip loss value.",)
     parser.add_argument("--clip_param",type=float,default=0.2,help="ppo clip parameter (default: 0.2)",)
@@ -275,8 +277,8 @@ def get_config():
     parser.add_argument("--num_humans", type=int, default=6, help="number of dynamic obstacles")
     parser.add_argument("--num_attention_agents", type=int, default=5, help="number of agents that should be paid attention")
     parser.add_argument("--for_edge", type=int,default=2, help='the formation edge lenth')
-    parser.add_argument("--robot_radius", type=float,default=0.3, help='the radius of robot')
-    parser.add_argument("--human_radius", type=float,default=0.3, help='the radius of human')
+    parser.add_argument("--robot_radius", type=float,default=0.0, help='the radius of robot')
+    parser.add_argument("--human_radius", type=float,default=0.0, help='the radius of human')
     parser.add_argument("--dcf_dist",type=float,default=0.2,help='discomfort distance of robot and human')
     parser.add_argument("--base_v",type=float,default=0.25,help='When use discrete envirnment,the base velosity in action space')
     parser.add_argument("--randomize_attributes",type=bool,default=False,help='Randomize humans radius and preferred speed')

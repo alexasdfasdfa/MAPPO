@@ -31,8 +31,11 @@ def cal_distance(x1, y1, x2, y2):
 def get_weight(x1, y1, x2, y2):
     return (x1 - x2) ** 2 + (y1 - y2) ** 2
 
-def reach_goal(agent):
-    if cal_distance(agent.px, agent.py, agent.gx, agent.gy) <= agent.radius:
+def reach_goal(agent, goal_threshold=0.5):
+    # 使用固定阈值goal_threshold，解决radius=0时无法到达目标的问题
+    # 当智能体视为质点(radius=0)时，距离目标0.5以内即认为到达
+    threshold = max(agent.radius, goal_threshold)
+    if cal_distance(agent.px, agent.py, agent.gx, agent.gy) <= threshold:
         return True
     else:
         return False

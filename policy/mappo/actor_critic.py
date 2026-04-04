@@ -65,12 +65,12 @@ class R_Actor(nn.Module):
         :return action_log_probs: (torch.Tensor) log probabilities of taken actions.
         :return rnn_states: (torch.Tensor) updated RNN hidden states.
         """
-        robot_obs = check(robot_obs).to(**self.tpdv)
+        robot_obs = check(robot_obs)
         # human_obs = check(human_obs).to(**self.tpdv)
-        rnn_states = check(rnn_states).to(**self.tpdv)
-        masks = check(masks).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(device=robot_obs.device)
+        masks = check(masks).to(device=robot_obs.device)
         if available_actions is not None:
-            available_actions = check(available_actions).to(**self.tpdv)
+            available_actions = check(available_actions).to(device=robot_obs.device)
         
         if self.use_human_obs:
             human_obs = transform(robot_obs, human_obs, self.human_num, self.att_agents)
@@ -105,16 +105,16 @@ class R_Actor(nn.Module):
         :return action_log_probs: (torch.Tensor) log probabilities of the input actions.
         :return dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
         """
-        robot_obs = check(robot_obs).to(**self.tpdv)
+        robot_obs = check(robot_obs)
         # human_obs = check(human_obs).to(**self.tpdv)
-        rnn_states = check(rnn_states).to(**self.tpdv)
-        action = check(action).to(**self.tpdv)
-        masks = check(masks).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(device=robot_obs.device)
+        action = check(action).to(device=robot_obs.device)
+        masks = check(masks).to(device=robot_obs.device)
         if available_actions is not None:
-            available_actions = check(available_actions).to(**self.tpdv)
+            available_actions = check(available_actions).to(device=robot_obs.device)
 
         if active_masks is not None:
-            active_masks = check(active_masks).to(**self.tpdv)
+            active_masks = check(active_masks).to(device=robot_obs.device)
 
         if self.use_human_obs:
             human_obs = transform(robot_obs, human_obs, self.human_num, self.att_agents)
@@ -211,9 +211,9 @@ class R_Critic(nn.Module):
         :return values: (torch.Tensor) value function predictions.
         :return rnn_states: (torch.Tensor) updated RNN hidden states.
         """
-        rnn_states = check(rnn_states).to(**self.tpdv)
-        masks = check(masks).to(**self.tpdv)
-        cent_obs = check(cent_obs).to(**self.tpdv)
+        rnn_states = check(rnn_states).to(device=cent_obs.device)
+        masks = check(masks).to(device=cent_obs.device)
+        cent_obs = check(cent_obs)
 
         # cent_obs comes from SharedReplayBuffer.share_obs, which stores for each
         # (env, agent) a flattened joint observation of ALL robots + humans:

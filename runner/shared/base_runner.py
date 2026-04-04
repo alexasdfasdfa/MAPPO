@@ -50,17 +50,27 @@ class Runner(object):
 
         self.run_dir = config["run_dir"]
         self.log_dir = str(self.run_dir / 'logs')
-        if not os.path.exists(self.log_dir):
-            os.makedirs(self.log_dir)
-        self.writter = SummaryWriter(self.log_dir)
         self.save_dir = str(self.run_dir / 'models')
-        if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
+
+        # DDP configuration
+        self.use_ddp = config.get("use_ddp", False)
+        self.local_rank = config.get("local_rank", 0)
+
+        # Only rank 0 creates directories and SummaryWriter in DDP mode
+        if not self.use_ddp or self.local_rank == 0:
+            if not os.path.exists(self.log_dir):
+                os.makedirs(self.log_dir)
+            if not os.path.exists(self.save_dir):
+                os.makedirs(self.save_dir)
+            self.writter = SummaryWriter(self.log_dir)
+        else:
+            self.writter = None  # Non-rank-0 processes don't write logs
 
         # from algorithms.algorithm.r_mappo import RMAPPO as TrainAlgo
         from policy.mappo.rmappo import RMAPPO as TrainAlgo
         # from algorithms.algorithm.rMAPPOPolicy import RMAPPOPolicy as Policy
         from policy.mappo.MAPPOPolicy import RMAPPOPolicy as Policy
+        import torch.nn as nn
 
         share_observation_space = self.envs.share_observation_space[0] if self.use_centralized_V else self.envs.observation_space[0]
 
@@ -77,6 +87,7 @@ class Runner(object):
 
         # algorithm
         self.trainer = TrainAlgo(self.all_args, self.policy, device = self.device)
+        
         
         # buffer
         self.buffer = SharedReplayBuffer(self.all_args,
@@ -123,9 +134,19 @@ class Runner(object):
 
     def save(self):
         """Save policy's actor and critic networks."""
+        # Only save on rank 0 when using DDP
+        if self.use_ddp and self.local_rank != 0:
+            return
+
         policy_actor = self.trainer.policy.actor
-        torch.save(policy_actor.state_dict(), str(self.save_dir) + "/actor.pt")
         policy_critic = self.trainer.policy.critic
+
+        # When using DDP, need to access .module to get underlying model
+        if self.use_ddp:
+            policy_actor = policy_actor.module
+            policy_critic = policy_critic.module
+
+        torch.save(policy_actor.state_dict(), str(self.save_dir) + "/actor.pt")
         torch.save(policy_critic.state_dict(), str(self.save_dir) + "/critic.pt")
 
     def restore(self):
@@ -142,6 +163,9 @@ class Runner(object):
         :param train_infos: (dict) information about training update.
         :param total_num_steps: (int) total number of training env steps.
         """
+        # Only rank 0 writes logs in DDP mode
+        if self.use_ddp and self.local_rank != 0:
+            return
         for k, v in train_infos.items():
             self.writter.add_scalars(k, {k: v}, total_num_steps)
 
