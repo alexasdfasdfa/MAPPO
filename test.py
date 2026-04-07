@@ -338,8 +338,8 @@ def evaluate_model(all_args, envs, policy, num_episodes=100):
 
 def parser_args_eval(args, parser):
     # 使用不同的参数名避免与config.py中已有参数冲突
-    parser.add_argument("--log_dir", type=str, default="/home/inno/proj/MAPPO/results/train/run24/logs")
-    parser.add_argument("--save_dir", type=str, default="/home/inno/proj/MAPPO/results/eval/run24")
+    parser.add_argument("--log_dir", type=str, default="/home/inno/proj/MAPPO/results/train/run25/logs")
+    parser.add_argument("--save_dir", type=str, default="/home/inno/proj/MAPPO/results/eval/run25")
     parser.add_argument("--num_eval_episodes", type=int, default=100)
     return parser.parse_known_args(args)[0]
 
@@ -350,7 +350,7 @@ def main(args):
     eval_args = parser_args_eval(args, parser)
 
     # 合并参数
-    MODEL_DIR = all_args.model_dir if all_args.model_dir else "/home/inno/proj/MAPPO/results/train/run24/models"
+    MODEL_DIR = all_args.model_dir if all_args.model_dir else "/home/inno/proj/MAPPO/results/train/run25/models"
     LOG_DIR = eval_args.log_dir
     SAVE_DIR = eval_args.save_dir
     NUM_EVAL_EPISODES = eval_args.num_eval_episodes

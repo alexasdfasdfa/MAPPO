@@ -57,14 +57,13 @@ class RMAPPOPolicy:
 
     def get_actions(self, cent_obs, robot_obs, human_obs, rnn_states_actor, rnn_states_critic, masks, available_actions=None,
                     deterministic=False):
-        # ========== 优化2: 优化数据传输 ==========
         robot_obs = self._to_tensor(robot_obs)
         human_obs = self._to_tensor(human_obs)
         cent_obs = self._to_tensor(cent_obs)
         rnn_states_actor = self._to_tensor(rnn_states_actor)
         rnn_states_critic = self._to_tensor(rnn_states_critic)
         masks = self._to_tensor(masks)
-        
+
         if available_actions is not None:
             available_actions = self._to_tensor(available_actions)
 
@@ -82,13 +81,12 @@ class RMAPPOPolicy:
         cent_obs = self._to_tensor(cent_obs)
         rnn_states_critic = self._to_tensor(rnn_states_critic)
         masks = self._to_tensor(masks)
-        
+
         values, _ = self.critic(cent_obs, rnn_states_critic, masks)
         return values
 
     def evaluate_actions(self, cent_obs, robot_obs, human_obs, rnn_states_actor, rnn_states_critic, action, masks,
                          available_actions=None, active_masks=None):
-        # ========== 优化2: 优化数据传输 ==========
         robot_obs = self._to_tensor(robot_obs)
         human_obs = self._to_tensor(human_obs)
         cent_obs = self._to_tensor(cent_obs)
@@ -96,14 +94,14 @@ class RMAPPOPolicy:
         rnn_states_critic = self._to_tensor(rnn_states_critic)
         action = self._to_tensor(action)
         masks = self._to_tensor(masks)
-        
+
         if available_actions is not None:
             available_actions = self._to_tensor(available_actions)
         if active_masks is not None:
             active_masks = self._to_tensor(active_masks)
 
         if self.use_ddp:
-            action_log_probs, dist_entropy = self.actor.module.evaluate_actions(robot_obs, 
+            action_log_probs, dist_entropy = self.actor.module.evaluate_actions(robot_obs,
                                                                                  human_obs,
                                                                                  rnn_states_actor,
                                                                                  action,
@@ -112,7 +110,7 @@ class RMAPPOPolicy:
                                                                                  active_masks)
             values, _ = self.critic.module(cent_obs, rnn_states_critic, masks)
         else:
-            action_log_probs, dist_entropy = self.actor.evaluate_actions(robot_obs, 
+            action_log_probs, dist_entropy = self.actor.evaluate_actions(robot_obs,
                                                                          human_obs,
                                                                          rnn_states_actor,
                                                                          action,
@@ -120,18 +118,62 @@ class RMAPPOPolicy:
                                                                          available_actions,
                                                                          active_masks)
             values, _ = self.critic(cent_obs, rnn_states_critic, masks)
-        
+
         return values, action_log_probs, dist_entropy
+
+    # ========== NEW: Separate actor evaluation for DDP fix ==========
+    def evaluate_actions_actor(self, robot_obs, human_obs, rnn_states_actor, action, masks,
+                                available_actions=None, active_masks=None):
+        """
+        Evaluate actor actions only - for separated actor/critic backward in DDP.
+        Returns: action_log_probs, dist_entropy (no values)
+        """
+        robot_obs = self._to_tensor(robot_obs)
+        human_obs = self._to_tensor(human_obs)
+        rnn_states_actor = self._to_tensor(rnn_states_actor)
+        action = self._to_tensor(action)
+        masks = self._to_tensor(masks)
+
+        if available_actions is not None:
+            available_actions = self._to_tensor(available_actions)
+        if active_masks is not None:
+            active_masks = self._to_tensor(active_masks)
+
+        if self.use_ddp:
+            action_log_probs, dist_entropy = self.actor.module.evaluate_actions(
+                robot_obs, human_obs, rnn_states_actor, action, masks, available_actions, active_masks)
+        else:
+            action_log_probs, dist_entropy = self.actor.evaluate_actions(
+                robot_obs, human_obs, rnn_states_actor, action, masks, available_actions, active_masks)
+
+        return action_log_probs, dist_entropy
+
+    # ========== NEW: Separate critic evaluation for DDP fix ==========
+    def get_critic_values(self, cent_obs, rnn_states_critic, masks):
+        """
+        Get critic values only - for separated actor/critic backward in DDP.
+        Returns: values, rnn_states_critic (no action outputs)
+        """
+        cent_obs = self._to_tensor(cent_obs)
+        rnn_states_critic = self._to_tensor(rnn_states_critic)
+        masks = self._to_tensor(masks)
+
+        if self.use_ddp:
+            values, rnn_states_critic = self.critic.module(cent_obs, rnn_states_critic, masks)
+        else:
+            values, rnn_states_critic = self.critic(cent_obs, rnn_states_critic, masks)
+
+        return values, rnn_states_critic
 
     def act(self, robot_obs, human_obs, rnn_states_actor, masks, available_actions=None, deterministic=False):
         robot_obs = self._to_tensor(robot_obs)
         human_obs = self._to_tensor(human_obs)
         rnn_states_actor = self._to_tensor(rnn_states_actor)
         masks = self._to_tensor(masks)
-        
+
         if available_actions is not None:
             available_actions = self._to_tensor(available_actions)
-            
+
         actions, _, rnn_states_actor = self.actor(robot_obs, human_obs, rnn_states_actor, masks, available_actions, deterministic)
         return actions, rnn_states_actor
 

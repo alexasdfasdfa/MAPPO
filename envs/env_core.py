@@ -441,8 +441,8 @@ class EnvCore(object):
                     robot.dmin = cal_distance(robot.px, robot.py, agent.px, agent.py)
                     
             # if robot.dmin - robot.radius - agent.radius < 0 or robot.px < 0 or robot.py < 0: # with boundary
-            # 修复：当radius=0时，使用最小碰撞阈值0.3，避免碰撞检测失效
-            collision_threshold = max(robot.radius + agent.radius, 0.3)
+            # 修复：当radius=0时，使用最小碰撞阈值0，避免碰撞检测失效
+            collision_threshold = -1 #max(robot.radius + agent.radius, 0)
             if robot.dmin < collision_threshold:   # without boundary
                 robot.collision = True
                 # print('collision')

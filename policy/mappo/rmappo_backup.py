@@ -1,7 +1,6 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.distributed as dist
 from policy.utils.util import get_gard_norm, huber_loss, mse_loss
 from policy.utils.valuenorm import ValueNorm
 from policy.mappo.utils.util import check
@@ -44,9 +43,6 @@ class RMAPPO():
         self._use_value_active_masks = args.use_value_active_masks
         self._use_policy_active_masks = args.use_policy_active_masks
 
-        # DDP configuration
-        self.use_ddp = getattr(args, 'use_ddp', False)
-
         assert (self._use_popart and self._use_valuenorm) == False, (
             "self._use_popart and self._use_valuenorm can not be set True simultaneously")
 
@@ -56,24 +52,6 @@ class RMAPPO():
             self.value_normalizer = ValueNorm(1, device=self.device)
         else:
             self.value_normalizer = None
-
-    def _all_reduce_mean(self, value):
-        """All-reduce mean across all GPUs for DDP synchronization."""
-        if not self.use_ddp:
-            return value
-
-        # Convert to tensor if needed
-        if isinstance(value, (int, float)):
-            value_tensor = torch.tensor(value, dtype=torch.float32, device=self.device)
-        else:
-            value_tensor = value.detach() if isinstance(value, torch.Tensor) else torch.tensor(value, dtype=torch.float32, device=self.device)
-
-        # All-reduce sum
-        dist.all_reduce(value_tensor, op=dist.ReduceOp.SUM)
-
-        # Divide by world size to get mean
-        world_size = dist.get_world_size()
-        return value_tensor.item() / world_size
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         """
@@ -121,7 +99,7 @@ class RMAPPO():
         :update_actor: (bool) whether to update actor network.
 
         :return value_loss: (torch.Tensor) value function loss.
-        :return critic_grad_norm: (torch.Tensor) gradient norm from critic update.
+        :return critic_grad_norm: (torch.Tensor) gradient norm from critic up9date.
         ;return policy_loss: (torch.Tensor) actor(policy) loss value.
         :return dist_entropy: (torch.Tensor) action entropies.
         :return actor_grad_norm: (torch.Tensor) gradient norm from actor update.
@@ -137,20 +115,17 @@ class RMAPPO():
         return_batch = check(return_batch).to(**self.tpdv)
         active_masks_batch = check(active_masks_batch).to(**self.tpdv)
 
-        # ========== FIX 1: Separate Actor and Critic forward/backward ==========
-
-        # Step 1: Compute actor outputs (action_log_probs, dist_entropy) only
-        action_log_probs, dist_entropy = self.policy.evaluate_actions_actor(
-            robot_obs_batch,
-            human_obs_batch,
-            rnn_states_batch,
-            actions_batch,
-            masks_batch,
-            available_actions_batch,
-            active_masks_batch if self._use_policy_active_masks else None
-        )
-
-        # actor update - only affects actor parameters
+        # Reshape to do in a single forward pass for all steps
+        values, action_log_probs, dist_entropy = self.policy.evaluate_actions(share_obs_batch,
+                                                                              robot_obs_batch,
+                                                                              human_obs_batch,
+                                                                              rnn_states_batch,
+                                                                              rnn_states_critic_batch,
+                                                                              actions_batch,
+                                                                              masks_batch,
+                                                                              available_actions_batch,
+                                                                              active_masks_batch)
+        # actor update
         imp_weights = torch.exp(action_log_probs - old_action_log_probs_batch)
 
         surr1 = imp_weights * adv_targ
@@ -177,14 +152,7 @@ class RMAPPO():
 
         self.policy.actor_optimizer.step()
 
-        # Step 2: Compute critic outputs (values) separately - fresh forward pass
-        values, _ = self.policy.get_critic_values(
-            share_obs_batch,
-            rnn_states_critic_batch,
-            masks_batch
-        )
-
-        # critic update - only affects critic parameters
+        # critic update
         value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
 
         self.policy.critic_optimizer.zero_grad()
@@ -208,39 +176,14 @@ class RMAPPO():
 
         :return train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
         """
-        # ========== FIX 3: Sync Advantage normalization across GPUs ==========
         if self._use_popart or self._use_valuenorm:
             advantages = buffer.returns[:-1] - self.value_normalizer.denormalize(buffer.value_preds[:-1])
         else:
             advantages = buffer.returns[:-1] - buffer.value_preds[:-1]
         advantages_copy = advantages.copy()
         advantages_copy[buffer.active_masks[:-1] == 0.0] = np.nan
-
-        # Compute local mean/std
-        local_mean = np.nanmean(advantages_copy)
-        local_std = np.nanstd(advantages_copy)
-        local_count = np.sum(~np.isnan(advantages_copy))
-
-        # Sync across GPUs using all-reduce
-        if self.use_ddp:
-            mean_tensor = torch.tensor(local_mean, dtype=torch.float32, device=self.device)
-            var_tensor = torch.tensor(local_std * local_std, dtype=torch.float32, device=self.device)
-            count_tensor = torch.tensor(local_count, dtype=torch.float32, device=self.device)
-
-            dist.all_reduce(mean_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(var_tensor, op=dist.ReduceOp.SUM)
-            dist.all_reduce(count_tensor, op=dist.ReduceOp.SUM)
-
-            world_size = dist.get_world_size()
-            global_mean = mean_tensor.item() / world_size
-            global_std = np.sqrt(var_tensor.item() / world_size)
-
-            mean_advantages = global_mean
-            std_advantages = global_std
-        else:
-            mean_advantages = local_mean
-            std_advantages = local_std
-
+        mean_advantages = np.nanmean(advantages_copy)
+        std_advantages = np.nanstd(advantages_copy)
         advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
 
         train_info = {}
@@ -252,15 +195,15 @@ class RMAPPO():
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
 
-        for _ in range(self.ppo_epoch):
+        for _ in range(self.ppo_epoch):#耗时16
             if self._use_recurrent_policy:
                 data_generator = buffer.recurrent_generator(advantages, self.num_mini_batch, self.data_chunk_length)
             elif self._use_naive_recurrent:
                 data_generator = buffer.naive_recurrent_generator(advantages, self.num_mini_batch)
             else:
-                data_generator = buffer.feed_forward_generator(advantages, self.num_mini_batch)
+                data_generator = buffer.feed_forward_generator(advantages, self.num_mini_batch)  #用yield在函数中返回可迭代的结果
 
-            for sample in data_generator:
+            for sample in data_generator:#每轮耗时约1s
                 value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights \
                     = self.ppo_update(sample, update_actor)
 
@@ -269,18 +212,12 @@ class RMAPPO():
                 train_info['dist_entropy'] += dist_entropy.item()
                 train_info['actor_grad_norm'] += actor_grad_norm
                 train_info['critic_grad_norm'] += critic_grad_norm
-                train_info['ratio'] += imp_weights.mean().item()
+                train_info['ratio'] += imp_weights.mean()
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
-        # ========== FIX 2: Sync training statistics across GPUs ==========
-        if self.use_ddp:
-            for k in train_info.keys():
-                train_info[k] /= num_updates
-                train_info[k] = self._all_reduce_mean(train_info[k])
-        else:
-            for k in train_info.keys():
-                train_info[k] /= num_updates
+        for k in train_info.keys():
+            train_info[k] /= num_updates
 
         return train_info
 
