@@ -17,7 +17,7 @@ def make_render_env(all_args):
             from envs.env_discrete import DiscreteActionEnv
             env = DiscreteActionEnv(all_args)
 
-            env.seed(all_args.seed + rank * 1000 )
+            env.seed(all_args.seed + rank * 1000)
             return env
         return init_env
     if all_args.n_rollout_threads == 1:
@@ -28,6 +28,7 @@ def make_render_env(all_args):
 def parser_args(args, parser):
     parser.add_argument('--num_agents', type=int,default=10, help="number of players")
     parser.add_argument("--random_act_prob", type=int, default=0, help="the probability of robot to choice random action")
+    parser.add_argument("--config_path", type=str, default="reward.yaml", help="path to reward config file")
     
     all_args = parser.parse_known_args(args)[0]
 
@@ -38,7 +39,7 @@ def main(args):
     parser = get_config()
     all_args = parser_args(args, parser)
     all_args.use_render = True
-    all_args.model_dir = '/home/wangdx_lab/cse12211818/mappo1.8.4.2/results/train/run116/models'
+    all_args.model_dir = '/home/inno/proj/MAPPO/results/train/run27/models'
     all_args.n_rollout_threads = 1
     all_args.episode_length = 350
     all_args.visualize = False

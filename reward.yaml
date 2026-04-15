@@ -35,7 +35,7 @@ time_penalty: -0.001
 # 权重参数（增加正向激励权重）
 # ================================
 w_formation: 1.5
-w_collision: 4.0
+w_collision: 3.0
 w_progress: 2.0
 w_goal: 5.0
 w_time: 0.05

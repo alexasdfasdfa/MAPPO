@@ -114,6 +114,17 @@ class RMAPPO():
 
         return value_loss
 
+    def _sync_valuenorm(self):
+        """Sync ValueNorm running stats across all GPUs using all-reduce."""
+        if not self.use_ddp or not self._use_valuenorm:
+            return
+
+        for param in [self.value_normalizer.running_mean,
+                      self.value_normalizer.running_mean_sq,
+                      self.value_normalizer.debiasing_term]:
+            dist.all_reduce(param.data, op=dist.ReduceOp.SUM)
+            param.data /= dist.get_world_size()
+
     def ppo_update(self, sample, update_actor=True):
         """
         Update actor and critic networks.
@@ -281,6 +292,9 @@ class RMAPPO():
         else:
             for k in train_info.keys():
                 train_info[k] /= num_updates
+
+        # Sync ValueNorm stats across GPUs after training
+        self._sync_valuenorm()
 
         return train_info
 

@@ -79,7 +79,7 @@ def main(args):
     all_args.num_attention_agents = 10
     all_args.n_rollout_threads = 100
     all_args.episode_length = 400
-    all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 1200
+    all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 800
     all_args.num_mini_batch = 8
     all_args.save_interval = 1
     all_args.log_interval = 1
@@ -106,14 +106,14 @@ def main(args):
             device = torch.device('cuda:{}'.format(local_rank))
             world_size = dist.get_world_size()
             print("DDP mode: using GPU {} (world_size={})".format(local_rank, world_size))
-            # DDP: 分割环境数到各GPU，保持episodes不变
-            # 单卡: 100环境 × 1200 episodes，总时间T
-            # DDP双卡: 每卡50环境 × 1200 episodes，两卡并行，总时间T/2
-            original_threads = all_args.n_rollout_threads
-            all_args.n_rollout_threads = all_args.n_rollout_threads // world_size
-            # 重新计算num_env_steps，保持episodes=1200不变
-            all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 1200
-            print("DDP: n_rollout_threads {} -> {}, num_env_steps adjusted to keep episodes=1200".format(original_threads, all_args.n_rollout_threads))
+            # DDP: 每卡保持100环境，通过减少episodes实现加速，总采样量不变
+            # 单卡: 100环境 × 400步 × 1200 episodes = 48M 总步数，时间T
+            # DDP双卡: 每卡100环境 × 400步 × 600 episodes = 48M 总步数(两卡合计)，时间T/2
+            # DDP梯度同步使两卡共享梯度，等效于每步batch翻倍，模型质量不受影响
+            all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 600
+            print("DDP: n_rollout_threads={}, episodes=600, num_env_steps={} (total across {} GPUs = {})".format(
+                all_args.n_rollout_threads, all_args.num_env_steps, world_size,
+                all_args.num_env_steps * world_size))
         else:
             print("choose to use gpu...")
             device = torch.device("cuda:0")
