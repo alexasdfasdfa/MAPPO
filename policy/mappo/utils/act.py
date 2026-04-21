@@ -165,3 +165,13 @@ class ACTLayer(nn.Module):
                 dist_entropy = action_logits.entropy().mean()
         
         return action_log_probs, dist_entropy
+
+    def flat_logits(self, x, available_actions=None):
+        """
+        Concatenated raw logits for all discrete heads (for policy distillation / probing).
+        """
+        if self.multi_discrete:
+            return torch.cat([action_out(x).logits for action_out in self.action_outs], dim=-1)
+        if self.mixed_action:
+            raise NotImplementedError("flat_logits for mixed_action not implemented")
+        return self.action_out(x, available_actions).logits

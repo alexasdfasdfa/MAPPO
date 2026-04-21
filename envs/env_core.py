@@ -9,6 +9,7 @@ from envs.utils.state_lux import JointState
 from envs.utils.robot import Robot
 import time
 from envs.utils.reward_calculator import RewardCalculator
+from envs.utils.hungarian_opt import assignment_cost_for_target_ids, optimal_assignment_cost
 
 
 def _parse_csv_ints_arg(s):
@@ -188,7 +189,16 @@ class EnvCore(object):
         # K == swarm size here; reset() may set len(goal_positions) when dynamic goals are built
         self.num_goal_targets = self.robot_num
 
+        self.undetermined_goal_assignment = bool(getattr(args, "enable_undetermined_goal", False))
+        self.undetermined_goal_v2 = bool(getattr(args, "enable_undetermined_goal_v2", False))
+        self.undetermined_v2_goal_slots = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
+        if self.undetermined_goal_v2 and not self.undetermined_goal_assignment:
+            raise ValueError("enable_undetermined_goal_v2 requires enable_undetermined_goal")
         self.dynamic_goal_assignment = bool(getattr(args, "enable_dynamic_goal_assignment", False))
+        if self.undetermined_goal_assignment:
+            self.dynamic_goal_assignment = False
+        self.undetermined_obs_goal_radius = float(getattr(args, "undetermined_obs_goal_radius", 5.0))
+        self.undetermined_comm_radius = float(getattr(args, "undetermined_comm_radius", 6.0))
         self.dynamic_obs_pack_version = str(
             getattr(args, "dynamic_obs_pack_version", "slots")
         )
@@ -229,7 +239,11 @@ class EnvCore(object):
         self.agent_broadcast_msg_prev = np.zeros((self.robot_num, self.attn_comm_msg_dim), dtype=np.float32)
         self.goal_positions = None
         self.claimed_by = None
+        self.undetermined_hungarian_bonus = np.zeros(self.robot_num, dtype=np.float64)
         self.goal_centroid_xy = (0.0, 0.0)
+        # Cons-DecAF paper reward lag state (arXiv:2307.12287 Eq.(1)-(2))
+        self._cons_decaf_rf_prev = 0.0
+        self._cons_decaf_rv_prev = 0.0
         self.dynamic_step_travel_sum = 0.0
         self.dynamic_same_target_conflict_pairs = 0
         self.dynamic_formation_success_once = False
@@ -488,11 +502,143 @@ class EnvCore(object):
             float(robot.vy_formation),
         ]
         vec = np.array(base + ally_feats + recv_feats + hum_feats + obst + [px, py], dtype=np.float32)
-        assert vec.shape[0] == self.robot_obs_dim + 2
+        # Standalone AttnComm row only; hybrid mode sets self.robot_obs_dim to v2+tail (see compute_undetermined_v2_attn_hybrid_robot_obs_dim).
+        _p, _h, _md = int(P), int(H), int(self.attn_comm_msg_dim)
+        _attn_row_len = 7 + _p * 6 + _p * _md + _h * 5 + 4 + 2
+        assert vec.shape[0] == _attn_row_len, (
+            f"attn_comm pack len {vec.shape[0]} != {_attn_row_len} (P={_p},H={_h},msg={_md}); "
+            f"robot_obs_dim={self.robot_obs_dim} is full-row / hybrid, not attn-only"
+        )
         return vec.copy()
+
+    def _pack_undetermined_obs(self, robot_index, robot, for_feature):
+        """All goal positions + local claimed visibility within r; others' target_id; pending flag."""
+        px, py = float(robot.px), float(robot.py)
+        theta = float(robot.theta)
+        K = int(self.num_goal_targets)
+        rr = max(float(self.undetermined_obs_goal_radius), 1e-6)
+        scale = max(rr, 1.0)
+        base = [
+            robot.gx - px,
+            robot.gy - py,
+            robot.v,
+            robot.theta,
+            for_feature,
+            robot.vx_formation,
+            robot.vy_formation,
+        ]
+        tail = []
+        cb = self.claimed_by if self.claimed_by is not None else [-1] * K
+        for k in range(K):
+            tx, ty = self.goal_positions[k]
+            dx = float(tx - px)
+            dy = float(ty - py)
+            dist = float(cal_distance(px, py, tx, ty))
+            in_r = 1.0 if dist <= rr + 1e-9 else 0.0
+            if in_r > 0.5:
+                owner = int(cb[k]) if k < len(cb) else -1
+                if owner < 0:
+                    cobs = 0.0
+                elif owner == robot_index:
+                    cobs = 0.5
+                else:
+                    cobs = 1.0
+            else:
+                cobs = -1.0
+            tail.extend([dx / scale, dy / scale, in_r, cobs])
+        norm = float(max(1, K - 1))
+        for j in range(self.robot_num):
+            if j == robot_index:
+                continue
+            tail.append(float(self.robots[j].target_id) / norm)
+        tail.append(1.0 if bool(getattr(robot, "undetermined_target_pending", False)) else 0.0)
+        vec = np.array(base + tail + [px, py], dtype=np.float32)
+        assert vec.shape[0] == self.robot_obs_dim + 2
+        return vec
+
+    def _pack_undetermined_v2_obs(self, robot_index, robot, for_feature):
+        """
+        Nearest-M goal slots (body-frame rel + claim visibility) + goal index norm; no (K-1) peer target_id vector.
+        Padding uses k_norm=-1 (masked in target head). Pending flag last before px,py.
+        """
+        px, py = float(robot.px), float(robot.py)
+        K = int(self.num_goal_targets)
+        M_cfg = int(self.undetermined_v2_goal_slots)
+        M = min(M_cfg, K)
+        rr = max(float(self.undetermined_obs_goal_radius), 1e-6)
+        scale = max(rr, 1.0)
+        base = [
+            robot.gx - px,
+            robot.gy - py,
+            robot.v,
+            robot.theta,
+            for_feature,
+            robot.vx_formation,
+            robot.vy_formation,
+        ]
+        dist_idx = []
+        for k in range(K):
+            tx, ty = self.goal_positions[k]
+            dist_idx.append((cal_distance(px, py, tx, ty), k))
+        dist_idx.sort(key=lambda t: t[0])
+        cb = self.claimed_by if self.claimed_by is not None else [-1] * K
+        norm_k = float(max(1, K - 1))
+        tail = []
+        for slot in range(M_cfg):
+            if slot < M:
+                _dist, k = dist_idx[slot]
+                tx, ty = self.goal_positions[k]
+                dx = float(tx - px)
+                dy = float(ty - py)
+                dist = float(cal_distance(px, py, tx, ty))
+                in_r = 1.0 if dist <= rr + 1e-9 else 0.0
+                if in_r > 0.5:
+                    owner = int(cb[k]) if k < len(cb) else -1
+                    if owner < 0:
+                        cobs = 0.0
+                    elif owner == robot_index:
+                        cobs = 0.5
+                    else:
+                        cobs = 1.0
+                else:
+                    cobs = -1.0
+                k_norm = float(k) / norm_k
+                tail.extend([dx / scale, dy / scale, in_r, cobs, k_norm])
+            else:
+                tail.extend([0.0, 0.0, 0.0, -1.0, -1.0])
+        tail.append(1.0 if bool(getattr(robot, "undetermined_target_pending", False)) else 0.0)
+        vec = np.array(base + tail + [px, py], dtype=np.float32)
+        # v2-only row length; hybrid mode sets robot_obs_dim = v2_core + attn_tail (see compute_undetermined_v2_attn_hybrid_robot_obs_dim).
+        _v2_len = 7 + 5 * int(M_cfg) + 1 + 2
+        assert vec.shape[0] == _v2_len, (
+            f"undetermined v2 pack len {vec.shape[0]} != {_v2_len} "
+            f"(M_cfg={M_cfg}); robot_obs_dim={self.robot_obs_dim} (hybrid tail not included in this assert)"
+        )
+        return vec
+
+    def _pack_undetermined_v2_attn_hybrid_obs(self, robot_index, robot, for_feature):
+        """
+        Undetermined v2 layout unchanged, then ConsMAC/AttnComm ally+recv+human+obstacle tail (no duplicate self-7).
+        Px, py remain the last two scalars for the target head and critic-friendly slicing.
+        """
+        v2 = self._pack_undetermined_v2_obs(robot_index, robot, for_feature)
+        attn_row = self._pack_robot_obs_row_attn_comm(robot_index, robot, for_feature)
+        tail = attn_row[7:-2]
+        vec = np.concatenate([v2[:-2], tail, v2[-2:]], dtype=np.float32)
+        assert vec.shape[0] == self.robot_obs_dim + 2
+        return vec
 
     def _pack_robot_obs_row(self, robot_index, robot, for_feature):
         px, py = robot.px, robot.py
+        if self.undetermined_goal_assignment:
+            if self.undetermined_goal_v2:
+                if (
+                    str(getattr(self.args, "architecture_mode", "default")) == "attn_undetermined_goal"
+                    and self.use_attn_comm_actor
+                ):
+                    return self._pack_undetermined_v2_attn_hybrid_obs(robot_index, robot, for_feature)
+                return self._pack_undetermined_v2_obs(robot_index, robot, for_feature)
+            return self._pack_undetermined_obs(robot_index, robot, for_feature)
         if not self.dynamic_goal_assignment:
             if self.use_attn_comm_actor:
                 return self._pack_robot_obs_row_attn_comm(robot_index, robot, for_feature)
@@ -593,6 +739,135 @@ class EnvCore(object):
         assert vec.shape[0] == self.robot_obs_dim + 2
         return vec
 
+    def _undetermined_sync_all_goals(self):
+        K = int(self.num_goal_targets)
+        for r in self.robots:
+            tid = int(r.target_id) % K
+            gx, gy = self.goal_positions[tid]
+            r.gx, r.gy = gx, gy
+
+    def _undetermined_auction_duplicate_targets(self):
+        """Same discrete target: lowest agent index wins; others marked pending for re-selection."""
+        K = int(self.num_goal_targets)
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        for i in range(self.robot_num):
+            ri = self.robots[i]
+            if ri.collision or ri.success:
+                continue
+            tid = int(ri.target_id) % K
+            groups[tid].append(i)
+        for _tid, idxs in groups.items():
+            if len(idxs) <= 1:
+                continue
+            for lose in sorted(idxs)[1:]:
+                self.robots[lose].undetermined_target_pending = True
+
+    def _compute_undetermined_hungarian_shaping(self):
+        K = int(self.num_goal_targets)
+        pos = np.array([[r.px, r.py] for r in self.robots], dtype=np.float64)
+        goals = np.array(self.goal_positions, dtype=np.float64)
+        tids = np.array([int(r.target_id) % K for r in self.robots], dtype=np.int64)
+        cur = assignment_cost_for_target_ids(pos, goals, tids)
+        _opt_ass, opt_total = optimal_assignment_cost(pos, goals)
+        gap = float(cur - opt_total)
+        scale = float(getattr(self.args, "undetermined_hungarian_reward_scale", 0.15))
+        if getattr(self, "undetermined_goal_v2", False):
+            div = float(getattr(self.args, "undetermined_v2_hungarian_team_divisor", 8.0))
+            div = max(div, 1.0)
+            per = -scale * gap / div
+        else:
+            n = max(1, self.robot_num)
+            per = -scale * gap / float(n)
+        self.undetermined_hungarian_bonus = np.full(self.robot_num, per, dtype=np.float64)
+
+    def apply_undetermined_targets(self, targets):
+        """
+        Set each agent's target_id from policy, sync goals, auction duplicates, compute Hungarian shaping bonus.
+        targets: length N array-like of ints in [0, K-1].
+        """
+        K = int(self.num_goal_targets)
+        t = np.asarray(targets, dtype=np.int64).reshape(-1)
+        assert len(t) == self.robot_num, (len(t), self.robot_num)
+        for i, r in enumerate(self.robots):
+            r.target_id = int(t[i]) % K
+            r.undetermined_target_pending = False
+        self._undetermined_sync_all_goals()
+        self._undetermined_auction_duplicate_targets()
+        self._compute_undetermined_hungarian_shaping()
+
+    def refresh_observations_after_target_change(self):
+        """Rebuild per-agent obs like reset() after apply_undetermined_targets (for_feature=0)."""
+        obs = []
+        for i, robot in enumerate(self.robots):
+            temp_obs = np.zeros(((1 + max(self.human_num, self.att_agents)), self.obs_dim + 2))
+            temp_obs[0, : self.robot_obs_dim + 2] = self._pack_robot_obs_row(i, robot, 0.0).copy()
+            for human in self.humans:
+                human.dist2rob = cal_distance(robot.px, robot.py, human.px, human.py)
+            self.humans = sorted(self.humans, key=lambda x: x.dist2rob, reverse=True)
+            assert self.humans[-1].dist2rob < self.humans[-2].dist2rob, "sort error!"
+            for j, human in enumerate(self.humans[: self.human_num]):
+                htheta = np.arctan2(human.py, human.px)
+                temp_obs[j + 1, : self.human_obs_dim] = np.array(
+                    [human.px, human.py, human.vx, human.vy, htheta]
+                ).copy()
+            obs.append(temp_obs)
+        return obs
+
+    def _undetermined_refresh_pending_from_observation(self):
+        """Within obs radius r of current target: if claimed by another agent, request re-selection."""
+        if self.claimed_by is None:
+            return
+        K = int(self.num_goal_targets)
+        rr = float(self.undetermined_obs_goal_radius)
+        for i, r in enumerate(self.robots):
+            if r.collision or r.success:
+                continue
+            tid = int(r.target_id) % K
+            gx, gy = self.goal_positions[tid]
+            if cal_distance(r.px, r.py, gx, gy) > rr + 1e-9:
+                continue
+            owner = int(self.claimed_by[tid]) if tid < len(self.claimed_by) else -1
+            if owner >= 0 and owner != i:
+                r.undetermined_target_pending = True
+
+    def _undetermined_comm_conflict_auction(self):
+        """Same target as another agent within comm radius: lowest index keeps target; others pending."""
+        K = int(self.num_goal_targets)
+        Rc = float(self.undetermined_comm_radius)
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        for i in range(self.robot_num):
+            r = self.robots[i]
+            if r.collision or r.success:
+                continue
+            tid = int(r.target_id) % K
+            groups[tid].append(i)
+        for _tid, idxs in groups.items():
+            if len(idxs) <= 1:
+                continue
+            idxs = sorted(idxs)
+            conflict = False
+            for a in range(len(idxs)):
+                for b in range(a + 1, len(idxs)):
+                    i, j = idxs[a], idxs[b]
+                    if (
+                        cal_distance(self.robots[i].px, self.robots[i].py, self.robots[j].px, self.robots[j].py)
+                        <= Rc + 1e-9
+                    ):
+                        conflict = True
+                        break
+                if conflict:
+                    break
+            if not conflict:
+                continue
+            winner = idxs[0]
+            for lose in idxs[1:]:
+                if lose != winner:
+                    self.robots[lose].undetermined_target_pending = True
+
     def _dynamic_path_sync_and_conflict_count(self):
         self.dynamic_step_travel_sum = 0.0
         self.dynamic_same_target_conflict_pairs = 0
@@ -677,7 +952,7 @@ class EnvCore(object):
             r.v = 0
             r.vx = 0
             r.vy = 0
-        if self.dynamic_goal_assignment and all(
+        if (self.dynamic_goal_assignment or self.undetermined_goal_assignment) and all(
             self.robots[i].success for i in range(self.robot_num)
         ):
             if not self.dynamic_episode_had_collision and not self.collision_flag:
@@ -697,6 +972,8 @@ class EnvCore(object):
         self.robots = [Robot(self.args) for i in range(self.robot_num)]
         self.agent_broadcast_msg.fill(0.0)
         self.agent_broadcast_msg_prev.fill(0.0)
+        self._cons_decaf_rf_prev = 0.0
+        self._cons_decaf_rv_prev = 0.0
         self.total_obs = []
         # print('env has reset!')
         if self.robots is None:
@@ -773,14 +1050,14 @@ class EnvCore(object):
 
             # 将目标点转换为相对于质心的相对模板（for_std），以便队形对平移不敏感
             centroid = np.mean(np.array(used_targets), axis=0)
-            used_targets = sorted(used_targets, key= lambda target: ((np.arctan(1/np.divide(*(target-centroid))) + (np.pi if (target-centroid)[0]<0 else 0))*2/np.pi+4)%4)
+            # used_targets = sorted(used_targets, key= lambda target: ((np.arctan(1/np.divide(*(target-centroid))) + (np.pi if (target-centroid)[0]<0 else 0))*2/np.pi+4)%4)
             rel_targets = [(tx - centroid[0], ty - centroid[1]) for (tx, ty) in used_targets]
 
             rand_pos = None
             if getattr(self.args, "randomize_robot_initial_positions", False):
                 rand_pos = self._sample_collision_free_robot_starts()
 
-            if self.dynamic_goal_assignment:
+            if self.dynamic_goal_assignment or self.undetermined_goal_assignment:
                 self.goal_positions = [
                     (gx + rel_targets[j][0], gy + rel_targets[j][1])
                     for j in range(len(rel_targets))
@@ -793,6 +1070,7 @@ class EnvCore(object):
                 self.claimed_by = [-1] * K
                 self.dynamic_formation_success_once = False
                 self.dynamic_episode_had_collision = False
+                self.undetermined_hungarian_bonus = np.zeros(self.robot_num, dtype=np.float64)
             else:
                 K = len(rel_targets)
 
@@ -816,6 +1094,17 @@ class EnvCore(object):
                     robot.prev_px = float(px_i)
                     robot.prev_py = float(py_i)
                     robot.for_std = [gxi - self.goal_centroid_xy[0], gyi - self.goal_centroid_xy[1]]
+                elif self.undetermined_goal_assignment:
+                    tid = i % K
+                    gxi, gyi = self.goal_positions[tid]
+                    robot.set(px_i, py_i, gxi, gyi, 0, 0, np.pi / 2)
+                    robot.target_id = int(tid)
+                    robot.prev_target_id = int(tid)
+                    robot.target_switched_this_step = False
+                    robot.prev_px = float(px_i)
+                    robot.prev_py = float(py_i)
+                    robot.for_std = [gxi - self.goal_centroid_xy[0], gyi - self.goal_centroid_xy[1]]
+                    robot.undetermined_target_pending = True
                 else:
                     robot.set(px_i, py_i, gx, gy, 0, 0, np.pi / 2)
                     robot.gx = gx + rel_targets[i][0]
@@ -848,7 +1137,7 @@ class EnvCore(object):
                         robot.vx_formation -= (robot.px - r.px - (robot.for_std[0] - r.for_std[0]))
                         robot.vy_formation -= (robot.py - r.py - (robot.for_std[1] - r.for_std[1]))
 
-            if self.dynamic_goal_assignment:
+            if self.dynamic_goal_assignment or self.undetermined_goal_assignment:
                 _td0 = 0.0
                 for _r in self.robots:
                     if _r.collision is True:
@@ -940,7 +1229,7 @@ class EnvCore(object):
         # for i, human_action in enumerate(human_actions):
         #     self.humans[i].step(human_action)
 
-        if self.dynamic_goal_assignment:
+        if self.dynamic_goal_assignment or self.undetermined_goal_assignment:
             self._dynamic_path_sync_and_conflict_count()
 
         #for reward calculate
@@ -967,7 +1256,7 @@ class EnvCore(object):
                 # print('collision')
                 robot.success = False
                 self.collision_flag = True
-                if self.dynamic_goal_assignment:
+                if self.dynamic_goal_assignment or self.undetermined_goal_assignment:
                     self.dynamic_episode_had_collision = True
             else:
                 robot.dmin = robot.dmin - robot.radius - agent.radius
@@ -983,8 +1272,11 @@ class EnvCore(object):
                         robot.vy_formation -= (robot.py - r.py - (robot.for_std[1] - r.for_std[1]))
             # print('robot.px,robot.py',robot.px,robot.py)
 
-        if self.dynamic_goal_assignment:
+        if self.dynamic_goal_assignment or self.undetermined_goal_assignment:
             self._dynamic_process_claims()
+        if self.undetermined_goal_assignment:
+            self._undetermined_refresh_pending_from_observation()
+            self._undetermined_comm_conflict_auction()
 
         assert W[-1][-2] != 0,'W compute error!'
 
@@ -1002,7 +1294,7 @@ class EnvCore(object):
         if (self.L_des is None) or (self.L_des.shape != L_hat.shape):
             # Build W_des from current robots' goal positions (gx, gy)
             try:
-                if self.dynamic_goal_assignment:
+                if self.dynamic_goal_assignment or self.undetermined_goal_assignment:
                     targets = list(self.goal_positions)
                 else:
                     targets = [(r.gx, r.gy) for r in self.robots]
@@ -1028,7 +1320,7 @@ class EnvCore(object):
             robot.pre_dist2goal = robot.dist2goal
             robot.dist2goal = cal_distance(robot.px,robot.py,robot.gx,robot.gy)
 
-        if self.dynamic_goal_assignment and self.claimed_by is not None:
+        if (self.dynamic_goal_assignment or self.undetermined_goal_assignment) and self.claimed_by is not None:
             cb = self.claimed_by
             K = self.num_goal_targets
             unclaimed = [k for k in range(K) if int(cb[k]) < 0]
@@ -1144,6 +1436,14 @@ class EnvCore(object):
         return self.reward_calculator.compute_default_reward(robot, for_feature)
     
     def get_done(self,agent):
+        if self.undetermined_goal_assignment:
+            if agent.collision == True:
+                return True
+            if agent.success == True:
+                return True
+            if self.global_time >= self.time_limit:
+                return True
+            return False
         if self.dynamic_goal_assignment:
             if agent.collision == True:
                 return True
@@ -1170,9 +1470,21 @@ class EnvCore(object):
             info.reward_terms = {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in t.items()}
         else:
             info.reward_terms = {}
+        if self.undetermined_goal_assignment:
+            setattr(info, "undetermined_need_target", bool(getattr(agent, "undetermined_target_pending", False)))
         return info
 
     def get_info(self, agent):
+        if self.undetermined_goal_assignment:
+            if agent.collision == True:
+                return self._attach_reward_terms(agent, Collision())
+            if self.global_time >= self.time_limit:
+                return self._attach_reward_terms(agent, Timeout())
+            if agent.dmin < agent.discomfort_dist:
+                return self._attach_reward_terms(agent, Danger())
+            if agent.success == True:
+                return self._attach_reward_terms(agent, ReachGoal())
+            return self._attach_reward_terms(agent, Nothing())
         if self.dynamic_goal_assignment:
             if agent.collision == True:
                 return self._attach_reward_terms(agent, Collision())

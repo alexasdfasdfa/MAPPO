@@ -8,6 +8,7 @@ from tensorboardX import SummaryWriter
 from policy.utils.separated_buffer import SeparatedReplayBuffer
 from policy.ORCAPolicy import ORCAPolicy
 from policy.APFPolicy import APFPolicy
+from policy.mappo.undet_v2_latent_ckpt import apply_undet_v2_target_latent_heads
 
 
 def _t2n(x):
@@ -94,6 +95,10 @@ class Runner(object):
 
         if self.model_dir is not None:
             self.restore()
+
+        apply_undet_v2_target_latent_heads(
+            self.all_args, [po.actor for po in self.policy], self.device
+        )
 
         self.trainer = []
         self.buffer = []

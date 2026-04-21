@@ -14,11 +14,18 @@ if _REPO_ROOT not in sys.path:
 # import rvo2
 from config.config import (
     get_config,
+    apply_architecture_mode_preset,
     resolve_attn_comm_args,
     resolve_attn_comm_ppo_batch_args,
     resolve_dynamic_target_reasoning_args,
     compute_attn_comm_robot_obs_dim,
+    compute_attn_comm_tail_dim,
     compute_dynamic_robot_obs_dim,
+    compute_undetermined_robot_obs_dim,
+    compute_undetermined_v2_robot_obs_dim,
+    compute_undetermined_v2_attn_hybrid_robot_obs_dim,
+    apply_undetermined_reward_floors,
+    apply_undetermined_v2_reward_floors,
 )
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv
 
@@ -72,7 +79,15 @@ def parser_args(args, parser):
     parser.add_argument("--random_act_prob", type=int, default=0, help="the probability of robot to choice random action")
 
     all_args = parser.parse_known_args(args)[0]
+    apply_architecture_mode_preset(all_args)
     resolve_dynamic_target_reasoning_args(all_args)
+
+    if str(getattr(all_args, "architecture_mode", "default")) == "attn_undetermined_goal" and not getattr(
+        all_args, "use_attn_comm_actor", False
+    ):
+        raise ValueError(
+            "--architecture_mode attn_undetermined_goal requires --use_attn_comm_actor (ConsMAC-style comm encoder)."
+        )
 
     # Match swarm size to font-pattern length bucket (config --train_font_pattern_length).
     _pat_len = int(getattr(all_args, "train_font_pattern_length", 10))
@@ -81,18 +96,100 @@ def parser_args(args, parser):
         print(f"[train] num_agents {_prev_n} -> {_pat_len} (aligned to train_font_pattern_length)")
     all_args.num_agents = _pat_len
 
+    if getattr(all_args, "enable_undetermined_goal_v2", False) and not getattr(
+        all_args, "enable_undetermined_goal", False
+    ):
+        raise ValueError("--enable_undetermined_goal_v2 requires --enable_undetermined_goal")
+
+    _lat_dir = getattr(all_args, "undet_v2_target_latent_model_dir", None)
+    if _lat_dir and str(_lat_dir).strip():
+        if not getattr(all_args, "enable_undetermined_goal", False):
+            raise ValueError("--undet_v2_target_latent_model_dir requires --enable_undetermined_goal")
+        if not getattr(all_args, "enable_undetermined_goal_v2", False):
+            raise ValueError("--undet_v2_target_latent_model_dir requires --enable_undetermined_goal_v2")
+        if getattr(all_args, "use_attn_comm_actor", False):
+            raise ValueError(
+                "--undet_v2_target_latent_model_dir is only for runs with --use_attn_comm_actor disabled "
+                "(import undetermined_head into the non-AttnComm actor); hybrid attn checkpoints use model_dir only."
+            )
+        _tm = str(getattr(all_args, "undet_v2_latent_train_mode", "finetune_all"))
+        if _tm == "motion_only" and (not _lat_dir or not str(_lat_dir).strip()):
+            raise ValueError(
+                "--undet_v2_latent_train_mode motion_only requires --undet_v2_target_latent_model_dir "
+                "(pretrained head path)"
+            )
+
+    if getattr(all_args, "enable_undetermined_goal", False):
+        all_args.enable_dynamic_goal_assignment = False
+        k = int(all_args.num_agents)
+        if getattr(all_args, "enable_undetermined_goal_v2", False):
+            m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
+            all_args.robot_obs_dim = compute_undetermined_v2_robot_obs_dim(m)
+            apply_undetermined_v2_reward_floors(all_args)
+            print(
+                f"[train] undetermined goal v2: robot_obs_dim={all_args.robot_obs_dim} (+2 px,py), "
+                f"K={k}, v2_slots={m}, hungarian_div={getattr(all_args, 'undetermined_v2_hungarian_team_divisor', 8.0)}"
+            )
+            if _lat_dir and str(_lat_dir).strip():
+                print(
+                    f"[train] undet_v2_target_latent: train_mode={getattr(all_args, 'undet_v2_latent_train_mode', 'finetune_all')}, "
+                    f"head_aux_coef={float(getattr(all_args, 'undet_v2_target_head_aux_coef', 0.0))}"
+                )
+        else:
+            all_args.robot_obs_dim = compute_undetermined_robot_obs_dim(k)
+            apply_undetermined_reward_floors(all_args)
+            print(f"[train] undetermined goal mode: robot_obs_dim={all_args.robot_obs_dim} (+2 px,py), K={k}")
+        print(
+            f"[train] undetermined reward floors: nd_discount_avoid={getattr(all_args, 'nd_discount_avoid', 0)}, "
+            f"nd_discount_nav={all_args.nd_discount_nav}, "
+            f"nd_discount_goal={all_args.nd_discount_goal}, "
+            f"nd_goal_progress_coef={all_args.nd_goal_progress_coef}, "
+            f"nd_goal_terminal_reward={all_args.nd_goal_terminal_reward}, "
+            f"nd_goal_leave_penalty={all_args.nd_goal_leave_penalty}, "
+            f"undetermined_hungarian_reward_scale={all_args.undetermined_hungarian_reward_scale}, "
+            f"undetermined_goal_distance_penalty_scale={all_args.undetermined_goal_distance_penalty_scale}, "
+            f"undetermined_far_goal_progress_boost={all_args.undetermined_far_goal_progress_boost}"
+        )
+
     if getattr(all_args, "use_attn_comm_actor", False):
         if getattr(all_args, "enable_dynamic_goal_assignment", False):
             raise ValueError(
                 "use_attn_comm_actor requires fixed (pre-assigned) targets; "
                 "disable --enable_dynamic_goal_assignment."
             )
+        if getattr(all_args, "enable_undetermined_goal", False) and str(
+            getattr(all_args, "architecture_mode", "default")
+        ) != "attn_undetermined_goal":
+            raise ValueError(
+                "use_attn_comm_actor is incompatible with --enable_undetermined_goal unless "
+                "--architecture_mode attn_undetermined_goal (hybrid ConsMAC observation pack)."
+            )
         resolve_attn_comm_args(all_args)
-        all_args.robot_obs_dim = compute_attn_comm_robot_obs_dim(
-            int(all_args.attn_comm_ally_slots),
-            int(all_args.attn_comm_human_slots),
-            message_dim=int(getattr(all_args, "attn_comm_message_dim", 16)),
-        )
+        if str(getattr(all_args, "architecture_mode", "")) == "attn_undetermined_goal" and getattr(
+            all_args, "enable_undetermined_goal_v2", False
+        ):
+            m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
+            all_args.robot_obs_dim = compute_undetermined_v2_attn_hybrid_robot_obs_dim(
+                m,
+                int(all_args.attn_comm_ally_slots),
+                int(all_args.attn_comm_human_slots),
+                int(getattr(all_args, "attn_comm_message_dim", 16)),
+            )
+            _tl = compute_attn_comm_tail_dim(
+                int(all_args.attn_comm_ally_slots),
+                int(all_args.attn_comm_human_slots),
+                int(getattr(all_args, "attn_comm_message_dim", 16)),
+            )
+            print(
+                f"[train] architecture attn_undetermined_goal: hybrid robot_obs_dim={all_args.robot_obs_dim} (+2), "
+                f"undetermined_v2_core={compute_undetermined_v2_robot_obs_dim(m)}, consmac_tail={_tl}"
+            )
+        else:
+            all_args.robot_obs_dim = compute_attn_comm_robot_obs_dim(
+                int(all_args.attn_comm_ally_slots),
+                int(all_args.attn_comm_human_slots),
+                message_dim=int(getattr(all_args, "attn_comm_message_dim", 16)),
+            )
         resolve_attn_comm_ppo_batch_args(all_args)
 
     if getattr(all_args, "enable_dynamic_goal_assignment", False):
@@ -123,7 +220,7 @@ def main(args):
     all_args = parser_args(args, parser)
     all_args.num_humans = 2
     all_args.num_attention_agents = 10
-    all_args.n_rollout_threads = 200
+    all_args.n_rollout_threads = 40
     all_args.episode_length = 400
     all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 1200
     # PPO: mini_batch_size = (n_rollout_threads * episode_length * num_agents) / num_mini_batch.
@@ -183,10 +280,13 @@ def main(args):
     _notes_path = run_dir / "run_flags.txt"
     _asm = getattr(all_args, "agent_state_mode", "all")
     _dyn = bool(getattr(all_args, "enable_dynamic_goal_assignment", False))
+    _und = bool(getattr(all_args, "enable_undetermined_goal", False))
     _ir = bool(getattr(all_args, "randomize_robot_initial_positions", False))
     _notes = (
         f"agent_state_mode: {_asm}\n"
+        f"architecture_mode: {str(getattr(all_args, 'architecture_mode', 'default'))}\n"
         f"dynamic_target: {_dyn}\n"
+        f"undetermined_goal: {_und}\n"
         f"initial_randomize: {_ir}\n"
         f"num_agents: {int(all_args.num_agents)}\n"
     )
@@ -203,6 +303,7 @@ def main(args):
             f"dynamic_discount_formation: {float(getattr(all_args, 'dynamic_discount_formation', 0.0))}\n"
             f"formation_time_weight: {float(getattr(all_args, 'formation_time_weight_start', 1.0))}"
             f" -> {float(getattr(all_args, 'formation_time_weight_end', 1.0))}\n"
+            f"formation_time_weight_decay_horizon: {float(getattr(all_args, 'formation_time_weight_decay_horizon', 1.0))}\n"
             f"dynamic_arrival_require_outside_entry: {int(getattr(all_args, 'dynamic_arrival_require_outside_entry', 1))}\n"
             f"dynamic_crowding_dist/penalty: {float(getattr(all_args, 'dynamic_crowding_dist', 0.0))}"
             f" / {float(getattr(all_args, 'dynamic_crowding_penalty_scale', 0.0))}\n"
@@ -216,6 +317,31 @@ def main(args):
             f"use_centralized_V: {bool(getattr(all_args, 'use_centralized_V', False))}\n"
             f"dynamic_ctde_remaining_target_shaping_scale: {float(getattr(all_args, 'dynamic_ctde_remaining_target_shaping_scale', 0.0))}\n"
         )
+    if _und:
+        _notes += (
+            f"robot_obs_dim: {int(getattr(all_args, 'robot_obs_dim', 0))}\n"
+            f"undetermined_obs_goal_radius: {float(getattr(all_args, 'undetermined_obs_goal_radius', 5.0))}\n"
+            f"undetermined_comm_radius: {float(getattr(all_args, 'undetermined_comm_radius', 6.0))}\n"
+            f"undetermined_hungarian_reward_scale: {float(getattr(all_args, 'undetermined_hungarian_reward_scale', 0.10))}\n"
+            f"undetermined_target_embed_dim: {int(getattr(all_args, 'undetermined_target_embed_dim', 32))}\n"
+            f"undetermined_max_auction_rounds: {int(getattr(all_args, 'undetermined_max_auction_rounds', 8))}\n"
+            f"undetermined_far_goal_progress_dist_thresh: {float(getattr(all_args, 'undetermined_far_goal_progress_dist_thresh', 4.0))}\n"
+            f"undetermined_far_goal_progress_boost: {float(getattr(all_args, 'undetermined_far_goal_progress_boost', 1.6))}\n"
+            f"undetermined_goal_distance_penalty_scale: {float(getattr(all_args, 'undetermined_goal_distance_penalty_scale', 0.004))}\n"
+            f"use_centralized_V: {bool(getattr(all_args, 'use_centralized_V', False))}\n"
+            f"formation_time_weight: {float(getattr(all_args, 'formation_time_weight_start', 1.0))}"
+            f" -> {float(getattr(all_args, 'formation_time_weight_end', 1.0))}\n"
+            f"formation_time_weight_decay_horizon: {float(getattr(all_args, 'formation_time_weight_decay_horizon', 1.0))}\n"
+            f"nd_discount_formation: {float(getattr(all_args, 'nd_discount_formation', 0.0))}\n"
+            f"nd_discount_avoid: {float(getattr(all_args, 'nd_discount_avoid', 50.0))}\n"
+            f"nd_discount_nav: {float(getattr(all_args, 'nd_discount_nav', 20.0))}\n"
+            f"nd_discount_goal: {float(getattr(all_args, 'nd_discount_goal', 200.0))}\n"
+            f"nd_goal_progress_coef: {float(getattr(all_args, 'nd_goal_progress_coef', 5.0))}\n"
+            f"nd_arrival_reward: {float(getattr(all_args, 'nd_arrival_reward', 0.0))}\n"
+            f"nd_goal_terminal_reward: {float(getattr(all_args, 'nd_goal_terminal_reward', 0.0))}\n"
+            f"nd_proximity_reward_scale: {float(getattr(all_args, 'nd_proximity_reward_scale', 0.0))}\n"
+            f"nd_heading_reward_scale: {float(getattr(all_args, 'nd_heading_reward_scale', 0.0))}\n"
+        )
     if bool(getattr(all_args, "use_attn_comm_actor", False)):
         _notes += (
             f"use_attn_comm_actor: True\n"
@@ -224,6 +350,11 @@ def main(args):
             f"attn_comm_human_slots: {int(getattr(all_args, 'attn_comm_human_slots', 0))}\n"
             f"attn_comm_max_ppo_samples_per_gpu: {int(getattr(all_args, 'attn_comm_max_ppo_samples_per_gpu', 0))}\n"
         )
+    _lat_note = getattr(all_args, "undet_v2_target_latent_model_dir", None)
+    if _lat_note and str(_lat_note).strip():
+        _notes += f"undet_v2_target_latent_model_dir: {_lat_note}\n"
+        _notes += f"undet_v2_latent_train_mode: {getattr(all_args, 'undet_v2_latent_train_mode', 'finetune_all')}\n"
+        _notes += f"undet_v2_target_head_aux_coef: {float(getattr(all_args, 'undet_v2_target_head_aux_coef', 0.0))}\n"
     _notes += f"num_mini_batch: {int(all_args.num_mini_batch)}\n"
     with open(_notes_path, "w", encoding="utf-8") as _nf:
         _nf.write(_notes)

@@ -10,6 +10,7 @@ from policy.mappo.utils.lstm import LSTMLayer
 from policy.mappo.utils.neighbor_attn_lstm import NeighborSelfAttnLSTM
 from policy.mappo.utils.attn_comm_encoder import AttnCommActorEncoder
 from policy.mappo.utils.popart import PopArt
+from policy.mappo.undetermined_target_head import UndeterminedTargetHead, UndeterminedTargetHeadV2
 from policy.utils.util import get_shape_from_obs_space
 from policy.mappo.utils.util import transform
 import time
@@ -52,6 +53,16 @@ class R_Actor(nn.Module):
             and not self.use_attn_comm
         )
         k_ag = int(args.num_agents)
+        self.enable_undetermined_goal = bool(getattr(args, "enable_undetermined_goal", False))
+        self.enable_undetermined_v2 = bool(getattr(args, "enable_undetermined_goal_v2", False))
+        if self.enable_undetermined_goal:
+            if self.enable_undetermined_v2:
+                m = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
+                self.undetermined_head = UndeterminedTargetHeadV2(args, m_slots=m)
+            else:
+                self.undetermined_head = UndeterminedTargetHead(args, k_ag)
+        else:
+            self.undetermined_head = None
         self.slot_m_for_actor = min(
             max(int(getattr(args, "dynamic_target_slot_count", 1)), 1),
             k_ag,
@@ -64,7 +75,17 @@ class R_Actor(nn.Module):
 
         base = MLPBase
         if self.use_attn_comm:
-            self.attn_comm_encoder = AttnCommActorEncoder(args)
+            _hy_split = None
+            if (
+                str(getattr(args, "architecture_mode", "default")) == "attn_undetermined_goal"
+                and self.enable_undetermined_goal
+                and self.enable_undetermined_v2
+            ):
+                m = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
+                _hy_split = 7 + 5 * m + 1
+            self.attn_comm_encoder = AttnCommActorEncoder(
+                args, hybrid_undetermined_v2_split=_hy_split
+            )
             self.comm_state_dim = int(self.attn_comm_encoder.state_dim)
             self.base_robot = None
             self.neighbor_branch = None
@@ -141,7 +162,7 @@ class R_Actor(nn.Module):
                 comm_rnn_states = torch.zeros(B, self.comm_state_dim, device=robot_obs.device, dtype=robot_obs.dtype)
             else:
                 comm_rnn_states = check(comm_rnn_states).to(**self.tpdv)
-            actor_features, comm_out, broadcast_msg = self.attn_comm_encoder(
+            actor_features, comm_out, broadcast_msg, _, _, _ = self.attn_comm_encoder(
                 robot_obs, comm_rnn_states, masks
             )
         elif self.neighbor_branch is not None:
@@ -217,13 +238,18 @@ class R_Actor(nn.Module):
             human_features = torch.zeros((robot_obs.shape[0], self.hidden_size), device=robot_obs.device, dtype=robot_obs.dtype)
 
         robot_obs = robot_obs[:, : self.robot_obs_shape]
+        logits_hat = None
+        out_ctx = None
+        actor_distill = None
         if self.use_attn_comm:
             B = robot_obs.shape[0]
             if comm_rnn_states is None:
                 comm_rnn_states = torch.zeros(B, self.comm_state_dim, device=robot_obs.device, dtype=robot_obs.dtype)
             else:
                 comm_rnn_states = check(comm_rnn_states).to(**self.tpdv)
-            actor_features, _, _ = self.attn_comm_encoder(robot_obs, comm_rnn_states, masks)
+            actor_features, _, _, logits_hat, out_ctx, actor_distill = self.attn_comm_encoder(
+                robot_obs, comm_rnn_states, masks
+            )
         elif self.neighbor_branch is not None:
             ego = torch.cat(
                 (
@@ -241,9 +267,12 @@ class R_Actor(nn.Module):
             else:
                 n_out = robot_obs.new_zeros(robot_obs.shape[0], self.hidden_size)
             actor_features = self.base_robot(ego) + n_out
+            actor_distill = actor_features
         else:
             actor_features = self.base_robot(robot_obs)
+            actor_distill = actor_features
         total_features = torch.cat((actor_features,human_features), dim=1)
+        total_distill = torch.cat((actor_distill, human_features), dim=1)
 
         # if self._use_naive_recurrent_policy or self._use_recurrent_policy:
         #     actor_features, rnn_states = self.rnn(actor_features, rnn_states, masks)
@@ -254,7 +283,15 @@ class R_Actor(nn.Module):
                                                                    active_masks if self._use_policy_active_masks
                                                                    else None)
 
-        return action_log_probs, dist_entropy
+        flat_logits = self.act.flat_logits(total_distill, available_actions)
+        return action_log_probs, dist_entropy, logits_hat, out_ctx, flat_logits
+
+    def get_undetermined_target_logits(self, robot_obs):
+        if self.undetermined_head is None:
+            raise RuntimeError("get_undetermined_target_logits called without enable_undetermined_goal")
+        robot_obs = check(robot_obs).to(**self.tpdv)
+        robot_obs = robot_obs[:, : self.robot_obs_shape]
+        return self.undetermined_head(robot_obs)
 
 
 class R_Critic(nn.Module):

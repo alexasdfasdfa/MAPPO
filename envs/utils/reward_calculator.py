@@ -122,10 +122,11 @@ class RewardCalculator:
         return r_comm, terms
 
     def _formation_time_weight(self) -> float:
-        """Linear τ∈[0,1] over episode; multiply formation base weights.
+        """Linear in τ_eff∈[0,1]; multiply formation base weights.
 
         Uses time at the start of the current transition (global_time was already
         advanced by time_step before reward), so the first step uses τ=0 → start weight.
+        τ_eff = min(1, τ / decay_horizon): smaller horizon ⇒ faster decay toward t1.
         """
         a = self.env.args
         t0 = float(getattr(a, "formation_time_weight_start", 1.0))
@@ -135,7 +136,66 @@ class RewardCalculator:
         gt = float(getattr(self.env, "global_time", 0.0))
         t_elapsed = max(0.0, gt - dt)
         tau = min(1.0, t_elapsed / tl)
-        return t0 + (t1 - t0) * tau
+        h = float(getattr(a, "formation_time_weight_decay_horizon", 1.0))
+        h = max(1e-6, min(1.0, h))
+        tau_eff = min(1.0, tau / h)
+        return t0 + (t1 - t0) * tau_eff
+
+    def _nd_goal_disk_raw_reward(self, robot: Any, a: Any) -> tuple[float, dict[str, float]]:
+        """
+        Goal-disk shaping for static_nd / undetermined: arrival + per-step stay + velocity inside disk;
+        subtract nd_goal_leave_penalty when the agent was inside the disk last state and is outside now.
+        r_formation remains <= 0 elsewhere (penalty-only).
+        """
+        robot.goal_flag = False
+        r_goal = 0.0
+        terms: dict[str, float] = {"nd_goal_leave_penalty_raw": 0.0}
+        rr = float(getattr(robot, "radius", 0.3))
+        if reach_goal(robot):
+            robot.goal_flag = True
+            r_goal += float(getattr(a, "nd_arrival_reward", 0.0))
+            r_goal += float(getattr(a, "nd_goal_stay_reward", 0.0))
+            vb = float(getattr(a, "nd_goal_inside_velocity_bonus", 0.0))
+            if float(getattr(robot, "v", 0.0)) > 1e-6:
+                r_goal += vb
+        else:
+            lp = float(getattr(a, "nd_goal_leave_penalty", 0.0))
+            if lp > 1e-12 and robot.pre_dist2goal is not None:
+                pre_in = float(robot.pre_dist2goal) <= rr + 1e-9
+                cur_out = float(robot.dist2goal) > rr + 1e-9
+                if pre_in and cur_out:
+                    r_goal -= lp
+                    terms["nd_goal_leave_penalty_raw"] = float(lp)
+        return r_goal, terms
+
+    def _nd_progress_delta(self, robot: Any, a: Any) -> float:
+        """Per-step distance change toward goal, clipped to limit nav exploit."""
+        if robot.pre_dist2goal is None:
+            return 0.0
+        raw = float(robot.pre_dist2goal) - float(robot.dist2goal)
+        clip = float(getattr(a, "nd_nav_progress_clip", 0.0))
+        if clip > 1e-12:
+            raw = max(-clip, min(clip, raw))
+        return raw
+
+    def _nd_timeout_no_goal_penalty(self, robot: Any, a: Any) -> tuple[float, dict[str, float]]:
+        """Sparse penalty on the first step global_time crosses time_limit, if agent not at goal."""
+        pen = float(getattr(a, "nd_timeout_no_goal_penalty", 0.0))
+        if pen >= -1e-12:
+            return 0.0, {}
+        env = self.env
+        tl = float(getattr(env, "time_limit", 1e9))
+        gt = float(getattr(env, "global_time", 0.0))
+        dt = float(getattr(env, "time_step", 0.1))
+        if gt + 1e-9 < tl:
+            return 0.0, {}
+        if gt - dt + 1e-9 >= tl:
+            return 0.0, {}
+        if robot.collision is True:
+            return 0.0, {}
+        if reach_goal(robot):
+            return 0.0, {}
+        return pen, {"nd_timeout_no_goal_penalty_raw": float(pen)}
 
     def _dynamic_explore_undervisible_bonus(
         self, robot: Any, *, density_mult: float = 1.0
@@ -516,18 +576,156 @@ class RewardCalculator:
         pen = scale * float(excess_sum) / float(n)
         return pen, float(excess_sum)
 
+    @staticmethod
+    def _hausdorff_directed(A: np.ndarray, B: np.ndarray) -> float:
+        """h(A,B) = max_{x in A} min_{y in B} ||x-y|| (2D)."""
+        if A.size == 0 or B.size == 0:
+            return 0.0
+        worst = 0.0
+        for i in range(A.shape[0]):
+            d = np.sqrt(((B - A[i]) ** 2).sum(axis=1))
+            worst = max(worst, float(np.min(d)))
+        return float(worst)
+
+    def _hausdorff_2d(self, P: np.ndarray, Q: np.ndarray) -> float:
+        """Symmetric Hausdorff distance d_HD(P,Q) = max(h(P,Q), h(Q,P))."""
+        if P.shape[0] == 0 or Q.shape[0] == 0:
+            return 0.0
+        return max(self._hausdorff_directed(P, Q), self._hausdorff_directed(Q, P))
+
+    def _ensure_attn_undetermined_team_cache(self) -> dict:
+        """
+        Paper (arXiv:2307.12287) Eq.(1)-(4): formation (HD + lag), navigation (centroid-destination + lag),
+        collision count; shared team terms, cached once per env step.
+        """
+        env = self.env
+        key = float(getattr(env, "global_time", 0.0))
+        if getattr(self, "_aud_team_key", None) == key:
+            return self._aud_team  # type: ignore
+        self._aud_team_key = key
+        a = env.args
+        n = int(env.robot_num)
+        pos = np.array([[float(r.px), float(r.py)] for r in env.robots], dtype=np.float64)
+        gp = getattr(env, "goal_positions", None)
+        if gp is None or len(gp) < n:
+            self._aud_team = {
+                "rf": 0.0,
+                "rv": 0.0,
+                "rc": 0.0,
+                "r_team": 0.0,
+                "d_hd": 0.0,
+                "centroid_dist": 0.0,
+                "n_coll_pairs": 0.0,
+            }
+            return self._aud_team
+        goals = np.array([[float(t[0]), float(t[1])] for t in gp[:n]], dtype=np.float64)
+        c_pos = pos.mean(axis=0)
+        P = pos - c_pos
+        c_goal = goals.mean(axis=0)
+        Delta = goals - c_goal
+        rp = float(np.linalg.norm(P, axis=1).mean()) + 1e-6
+        rd = float(np.linalg.norm(Delta, axis=1).mean()) + 1e-6
+        Delta_scaled = Delta * (rp / rd)
+        d_hd = self._hausdorff_2d(P, Delta_scaled)
+        w1 = float(getattr(a, "cons_decaf_omega1_lag", 0.1))
+        w2 = float(getattr(a, "cons_decaf_omega2_lag", 0.1))
+        rf = -d_hd - w1 * float(getattr(env, "_cons_decaf_rf_prev", 0.0))
+        env._cons_decaf_rf_prev = rf
+        nav_d = float(np.linalg.norm(c_pos - c_goal))
+        rv = -nav_d - w2 * float(getattr(env, "_cons_decaf_rv_prev", 0.0))
+        env._cons_decaf_rv_prev = rv
+        rr = float(env.robots[0].radius) if env.robots else 0.35
+        delta_safe = float(getattr(a, "cons_decaf_delta_safe", 0.0))
+        if delta_safe <= 1e-9:
+            delta_safe = 2.0 * rr
+        n_coll = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if cal_distance(env.robots[i].px, env.robots[i].py, env.robots[j].px, env.robots[j].py) < delta_safe:
+                    n_coll += 1
+        rc = float(n_coll)
+        wf = float(getattr(a, "cons_decaf_omega_f", 1.0))
+        wv = float(getattr(a, "cons_decaf_omega_v", 1.0))
+        wc = float(getattr(a, "cons_decaf_omega_c", 1.0))
+        r_team = wf * rf + wv * rv - wc * rc
+        self._aud_team = {
+            "rf": float(rf),
+            "rv": float(rv),
+            "rc": float(rc),
+            "r_team": float(r_team),
+            "d_hd": float(d_hd),
+            "centroid_dist": float(nav_d),
+            "n_coll_pairs": float(n_coll),
+            "wf": wf,
+            "wv": wv,
+            "wc": wc,
+        }
+        return self._aud_team
+
+    def _compute_attn_undetermined_goal_reward(self, robot: Any, for_feature: float) -> np.ndarray:
+        """Undetermined execution + ConsMAC obs; reward from paper Eq.(1)-(4), identical per agent."""
+        env = self.env
+        a = env.args
+        team = self._ensure_attn_undetermined_team_cache()
+        reward = float(team["r_team"])
+        gcoef = float(getattr(a, "cons_decaf_goal_disk_coef", 0.0))
+        r_goal_add = 0.0
+        nd_goal_terms: dict[str, float] = {}
+        if gcoef > 0.0:
+            r_goal_add, nd_goal_terms = self._nd_goal_disk_raw_reward(robot, a)
+            reward += gcoef * float(getattr(a, "nd_discount_goal", 200.0)) * float(r_goal_add)
+
+        tr = float(getattr(a, "nd_goal_terminal_reward", 0.0))
+        entered = False
+        nd_tr_applied = 0.0
+        if robot.goal_flag:
+            entered = bool(
+                robot.pre_dist2goal is not None
+                and robot.pre_dist2goal > robot.radius + 1e-9
+            )
+            if tr != 0.0 and entered:
+                reward += tr
+                nd_tr_applied = tr
+
+        robot._reward_terms = {
+            "reward_mode": "attn_undetermined_goal",
+            "cons_decaf_rf": float(team["rf"]),
+            "cons_decaf_rv": float(team["rv"]),
+            "cons_decaf_rc": float(team["rc"]),
+            "cons_decaf_r_team": float(team["r_team"]),
+            "cons_decaf_d_hd": float(team["d_hd"]),
+            "cons_decaf_centroid_dist": float(team["centroid_dist"]),
+            "cons_decaf_n_coll_pairs": float(team["n_coll_pairs"]),
+            "r_goal_raw": float(r_goal_add),
+            "reward_final": float(reward),
+            "nd_terminal_tr": float(tr),
+            "nd_tr_applied": float(nd_tr_applied),
+            "goal_entered_from_outside": float(1.0 if entered else 0.0),
+            "goal_flag": float(1.0 if robot.goal_flag else 0.0),
+            **{k: float(v) for k, v in nd_goal_terms.items()},
+        }
+        return np.array([reward])
+
     def compute_default_reward(self, robot: Any, for_feature: float) -> np.ndarray:
         """
         Preserve EnvCore.get_reward() current logic.
         """
         if getattr(self.env, "dynamic_goal_assignment", False):
             return self._compute_dynamic_goal_reward(robot, for_feature)
+        if getattr(self.env, "undetermined_goal_assignment", False):
+            _a = self.env.args
+            if getattr(self.env, "undetermined_goal_v2", False) and str(
+                getattr(_a, "architecture_mode", "default")
+            ) == "attn_undetermined_goal":
+                return self._compute_attn_undetermined_goal_reward(robot, for_feature)
+            if getattr(self.env, "undetermined_goal_v2", False):
+                return self._compute_undetermined_reward_v2(robot, for_feature)
+            return self._compute_undetermined_reward(robot, for_feature)
         a = self.env.args
         r_avoid = 0
         r_goal = 0
         r_nav = 0
         r_bonus = 0
-        robot.goal_flag = False
         # collision
         if robot.collision == True:
             r_avoid = -60
@@ -544,8 +742,8 @@ class RewardCalculator:
 
         # navigation: distance progress (local-obs-friendly dense signal)
         prog_coef = float(getattr(a, "nd_goal_progress_coef", 5.0))
-        if robot.pre_dist2goal is not None:
-            r_nav += (robot.pre_dist2goal - robot.dist2goal) * prog_coef
+        prog_delta = self._nd_progress_delta(robot, a)
+        r_nav += prog_delta * prog_coef
 
         pr = float(getattr(a, "nd_proximity_reward_scale", 0.0))
         if pr != 0.0:
@@ -565,11 +763,11 @@ class RewardCalculator:
         if r_nav > 0 and robot.collision:
             r_nav = 0
 
-        if reach_goal(robot):
-            robot.goal_flag = True
-            r_goal += float(getattr(a, "nd_arrival_reward", 0.0))
-            if robot.v != 0:
-                r_goal += 5
+        tpen, tterms = self._nd_timeout_no_goal_penalty(robot, a)
+        r_nav += tpen
+
+        r_goal_add, nd_goal_terms = self._nd_goal_disk_raw_reward(robot, a)
+        r_goal += r_goal_add
 
         if self.env.collision_flag:
             r_goal = 0
@@ -595,18 +793,15 @@ class RewardCalculator:
         entered = False
         nd_tr_applied = 0.0
         if robot.goal_flag:
-            if tr != 0.0:
-                entered = bool(
-                    robot.pre_dist2goal is not None
-                    and robot.pre_dist2goal > robot.radius + 1e-9
-                )
-                if entered:
-                    reward = reward_mid + tr
-                    nd_tr_applied = tr
-                else:
-                    reward = 0.0
+            entered = bool(
+                robot.pre_dist2goal is not None
+                and robot.pre_dist2goal > robot.radius + 1e-9
+            )
+            if tr != 0.0 and entered:
+                reward = reward_mid + tr
+                nd_tr_applied = tr
             else:
-                reward = 0.0
+                reward = reward_mid
 
         robot._reward_terms = {
             "reward_mode": "static_nd",
@@ -615,6 +810,7 @@ class RewardCalculator:
             "r_nav_raw": float(r_nav),
             "r_goal_raw": float(r_goal),
             "r_bonus_raw": float(r_bonus),
+            "nd_progress_delta_applied": float(prog_delta),
             "c_formation": float(c_formation),
             "formation_time_w": float(w_form),
             "c_avoid": float(c_avoid),
@@ -626,12 +822,306 @@ class RewardCalculator:
             "goal_entered_from_outside": float(1.0 if entered else 0.0),
             "goal_flag": float(1.0 if robot.goal_flag else 0.0),
             "reward_final": float(reward),
+            **{k: float(v) for k, v in nd_goal_terms.items()},
+            **{k: float(v) for k, v in tterms.items()},
             **{k: float(v) for k, v in comm_terms.items()},
         }
 
         return np.array([reward])
 
+    def _compute_undetermined_reward(self, robot: Any, for_feature: float) -> np.ndarray:
+        """
+        Like non-dynamic (nd_*) shaping + one-time Hungarian gap bonus per apply_undetermined_targets.
+        Extra: when far from assigned (gx,gy), progress coef is boosted; optional -scale*dist2goal pulls
+        agents in world frame (reduces drifting in relative S-shape without entering targets).
+        """
+        env = self.env
+        a = env.args
+        ridx = 0
+        try:
+            ridx = env.robots.index(robot)
+        except ValueError:
+            pass
 
+        r_avoid = 0.0
+        r_goal = 0.0
+        r_nav = 0.0
+        r_bonus = 0.0
+        if robot.collision == True:
+            r_avoid = -60.0
+        else:
+            if robot.dmin < robot.discomfort_dist * 2:
+                r_avoid = -float(np.exp(-robot.dmin / 3))
+
+        r_formation = -np.sqrt(max(float(for_feature), 0.0))
+        if abs(robot.pre_theta - robot.theta) > 0.7:
+            r_bonus = -1.0
+
+        prog_coef = float(getattr(a, "nd_goal_progress_coef", 5.0))
+        pc = prog_coef
+        if robot.pre_dist2goal is not None and robot.dist2goal is not None:
+            d_th = float(getattr(a, "undetermined_far_goal_progress_dist_thresh", 4.0))
+            bst = float(getattr(a, "undetermined_far_goal_progress_boost", 1.5))
+            if float(robot.dist2goal) > d_th:
+                pc *= bst
+        prog_delta = self._nd_progress_delta(robot, a)
+        r_nav += prog_delta * pc
+
+        pdp = float(getattr(a, "undetermined_goal_distance_penalty_scale", 0.0))
+        und_dist_pen = 0.0
+        if pdp > 1e-12 and robot.dist2goal is not None:
+            und_dist_pen = pdp * float(robot.dist2goal)
+            r_nav -= und_dist_pen
+
+        und_dist_quad = 0.0
+        pdq = float(getattr(a, "undetermined_goal_dist_penalty_quad_scale", 0.0))
+        if pdq > 1e-12 and robot.dist2goal is not None:
+            dg = float(robot.dist2goal)
+            und_dist_quad = pdq * dg * dg
+            r_nav -= und_dist_quad
+
+        pr = float(getattr(a, "nd_proximity_reward_scale", 0.0))
+        if pr != 0.0:
+            sig = max(float(getattr(a, "nd_proximity_sigma", 10.0)), 1e-6)
+            r_nav += pr * float(np.exp(-robot.dist2goal / sig))
+
+        hs = float(getattr(a, "nd_heading_reward_scale", 0.0))
+        if hs != 0.0 and robot.v > 1e-6:
+            gdx = float(robot.gx - robot.px)
+            gdy = float(robot.gy - robot.py)
+            ng = float(np.hypot(gdx, gdy))
+            if ng > 1e-6:
+                c = (np.cos(robot.theta) * gdx + np.sin(robot.theta) * gdy) / ng
+                vref = max(float(getattr(a, "nd_heading_v_ref", 1.0)), 1e-6)
+                r_nav += hs * max(0.0, float(c)) * min(float(robot.v) / vref, 1.0)
+
+        if r_nav > 0 and robot.collision:
+            r_nav = 0.0
+
+        tpen, tterms = self._nd_timeout_no_goal_penalty(robot, a)
+        r_nav += tpen
+
+        r_goal_add, nd_goal_terms = self._nd_goal_disk_raw_reward(robot, a)
+        r_goal += r_goal_add
+
+        if env.collision_flag:
+            r_goal = 0.0
+
+        discount_formation = float(getattr(a, "nd_discount_formation", 0.0))
+        w_form = self._formation_time_weight()
+        discount_avoid = float(getattr(a, "nd_discount_avoid", 50.0))
+        discount_nav = float(getattr(a, "nd_discount_nav", 20.0))
+        discount_goal = float(getattr(a, "nd_discount_goal", 200.0))
+
+        c_formation = discount_formation * w_form * r_formation
+        c_avoid = discount_avoid * r_avoid
+        c_nav = discount_nav * r_nav
+        c_goal = discount_goal * r_goal
+
+        hung = 0.0
+        if hasattr(env, "undetermined_hungarian_bonus") and env.undetermined_hungarian_bonus is not None:
+            if 0 <= ridx < len(env.undetermined_hungarian_bonus):
+                hung = float(env.undetermined_hungarian_bonus[ridx])
+                env.undetermined_hungarian_bonus[ridx] = 0.0
+
+        reward_mid = c_formation + c_avoid + c_nav + c_goal
+        reward_shaped_nd = reward_mid
+        reward = reward_mid + hung
+
+        tr = float(getattr(a, "nd_goal_terminal_reward", 0.0))
+        entered = False
+        nd_tr_applied = 0.0
+        if robot.goal_flag:
+            entered = bool(
+                robot.pre_dist2goal is not None
+                and robot.pre_dist2goal > robot.radius + 1e-9
+            )
+            if tr != 0.0 and entered:
+                reward = reward_shaped_nd + hung + tr
+                nd_tr_applied = tr
+            else:
+                reward = reward_shaped_nd + hung
+
+        robot._reward_terms = {
+            "reward_mode": "undetermined",
+            "r_avoid_raw": float(r_avoid),
+            "r_formation_raw": float(r_formation),
+            "r_nav_raw": float(r_nav),
+            "r_goal_raw": float(r_goal),
+            "nd_progress_delta_applied": float(prog_delta),
+            "undetermined_dist_penalty_raw": float(und_dist_pen),
+            "undetermined_dist_penalty_quad_raw": float(und_dist_quad),
+            "c_formation": float(c_formation),
+            "formation_time_w": float(w_form),
+            "c_avoid": float(c_avoid),
+            "c_nav": float(c_nav),
+            "c_goal": float(c_goal),
+            "undetermined_hungarian_bonus": float(hung),
+            "reward_shaped": float(reward_shaped_nd),
+            "reward_final": float(reward),
+            "nd_terminal_tr": float(tr),
+            "nd_tr_applied": float(nd_tr_applied),
+            "goal_entered_from_outside": float(1.0 if entered else 0.0),
+            "goal_flag": float(1.0 if robot.goal_flag else 0.0),
+            **{k: float(v) for k, v in nd_goal_terms.items()},
+            **{k: float(v) for k, v in tterms.items()},
+        }
+
+        return np.array([reward])
+
+    def _compute_undetermined_reward_v2(self, robot: Any, for_feature: float) -> np.ndarray:
+        """
+        Undetermined v2: same structure as v1 with capped soft-collision signal, approach shaping toward (gx,gy),
+        and distance penalties already scaled by config floors + undetermined_v2_dist_penalty_mult.
+        """
+        env = self.env
+        a = env.args
+        ridx = 0
+        try:
+            ridx = env.robots.index(robot)
+        except ValueError:
+            pass
+
+        r_avoid = 0.0
+        r_goal = 0.0
+        r_nav = 0.0
+        r_bonus = 0.0
+        cap_av = float(getattr(a, "undetermined_v2_avoid_exp_cap", 2.0))
+        if robot.collision == True:
+            r_avoid = -60.0
+        else:
+            if robot.dmin < robot.discomfort_dist * 2:
+                r_avoid = -min(float(np.exp(-robot.dmin / 3)), max(cap_av, 1e-6))
+
+        r_formation = -np.sqrt(max(float(for_feature), 0.0))
+        if abs(robot.pre_theta - robot.theta) > 0.7:
+            r_bonus = -1.0
+
+        prog_coef = float(getattr(a, "nd_goal_progress_coef", 5.0))
+        pc = prog_coef
+        if robot.pre_dist2goal is not None and robot.dist2goal is not None:
+            d_th = float(getattr(a, "undetermined_far_goal_progress_dist_thresh", 4.0))
+            bst = float(getattr(a, "undetermined_far_goal_progress_boost", 1.5))
+            if float(robot.dist2goal) > d_th:
+                pc *= bst
+        prog_delta = self._nd_progress_delta(robot, a)
+        r_nav += prog_delta * pc
+
+        apr_s = float(getattr(a, "undetermined_v2_approach_reward_scale", 0.0))
+        apr_cap = float(getattr(a, "undetermined_v2_approach_reward_cap", 0.55))
+        approach_term = 0.0
+        if (
+            apr_s > 1e-9
+            and not robot.collision
+            and robot.pre_dist2goal is not None
+            and robot.dist2goal is not None
+        ):
+            raw = float(robot.pre_dist2goal) - float(robot.dist2goal)
+            approach_term = apr_s * min(max(raw, 0.0), apr_cap)
+            r_nav += approach_term
+
+        pdp = float(getattr(a, "undetermined_goal_distance_penalty_scale", 0.0))
+        und_dist_pen = 0.0
+        if pdp > 1e-12 and robot.dist2goal is not None:
+            und_dist_pen = pdp * float(robot.dist2goal)
+            r_nav -= und_dist_pen
+
+        und_dist_quad = 0.0
+        pdq = float(getattr(a, "undetermined_goal_dist_penalty_quad_scale", 0.0))
+        if pdq > 1e-12 and robot.dist2goal is not None:
+            dg = float(robot.dist2goal)
+            und_dist_quad = pdq * dg * dg
+            r_nav -= und_dist_quad
+
+        pr = float(getattr(a, "nd_proximity_reward_scale", 0.0))
+        if pr != 0.0:
+            sig = max(float(getattr(a, "nd_proximity_sigma", 10.0)), 1e-6)
+            r_nav += pr * float(np.exp(-robot.dist2goal / sig))
+
+        hs = float(getattr(a, "nd_heading_reward_scale", 0.0))
+        if hs != 0.0 and robot.v > 1e-6:
+            gdx = float(robot.gx - robot.px)
+            gdy = float(robot.gy - robot.py)
+            ng = float(np.hypot(gdx, gdy))
+            if ng > 1e-6:
+                c = (np.cos(robot.theta) * gdx + np.sin(robot.theta) * gdy) / ng
+                vref = max(float(getattr(a, "nd_heading_v_ref", 1.0)), 1e-6)
+                r_nav += hs * max(0.0, float(c)) * min(float(robot.v) / vref, 1.0)
+
+        if r_nav > 0 and robot.collision:
+            r_nav = 0.0
+
+        tpen, tterms = self._nd_timeout_no_goal_penalty(robot, a)
+        r_nav += tpen
+
+        r_goal_add, nd_goal_terms = self._nd_goal_disk_raw_reward(robot, a)
+        r_goal += r_goal_add
+
+        if env.collision_flag:
+            r_goal = 0.0
+
+        discount_formation = float(getattr(a, "nd_discount_formation", 0.0))
+        w_form = self._formation_time_weight()
+        discount_avoid = float(getattr(a, "nd_discount_avoid", 50.0))
+        discount_nav = float(getattr(a, "nd_discount_nav", 20.0))
+        discount_goal = float(getattr(a, "nd_discount_goal", 200.0))
+
+        c_formation = discount_formation * w_form * r_formation
+        c_avoid = discount_avoid * r_avoid
+        c_nav = discount_nav * r_nav
+        c_goal = discount_goal * r_goal
+
+        hung = 0.0
+        if hasattr(env, "undetermined_hungarian_bonus") and env.undetermined_hungarian_bonus is not None:
+            if 0 <= ridx < len(env.undetermined_hungarian_bonus):
+                hung = float(env.undetermined_hungarian_bonus[ridx])
+                env.undetermined_hungarian_bonus[ridx] = 0.0
+
+        reward_mid = c_formation + c_avoid + c_nav + c_goal
+        reward_shaped_nd = reward_mid
+        reward = reward_mid + hung
+
+        tr = float(getattr(a, "nd_goal_terminal_reward", 0.0))
+        entered = False
+        nd_tr_applied = 0.0
+        if robot.goal_flag:
+            entered = bool(
+                robot.pre_dist2goal is not None
+                and robot.pre_dist2goal > robot.radius + 1e-9
+            )
+            if tr != 0.0 and entered:
+                reward = reward_shaped_nd + hung + tr
+                nd_tr_applied = tr
+            else:
+                reward = reward_shaped_nd + hung
+
+        robot._reward_terms = {
+            "reward_mode": "undetermined_v2",
+            "r_avoid_raw": float(r_avoid),
+            "r_formation_raw": float(r_formation),
+            "r_nav_raw": float(r_nav),
+            "r_goal_raw": float(r_goal),
+            "nd_progress_delta_applied": float(prog_delta),
+            "undetermined_v2_approach_raw": float(approach_term),
+            "undetermined_dist_penalty_raw": float(und_dist_pen),
+            "undetermined_dist_penalty_quad_raw": float(und_dist_quad),
+            "c_formation": float(c_formation),
+            "formation_time_w": float(w_form),
+            "c_avoid": float(c_avoid),
+            "c_nav": float(c_nav),
+            "c_goal": float(c_goal),
+            "undetermined_hungarian_bonus": float(hung),
+            "reward_shaped": float(reward_shaped_nd),
+            "reward_final": float(reward),
+            "nd_terminal_tr": float(tr),
+            "nd_tr_applied": float(nd_tr_applied),
+            "goal_entered_from_outside": float(1.0 if entered else 0.0),
+            "goal_flag": float(1.0 if robot.goal_flag else 0.0),
+            **{k: float(v) for k, v in nd_goal_terms.items()},
+            **{k: float(v) for k, v in tterms.items()},
+        }
+
+        return np.array([reward])
 
     def _compute_dynamic_goal_reward(self, robot: Any, for_feature: float) -> np.ndarray:
         """Team travel, conflicts, coordinated distance + assignment shaping, arrival signal.

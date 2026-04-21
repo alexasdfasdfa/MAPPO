@@ -22,6 +22,7 @@ class Robot(Agent):
 
         self.target_id = 0
         self.prev_target_id = 0
+        self.undetermined_target_pending = False
         self.prev_px = None
         self.prev_py = None
         self.target_switched_this_step = False

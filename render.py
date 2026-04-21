@@ -17,8 +17,12 @@ from config.config import (
     resolve_attn_comm_args,
     resolve_dynamic_target_reasoning_args,
     compute_attn_comm_robot_obs_dim,
+    compute_attn_comm_tail_dim,
     compute_dynamic_robot_obs_dim,
     compute_dynamic_robot_obs_dim_legacy_full_k,
+    compute_undetermined_robot_obs_dim,
+    compute_undetermined_v2_robot_obs_dim,
+    compute_undetermined_v2_attn_hybrid_robot_obs_dim,
     infer_dynamic_pack_from_actor_feat_dim,
 )
 
@@ -74,9 +78,22 @@ def align_render_args_from_actor_checkpoint(all_args):
         hs = int(getattr(all_args, "hidden_size", d_emb))
         if d_emb != hs:
             all_args.attn_comm_hidden_dim = d_emb
-        rod = compute_attn_comm_robot_obs_dim(P, H, message_dim=M)
         all_args.attn_comm_ally_slots = P
         all_args.attn_comm_human_slots = H
+        gh = "undetermined_head.goal_mlp.0.weight"
+        if gh in sd and str(getattr(all_args, "architecture_mode", "")) == "attn_undetermined_goal":
+            m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
+            all_args.enable_undetermined_goal = True
+            all_args.enable_undetermined_goal_v2 = True
+            rod = compute_undetermined_v2_attn_hybrid_robot_obs_dim(m, P, H, M)
+            all_args.robot_obs_dim = rod
+            tail = compute_attn_comm_tail_dim(P, H, M)
+            print(
+                f"[render] auto_align: attn_undetermined_goal hybrid M={m} P={P} H={H} "
+                f"tail={tail} robot_obs_dim={rod} num_agents={K}"
+            )
+            return
+        rod = compute_attn_comm_robot_obs_dim(P, H, message_dim=M)
         all_args.robot_obs_dim = rod
         print(
             f"[render] auto_align: attn_comm actor (fixed targets) P={P} H={H} "
@@ -144,11 +161,49 @@ def align_render_args_from_actor_checkpoint(all_args):
         )
     else:
         all_args.enable_dynamic_goal_assignment = False
-        all_args.robot_obs_dim = max(7, D - 2)
-        print(
-            f"[render] auto_align: non-dynamic, robot_obs_dim={all_args.robot_obs_dim} "
-            f"(actor input dim {D})"
-        )
+        gh = "undetermined_head.goal_mlp.0.weight"
+        if gh in sd:
+            all_args.enable_undetermined_goal = True
+            in_f = int(sd[gh].shape[1])
+            rod_bc = max(7, D - 2)
+            if in_f == 5:
+                all_args.enable_undetermined_goal_v2 = True
+                m_slots = (rod_bc - 8) // 5
+                if m_slots < 1 or (rod_bc - 8) % 5 != 0:
+                    m_slots = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
+                    print(
+                        f"[render] auto_align WARN: undetermined v2 obs dim {rod_bc} does not match "
+                        f"7+5*M+1; using undetermined_v2_goal_slots={m_slots}"
+                    )
+                all_args.undetermined_v2_goal_slots = m_slots
+                all_args.robot_obs_dim = compute_undetermined_v2_robot_obs_dim(m_slots)
+                print(
+                    f"[render] auto_align: undetermined goal v2, M={m_slots}, "
+                    f"robot_obs_dim={all_args.robot_obs_dim} (actor input dim {D})"
+                )
+            else:
+                all_args.enable_undetermined_goal_v2 = False
+                k_inf = (rod_bc - 7) // 5
+                if k_inf >= 1 and rod_bc == 7 + 5 * k_inf:
+                    all_args.num_agents = k_inf
+                else:
+                    k_inf = int(getattr(all_args, "num_agents", 10))
+                    all_args.num_agents = k_inf
+                    print(
+                        f"[render] auto_align WARN: undetermined v1 K infer from rod={rod_bc} failed; "
+                        f"using num_agents={k_inf}"
+                    )
+                all_args.robot_obs_dim = compute_undetermined_robot_obs_dim(int(all_args.num_agents))
+                print(
+                    f"[render] auto_align: undetermined goal v1, K={int(all_args.num_agents)}, "
+                    f"robot_obs_dim={all_args.robot_obs_dim} (actor input dim {D})"
+                )
+        else:
+            all_args.robot_obs_dim = max(7, D - 2)
+            print(
+                f"[render] auto_align: non-dynamic, robot_obs_dim={all_args.robot_obs_dim} "
+                f"(actor input dim {D})"
+            )
 
 
 def _warn_checkpoint_dynamic_goal_head_mismatch(all_args):
@@ -257,12 +312,12 @@ def main(args):
     parser = get_config()
     all_args = parser_args(args, parser)
     all_args.use_render = True
-    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run60/models'
+    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run83/models'
     all_args.n_rollout_threads = 1
     all_args.episode_length = 500
     all_args.visualize = False
     all_args.render_episodes = 100
-    all_args.num_attention_agents = 5
+    all_args.num_attention_agents = 10
     all_args.num_humans = 2
     all_args.method = 'ppo'
 

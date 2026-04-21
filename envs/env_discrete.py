@@ -6,6 +6,9 @@ from config.config import (
     compute_attn_comm_robot_obs_dim,
     compute_dynamic_robot_obs_dim,
     compute_dynamic_robot_obs_dim_legacy_full_k,
+    compute_undetermined_robot_obs_dim,
+    compute_undetermined_v2_robot_obs_dim,
+    compute_undetermined_v2_attn_hybrid_robot_obs_dim,
     resolve_attn_comm_args,
 )
 import configparser
@@ -34,7 +37,28 @@ class DiscreteActionEnv(gym.Env):
             )
             if int(getattr(all_args, "robot_obs_dim", 7)) != exp:
                 all_args.robot_obs_dim = exp
-        if getattr(all_args, "enable_dynamic_goal_assignment", False):
+        if getattr(all_args, "enable_undetermined_goal", False):
+            k = int(all_args.num_agents)
+            if getattr(all_args, "enable_undetermined_goal_v2", False):
+                m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
+                if (
+                    str(getattr(all_args, "architecture_mode", "default")) == "attn_undetermined_goal"
+                    and getattr(all_args, "use_attn_comm_actor", False)
+                ):
+                    resolve_attn_comm_args(all_args)
+                    exp = compute_undetermined_v2_attn_hybrid_robot_obs_dim(
+                        m,
+                        int(all_args.attn_comm_ally_slots),
+                        int(all_args.attn_comm_human_slots),
+                        int(getattr(all_args, "attn_comm_message_dim", 16)),
+                    )
+                else:
+                    exp = compute_undetermined_v2_robot_obs_dim(m)
+            else:
+                exp = compute_undetermined_robot_obs_dim(k)
+            if int(getattr(all_args, "robot_obs_dim", 7)) != exp:
+                all_args.robot_obs_dim = exp
+        elif getattr(all_args, "enable_dynamic_goal_assignment", False):
             k = int(all_args.num_agents)
             ver = getattr(all_args, "dynamic_obs_pack_version", "slots")
             if ver == "legacy":
@@ -73,7 +97,9 @@ class DiscreteActionEnv(gym.Env):
         self.robot_observation_space = []
         self.human_observation_space = []
         self.share_observation_space = []
-        share_obs_dim = 0
+        # Match SharedReplayBuffer / EnvCore joint layout: num_agents * num_rows * (obs_dim+2)
+        _num_rows_cent = 1 + max(self.human_num, self.att_agents)
+        share_obs_dim = int(self.robot_num) * _num_rows_cent * (self.obs_dim + 2)
 
         for agent_idx in range(self.robot_num):
             total_action_space = []
@@ -99,7 +125,6 @@ class DiscreteActionEnv(gym.Env):
                 self.action_space.append(total_action_space[0])
 
             # observation space
-            share_obs_dim += self.obs_dim+2 # add px and py
             self.robot_observation_space.append(
                 spaces.Box(
                     low=-np.inf,
@@ -109,7 +134,6 @@ class DiscreteActionEnv(gym.Env):
                 ))  # [-inf,inf]
         
         for human in range(max(self.human_num, self.att_agents)):
-            share_obs_dim += self.obs_dim+2 
             self.human_observation_space.append(
                 spaces.Box(
                     low=-np.inf,
@@ -164,6 +188,10 @@ class DiscreteActionEnv(gym.Env):
 
     def set_comm_broadcasts(self, msgs):
         self.env.set_comm_broadcasts(msgs)
+
+    def apply_undetermined_targets(self, targets):
+        self.env.apply_undetermined_targets(targets)
+        return self.env.refresh_observations_after_target_change()
 
     def reset(self):
         obs = self.env.reset()

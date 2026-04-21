@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from tensorboardX import SummaryWriter
 from policy.utils.shared_buffer import SharedReplayBuffer
+from policy.mappo.undet_v2_latent_ckpt import apply_undet_v2_target_latent_heads
 
 def _t2n(x):
     """Convert torch tensor to a numpy array."""
@@ -74,6 +75,8 @@ class Runner(object):
 
         if self.model_dir is not None:
             self.restore()
+
+        apply_undet_v2_target_latent_heads(self.all_args, [self.policy.actor], self.device)
 
         # algorithm
         self.trainer = TrainAlgo(self.all_args, self.policy, device = self.device)

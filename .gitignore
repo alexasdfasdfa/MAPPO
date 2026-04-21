@@ -1,0 +1,5 @@
+# Job logs, run artifacts, exports (exclude from push)
+swarm.*.out
+results/
+data.csv
+fig/

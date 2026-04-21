@@ -176,6 +176,9 @@ def worker(remote, parent_remote, env_fn_wrapper):
         elif cmd == 'set_comm_broadcasts':
             env.set_comm_broadcasts(data)
             remote.send(None)
+        elif cmd == 'apply_undetermined_targets':
+            ob = env.apply_undetermined_targets(data)
+            remote.send(ob)
         else:
             raise NotImplementedError
 
@@ -243,6 +246,14 @@ class SubprocVecEnv(ShareVecEnv):   #多线程环境，一般用于训练
         for remote in self.remotes:
             remote.recv()
 
+    def apply_undetermined_targets(self, targets):
+        """targets: (num_envs, num_agents) int array of goal indices."""
+        t = np.asarray(targets, dtype=np.int64)
+        for remote, row in zip(self.remotes, t):
+            remote.send(('apply_undetermined_targets', row))
+        obs = [remote.recv() for remote in self.remotes]
+        return np.stack(obs)
+
 class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测试
     def __init__(self, env_fns, args):
         self.envs = [fn() for fn in env_fns]
@@ -257,7 +268,15 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
     def step_wait(self):
         if self.method == 'ppo':
             results = self.envs[0].step(self.actions)
-            obs, rews, dones, infos = map(np.array, zip(results))   #map用于将函数变成指定形式
+            r0, r1, r2, infos_raw = results
+            # Preserve legacy shape (1, n_agents, ...) for vec batching; do not np-wrap infos.
+            obs = np.array((r0,))
+            rews = np.array((r1,))
+            dones = np.array((r2,))
+            if isinstance(infos_raw, (list, tuple)):
+                infos = (list(infos_raw),)
+            else:
+                infos = (infos_raw,)
             # if np.all(dones):
                 # print(dones)
                 # self.reset()
@@ -287,6 +306,14 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
         else:
             for i, env in enumerate(self.envs):
                 env.set_comm_broadcasts(b[i])
+
+    def apply_undetermined_targets(self, targets):
+        t = np.asarray(targets, dtype=np.int64)
+        if t.ndim == 1:
+            obs = self.envs[0].apply_undetermined_targets(t)
+            return np.array([obs])
+        obs_list = [self.envs[i].apply_undetermined_targets(t[i]) for i in range(len(self.envs))]
+        return np.stack(obs_list)
 
     def render(self, mode="vedio", visualize=False):
         episode_success = self.envs[0].render(mode=mode,visualize=visualize)

@@ -1,6 +1,9 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from policy.mappo.cons_decaf_utils import kl_ce_loss_paper
+from policy.mappo.undet_v2_latent_ckpt import undetermined_v2_slot_supervision_loss
 from policy.utils.util import get_gard_norm, huber_loss, mse_loss
 from policy.utils.valuenorm import ValueNorm
 from policy.mappo.utils.util import check
@@ -23,6 +26,15 @@ class RMAPPO():
         self.device = device
         self.tpdv = dict(dtype=torch.float32, device=device)
         self.policy = policy
+        self._args = args
+        self._undet_v2_head_aux_coef = float(getattr(args, "undet_v2_target_head_aux_coef", 0.0))
+        self._undet_v2_head_aux_on = (
+            self._undet_v2_head_aux_coef > 0.0
+            and getattr(args, "enable_undetermined_goal_v2", False)
+            and not getattr(args, "use_attn_comm_actor", False)
+            and str(getattr(args, "undet_v2_latent_train_mode", "finetune_all")) == "finetune_all"
+            and getattr(policy.actor, "undetermined_head", None) is not None
+        )
 
         self.clip_param = args.clip_param
         self.ppo_epoch = args.ppo_epoch
@@ -117,7 +129,12 @@ class RMAPPO():
 
         # Reshape to do in a single forward pass for all steps
         comm_arg = None if comm_rnn_states_batch is None else check(comm_rnn_states_batch).to(**self.tpdv)
-        values, action_log_probs, dist_entropy = self.policy.evaluate_actions(
+        self.policy.actor_optimizer.zero_grad()
+        if getattr(self.policy, "ce_optimizer", None) is not None:
+            self.policy.ce_optimizer.zero_grad()
+        self.policy.critic_optimizer.zero_grad()
+
+        values, action_log_probs, dist_entropy, logits_hat, out_ctx, flat_logits = self.policy.evaluate_actions(
             share_obs_batch,
             robot_obs_batch,
             human_obs_batch,
@@ -144,24 +161,89 @@ class RMAPPO():
 
         policy_loss = policy_action_loss
 
-        self.policy.actor_optimizer.zero_grad()
+        cc = float(getattr(self.policy, "cons_mac_ce_coef", 0.0))
+        dc = float(getattr(self.policy, "cons_mac_distill_coef", 0.0))
+        t_out = None
+        t_flat = None
+        if dc > 0.0 and getattr(self.policy, "teacher_actor", None) is not None and flat_logits is not None:
+            with torch.no_grad():
+                _, _, _, _, t_out, t_flat = self.policy.teacher_actor.evaluate_actions(
+                    robot_obs_batch,
+                    human_obs_batch,
+                    rnn_states_batch,
+                    actions_batch,
+                    masks_batch,
+                    available_actions_batch,
+                    active_masks_batch,
+                    comm_rnn_states=comm_arg,
+                )
 
+        loss_actor = policy_loss - dist_entropy * self.entropy_coef
+        if (
+            dc > 0.0
+            and t_flat is not None
+            and flat_logits is not None
+            and t_flat.shape == flat_logits.shape
+        ):
+            loss_actor = loss_actor + dc * F.mse_loss(flat_logits, t_flat)
+
+        undet_head_aux = None
+        if update_actor and self._undet_v2_head_aux_on:
+            ro = check(robot_obs_batch).to(**self.tpdv)
+            logits_u = self.policy.actor.get_undetermined_target_logits(ro)
+            rr = float(getattr(self._args, "undetermined_obs_goal_radius", 5.0))
+            am = active_masks_batch if self._use_policy_active_masks else None
+            aux = undetermined_v2_slot_supervision_loss(ro, logits_u, goal_rr=rr, active_mask=am)
+            undet_head_aux = self._undet_v2_head_aux_coef * aux
+            loss_actor = loss_actor + undet_head_aux
+
+        l_ce_side = None
+        if getattr(self.policy, "ce_optimizer", None) is not None:
+            ce_parts = []
+            if (
+                cc > 0.0
+                and logits_hat is not None
+                and getattr(self.policy, "global_label_head", None) is not None
+            ):
+                share_flat = check(share_obs_batch).to(**self.tpdv).reshape(logits_hat.shape[0], -1)
+                e_g = self.policy.global_label_head(share_flat).detach()
+                if e_g.shape[-1] == logits_hat.shape[-1]:
+                    ce_parts.append(cc * kl_ce_loss_paper(e_g, logits_hat))
+            if (
+                dc > 0.0
+                and out_ctx is not None
+                and t_out is not None
+                and out_ctx.shape == t_out.shape
+            ):
+                ce_parts.append(dc * F.mse_loss(out_ctx, t_out))
+            if ce_parts:
+                l_ce_side = sum(ce_parts)
+
+        value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
+
+        need_retain_ce = update_actor and (l_ce_side is not None)
         if update_actor:
-            (policy_loss - dist_entropy * self.entropy_coef).backward()
+            loss_actor.backward(retain_graph=need_retain_ce)
+            if l_ce_side is not None:
+                l_ce_side.backward(retain_graph=True)
+
+        (value_loss * self.value_loss_coef).backward()
 
         if self._use_max_grad_norm:
             actor_grad_norm = nn.utils.clip_grad_norm_(self.policy.actor.parameters(), self.max_grad_norm)
         else:
             actor_grad_norm = get_gard_norm(self.policy.actor.parameters())
 
-        self.policy.actor_optimizer.step()
+        if update_actor:
+            self.policy.actor_optimizer.step()
 
-        # critic update
-        value_loss = self.cal_value_loss(values, value_preds_batch, return_batch, active_masks_batch)
-
-        self.policy.critic_optimizer.zero_grad()
-
-        (value_loss * self.value_loss_coef).backward()
+        if update_actor and getattr(self.policy, "ce_optimizer", None) is not None and l_ce_side is not None:
+            if self._use_max_grad_norm:
+                nn.utils.clip_grad_norm_(
+                    [p for g in self.policy.ce_optimizer.param_groups for p in g["params"]],
+                    self.max_grad_norm,
+                )
+            self.policy.ce_optimizer.step()
 
         if self._use_max_grad_norm:
             critic_grad_norm = nn.utils.clip_grad_norm_(self.policy.critic.parameters(), self.max_grad_norm)
@@ -170,7 +252,9 @@ class RMAPPO():
 
         self.policy.critic_optimizer.step()
 
-        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights
+        undet_aux_item = float(undet_head_aux.detach().item()) if undet_head_aux is not None else None
+
+        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, undet_aux_item
 
     def train(self, buffer, update_actor=True):
         """
@@ -198,6 +282,8 @@ class RMAPPO():
         train_info['actor_grad_norm'] = 0
         train_info['critic_grad_norm'] = 0
         train_info['ratio'] = 0
+        if self._undet_v2_head_aux_on:
+            train_info["undet_head_aux_loss"] = 0.0
 
         for _ in range(self.ppo_epoch):#耗时16
             if self._use_recurrent_policy:
@@ -208,7 +294,7 @@ class RMAPPO():
                 data_generator = buffer.feed_forward_generator(advantages, self.num_mini_batch)  #用yield在函数中返回可迭代的结果
 
             for sample in data_generator:#每轮耗时约1s
-                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights \
+                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, undet_aux_item \
                     = self.ppo_update(sample, update_actor)
 
                 train_info['value_loss'] += value_loss.item()
@@ -217,6 +303,8 @@ class RMAPPO():
                 train_info['actor_grad_norm'] += actor_grad_norm
                 train_info['critic_grad_norm'] += critic_grad_norm
                 train_info['ratio'] += imp_weights.mean()
+                if self._undet_v2_head_aux_on and undet_aux_item is not None:
+                    train_info["undet_head_aux_loss"] += undet_aux_item
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 

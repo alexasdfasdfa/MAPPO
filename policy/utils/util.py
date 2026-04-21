@@ -37,6 +37,16 @@ def get_shape_from_obs_space(obs_space):
         raise NotImplementedError
     return obs_shape
 
+
+def compute_joint_share_obs_flat_dim(args) -> int:
+    """
+    Flattened centralized share_obs length per (env, agent) slot.
+    Must match SharedReplayBuffer: num_agents * num_rows * obs_row_dim.
+    """
+    obs_row_dim = max(int(getattr(args, "robot_obs_dim", 0)), int(getattr(args, "human_obs_dim", 0))) + 2
+    num_rows = 1 + max(int(getattr(args, "num_humans", 0)), int(getattr(args, "num_attention_agents", 0)))
+    return int(getattr(args, "num_agents", 1)) * num_rows * obs_row_dim
+
 def get_shape_from_act_space(act_space):
     if act_space.__class__.__name__ == 'Discrete':
         act_shape = 1

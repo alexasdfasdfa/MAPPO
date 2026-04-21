@@ -9,6 +9,8 @@ Grouped observation encoders + cross-step intent communication for MAPPO actor (
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -25,6 +27,9 @@ class AttnCommActorEncoder(nn.Module):
     """
     robot_obs layout (px, py last):
       [self_7 | allies P*6 | recv P*M | humans H*5 | obstacle_4 | px py]
+
+    Hybrid layout (undetermined v2 goal block + same ConsMAC tail, px py still last):
+      [self_7 | undetermined_v2_middle... | allies P*6 | recv P*M | humans H*5 | obst_4 | px py]
     """
 
     SELF_DIM = 7
@@ -32,7 +37,7 @@ class AttnCommActorEncoder(nn.Module):
     HUMAN_DIM = 5
     OBST_DIM = 4
 
-    def __init__(self, args):
+    def __init__(self, args, hybrid_undetermined_v2_split: Optional[int] = None):
         super().__init__()
         self.hidden_size = int(args.hidden_size)
         # Internal trunk width; 0 or None -> use hidden_size (legacy full-width)
@@ -44,6 +49,16 @@ class AttnCommActorEncoder(nn.Module):
         self.register_buffer("_attn_comm_h", torch.tensor(self.H, dtype=torch.int64))
         self.msg_dim = max(8, int(getattr(args, "attn_comm_message_dim", 16)))
         self.state_dim = int(getattr(args, "attn_comm_state_dim", None) or self.hidden_size)
+        # When set, robot_obs is [self_7 | ... arbitrary middle ... | attn_tail | px py]
+        self._hybrid_split: Optional[int] = (
+            int(hybrid_undetermined_v2_split) if hybrid_undetermined_v2_split is not None else None
+        )
+        P, Hn, M = self.P, self.H, self.msg_dim
+        self._hybrid_tail_len = (
+            P * self.ALLY_DIM + P * M + Hn * self.HUMAN_DIM + self.OBST_DIM
+            if self._hybrid_split is not None
+            else 0
+        )
         nh = _n_heads_for(self.d, int(getattr(args, "attn_comm_gat_heads", 2)))
         nh_out = _n_heads_for(self.d, min(nh, 4))
 
@@ -81,29 +96,52 @@ class AttnCommActorEncoder(nn.Module):
             nn.ReLU(),
             nn.Linear(self.hidden_size, self.hidden_size),
         )
+        # Cons-DecAF (arXiv:2307.12287): CE global estimator logits_hat; PPO does not backprop into CE stack
+        # when this flag is set (detach consensus path into fuse / msg_head per Sec. III-A3).
+        self.use_cons_decaf = str(getattr(args, "architecture_mode", "default")) == "attn_undetermined_goal"
+        self.ce_bins = max(2, int(getattr(args, "cons_mac_ce_bins", 32)))
+        self.global_estimator = (
+            nn.Linear(self.d, self.ce_bins) if self.use_cons_decaf else None
+        )
 
     def forward(
         self,
         robot_obs: torch.Tensor,
         comm_rnn: torch.Tensor,
-        masks: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        masks: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
-        :return: (actor_features, comm_rnn_out, broadcast_msg) with broadcast_msg (B, msg_dim).
+        :return: (actor_features, comm_rnn_out, broadcast_msg, logits_hat_or_none, consensus_h=out_ctx,
+                  actor_features_for_distill). Policy path uses detached consensus into fuse; distill path uses
+                  the same fuse on non-detached tensors so PD / auxiliary losses can update the comm stack.
         """
         B = robot_obs.shape[0]
         P, Hn, M = self.P, self.H, self.msg_dim
         d = self.d
-        s = 0
-        self_vec = robot_obs[:, s : s + self.SELF_DIM]
-        s += self.SELF_DIM
-        ally = robot_obs[:, s : s + P * self.ALLY_DIM].reshape(B, P, self.ALLY_DIM)
-        s += P * self.ALLY_DIM
-        recv = robot_obs[:, s : s + P * M].reshape(B, P, M)
-        s += P * M
-        hum = robot_obs[:, s : s + Hn * self.HUMAN_DIM].reshape(B, Hn, self.HUMAN_DIM)
-        s += Hn * self.HUMAN_DIM
-        obst = robot_obs[:, s : s + self.OBST_DIM].reshape(B, 1, self.OBST_DIM)
+        if self._hybrid_split is None:
+            s = 0
+            self_vec = robot_obs[:, s : s + self.SELF_DIM]
+            s += self.SELF_DIM
+            ally = robot_obs[:, s : s + P * self.ALLY_DIM].reshape(B, P, self.ALLY_DIM)
+            s += P * self.ALLY_DIM
+            recv = robot_obs[:, s : s + P * M].reshape(B, P, M)
+            s += P * M
+            hum = robot_obs[:, s : s + Hn * self.HUMAN_DIM].reshape(B, Hn, self.HUMAN_DIM)
+            s += Hn * self.HUMAN_DIM
+            obst = robot_obs[:, s : s + self.OBST_DIM].reshape(B, 1, self.OBST_DIM)
+        else:
+            sp = int(self._hybrid_split)
+            tl = int(self._hybrid_tail_len)
+            self_vec = robot_obs[:, : self.SELF_DIM]
+            tail = robot_obs[:, sp : sp + tl]
+            s = 0
+            ally = tail[:, s : s + P * self.ALLY_DIM].reshape(B, P, self.ALLY_DIM)
+            s += P * self.ALLY_DIM
+            recv = tail[:, s : s + P * M].reshape(B, P, M)
+            s += P * M
+            hum = tail[:, s : s + Hn * self.HUMAN_DIM].reshape(B, Hn, self.HUMAN_DIM)
+            s += Hn * self.HUMAN_DIM
+            obst = tail[:, s : s + self.OBST_DIM].reshape(B, 1, self.OBST_DIM)
 
         h_self = F.relu(self.embed_self(self_vec))
 
@@ -146,7 +184,25 @@ class AttnCommActorEncoder(nn.Module):
         else:
             out_ctx = self.out_q(h_out)
 
-        broadcast_msg = self.msg_head(torch.cat((h_out, out_ctx), dim=-1))
+        if self.use_cons_decaf and self.global_estimator is not None:
+            broadcast_msg = self.msg_head(torch.cat((h_out.detach(), out_ctx.detach()), dim=-1))
+            fused_in = torch.cat(
+                (
+                    h_self.detach(),
+                    ally_pool.detach(),
+                    human_pool.detach(),
+                    obst_pool.detach(),
+                    h_out.detach(),
+                    out_ctx.detach(),
+                ),
+                dim=-1,
+            )
+            fused_full = torch.cat((h_self, ally_pool, human_pool, obst_pool, h_out, out_ctx), dim=-1)
+            actor_distill = self.fuse(fused_full)
+            logits_hat = self.global_estimator(out_ctx)
+            return self.fuse(fused_in), h_out, broadcast_msg, logits_hat, out_ctx, actor_distill
 
+        broadcast_msg = self.msg_head(torch.cat((h_out, out_ctx), dim=-1))
         fused_in = torch.cat((h_self, ally_pool, human_pool, obst_pool, h_out, out_ctx), dim=-1)
-        return self.fuse(fused_in), h_out, broadcast_msg
+        actor_f = self.fuse(fused_in)
+        return actor_f, h_out, broadcast_msg, None, out_ctx, actor_f

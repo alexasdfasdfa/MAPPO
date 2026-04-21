@@ -49,8 +49,225 @@ def get_config():
     parser.add_argument(
         "--enable_dynamic_goal_assignment",
         action="store_true",
-        default=True,
+        default=False,
         help="Robots choose a discrete target index each step; claims + path-length / conflict shaping rewards.",
+    )
+    parser.add_argument(
+        "--enable_undetermined_goal",
+        action="store_true",
+        default=True,
+        help="Undetermined goal mode: sticky targets, embedding-based selection + auction, Hungarian shaping once per "
+        "assignment; motion is dir+vel only (like non-dynamic). Mutually exclusive with --enable_dynamic_goal_assignment.",
+    )
+    parser.add_argument(
+        "--undetermined_obs_goal_radius",
+        type=float,
+        default=5.0,
+        help="Within this distance to a goal center, agent observes claimed status for that goal.",
+    )
+    parser.add_argument(
+        "--undetermined_comm_radius",
+        type=float,
+        default=6.0,
+        help="Local communication radius: agents this close with same target trigger auction tie-break.",
+    )
+    parser.add_argument(
+        "--undetermined_hungarian_reward_scale",
+        type=float,
+        default=0.10,
+        help="Per-agent reward scale: -scale * (current_assignment_cost - optimal_cost) / n once per assignment batch. "
+        "Train script caps at 0.10 in undetermined mode so it does not overwhelm navigation.",
+    )
+    parser.add_argument(
+        "--undetermined_target_embed_dim",
+        type=int,
+        default=32,
+        help="Embedding dim for undetermined target-selection head (dot-product preferences).",
+    )
+    parser.add_argument(
+        "--undetermined_max_auction_rounds",
+        type=int,
+        default=8,
+        help="Max rounds of target-selection + apply_undetermined_targets while any agent is pending.",
+    )
+    parser.add_argument(
+        "--enable_undetermined_goal_v2",
+        action="store_true",
+        default=True,
+        help="Undetermined v2: observation uses fixed M nearest-goal slots (not 4*K + (K-1) peer tids tied to swarm size); "
+        "target head scores M slots then maps to global goal id. Requires --enable_undetermined_goal. "
+        "Uses apply_undetermined_v2_reward_floors (softer avoid / distance shaping, approach bonus, Hungarian divisor decoupled from N).",
+    )
+    parser.add_argument(
+        "--undetermined_v2_goal_slots",
+        type=int,
+        default=10,
+        help="Number of nearest-goal slots packed into each robot obs in undetermined v2 (capped by K at runtime).",
+    )
+    parser.add_argument(
+        "--undet_v2_target_latent_model_dir",
+        type=str,
+        default=None,
+        help="When --enable_undetermined_goal_v2 and --use_attn_comm_actor is disabled: path to a run folder "
+        "(e.g. results/train/<undet_v2_target_latent>/ with models/actor.pt) or a direct actor.pt. "
+        "After optional model_dir restore, loads only undetermined_head.* into the actor(s) for target selection.",
+    )
+    parser.add_argument(
+        "--undet_v2_latent_train_mode",
+        type=str,
+        default="finetune_all",
+        choices=["motion_only", "finetune_all"],
+        help="With undet_v2_target_latent_model_dir: motion_only freezes undetermined_head (train navigation / "
+        "base actor only). finetune_all keeps the head trainable and adds a small supervised slot loss during PPO "
+        "(rollout target picks are no_grad, so the head needs this aux term to receive gradients).",
+    )
+    parser.add_argument(
+        "--undet_v2_target_head_aux_coef",
+        type=float,
+        default=0.1,
+        help="When undet_v2_latent_train_mode=finetune_all (undetermined v2, no attn actor): weight on auxiliary "
+        "cross-entropy that matches the nearest-M slot to the goal implied by obs (gx,gy). Set 0 to disable aux "
+        "(head will then not get gradients from PPO). Ignored in motion_only.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_hungarian_team_divisor",
+        type=float,
+        default=8.0,
+        help="Undetermined v2: Hungarian per-agent bonus uses -scale*gap/divisor instead of dividing by num_agents.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_avoid_exp_cap",
+        type=float,
+        default=2.0,
+        help="Undetermined v2: cap |r_avoid_raw| from exp discomfort so nd_discount_avoid does not dominate returns.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_discount_avoid_mult",
+        type=float,
+        default=0.42,
+        help="Undetermined v2: multiply nd_discount_avoid by this factor (after floors).",
+    )
+    parser.add_argument(
+        "--undetermined_v2_dist_penalty_mult",
+        type=float,
+        default=0.38,
+        help="Undetermined v2: scale undetermined linear+quadratic distance penalties on r_nav.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_approach_reward_scale",
+        type=float,
+        default=0.85,
+        help="Undetermined v2: dense bonus scale * clip(pre_d - d, 0, cap) toward assigned goal (in addition to nd progress).",
+    )
+    parser.add_argument(
+        "--undetermined_v2_approach_reward_cap",
+        type=float,
+        default=0.55,
+        help="Max per-step approach shaping (world units) after clip, before nd_discount_nav.",
+    )
+    parser.add_argument(
+        "--undetermined_far_goal_progress_dist_thresh",
+        type=float,
+        default=4.0,
+        help="If dist2goal > this, multiply nd_goal_progress_coef by undetermined_far_goal_progress_boost (undetermined only).",
+    )
+    parser.add_argument(
+        "--undetermined_far_goal_progress_boost",
+        type=float,
+        default=1.12,
+        help="Multiplier on progress coef when far from assigned (gx,gy) (undetermined only). Keep near 1 to limit far-field nav exploit.",
+    )
+    parser.add_argument(
+        "--undetermined_goal_distance_penalty_scale",
+        type=float,
+        default=0.012,
+        help="Subtract scale*dist2goal from r_nav raw each step (undetermined); anchors world position vs relative formation. 0=off.",
+    )
+    parser.add_argument(
+        "--undetermined_goal_dist_penalty_quad_scale",
+        type=float,
+        default=0.00012,
+        help="Undetermined: additionally subtract scale*dist2goal^2 from r_nav each step (0=off).",
+    )
+    parser.add_argument(
+        "--architecture_mode",
+        type=str,
+        default="attn_undetermined_goal",
+        choices=["default", "attn_undetermined_goal"],
+        help="attn_undetermined_goal: Cons-DecAF-style stack — undetermined goal v2 obs unchanged; ConsMAC via "
+        "AttnComm tail; CTDE MAPPO + nearest_n_radius critic; reward Eq.(1)-(4) in Xiang et al. (arXiv:2307.12287).",
+    )
+    parser.add_argument(
+        "--cons_mac_ce_bins",
+        type=int,
+        default=32,
+        help="Cons-DecAF: K bins for global soft label e_g and estimator logits_hat (>=2).",
+    )
+    parser.add_argument(
+        "--cons_mac_ce_coef",
+        type=float,
+        default=1.0,
+        help="Weight on L_CE (KL(e_g || softmax(hat_e))); 0 disables CE auxiliary (separate ce_optimizer).",
+    )
+    parser.add_argument(
+        "--cons_mac_ce_lr",
+        type=float,
+        default=-1.0,
+        help="Learning rate for CE stack; <0 uses --lr.",
+    )
+    parser.add_argument(
+        "--cons_mac_distill_coef",
+        type=float,
+        default=0.0,
+        help="Policy distillation: weight on MSE(student logits, teacher logits) + MSE(h, teacher h); 0=off.",
+    )
+    parser.add_argument(
+        "--cons_mac_teacher_model_dir",
+        type=str,
+        default="",
+        help="Path to teacher actor state_dict (.pt) for distillation; empty=none.",
+    )
+    parser.add_argument(
+        "--cons_decaf_omega_f",
+        type=float,
+        default=1.0,
+        help="Paper ω_f: weight on formation reward r_f (HD-based).",
+    )
+    parser.add_argument(
+        "--cons_decaf_omega_v",
+        type=float,
+        default=1.0,
+        help="Paper ω_v: weight on navigation reward r_v (centroid to destination).",
+    )
+    parser.add_argument(
+        "--cons_decaf_omega_c",
+        type=float,
+        default=1.0,
+        help="Paper ω_c: weight on collision-count penalty r_c.",
+    )
+    parser.add_argument(
+        "--cons_decaf_omega1_lag",
+        type=float,
+        default=0.1,
+        help="Paper ω1: lag coefficient on previous step r_f in formation reward.",
+    )
+    parser.add_argument(
+        "--cons_decaf_omega2_lag",
+        type=float,
+        default=0.1,
+        help="Paper ω2: lag coefficient on previous step r_v in navigation reward.",
+    )
+    parser.add_argument(
+        "--cons_decaf_delta_safe",
+        type=float,
+        default=0.0,
+        help="Paper δ_safe for pairwise collision count; 0 uses 2*robot_radius.",
+    )
+    parser.add_argument(
+        "--cons_decaf_goal_disk_coef",
+        type=float,
+        default=0.0,
+        help="If >0, add nd_discount_goal * goal_disk (per agent) on top of shared paper team reward.",
     )
     parser.add_argument(
         "--dynamic_same_target_conflict_dist",
@@ -562,7 +779,7 @@ def get_config():
     parser.add_argument(
         "--use_attn_comm_actor",
         action="store_true",
-        default=False,
+        default=True,
         help="Use grouped GAT-style encoders + intent message attention on robot obs (requires fixed targets).",
     )
     parser.add_argument(
@@ -644,8 +861,20 @@ def get_config():
     parser.add_argument(
         "--nd_goal_progress_coef",
         type=float,
-        default=6.0,
-        help="Scales (pre_dist2goal - dist2goal) before discount_nav (legacy used 5).",
+        default=8.5,
+        help="Scales (clipped) distance progress before discount_nav.",
+    )
+    parser.add_argument(
+        "--nd_nav_progress_clip",
+        type=float,
+        default=0.42,
+        help="Max absolute per-step (pre_dist2goal-dist2goal) before × coef; 0 disables clipping.",
+    )
+    parser.add_argument(
+        "--nd_timeout_no_goal_penalty",
+        type=float,
+        default=-7.0,
+        help="Raw r_nav term on the timeout step if agent is not at goal and not in collision (≤0 typical). 0=off.",
     )
     parser.add_argument(
         "--nd_proximity_reward_scale",
@@ -674,21 +903,40 @@ def get_config():
     parser.add_argument(
         "--nd_arrival_reward",
         type=float,
-        default=4.0,
-        help="Extra r_goal when inside goal disk (any speed); still multiplied by discount_goal.",
+        default=9.0,
+        help="Extra r_goal when inside goal disk each step; still multiplied by discount_goal.",
+    )
+    parser.add_argument(
+        "--nd_goal_stay_reward",
+        type=float,
+        default=4.5,
+        help="Additional r_goal per step while inside goal disk (on top of nd_arrival_reward). 0 = off.",
+    )
+    parser.add_argument(
+        "--nd_goal_leave_penalty",
+        type=float,
+        default=36.0,
+        help="Subtracted from r_goal when agent was inside the goal disk last state and is outside now (strong discourages leaving).",
+    )
+    parser.add_argument(
+        "--nd_goal_inside_velocity_bonus",
+        type=float,
+        default=10.0,
+        help="Added to r_goal each step inside goal when speed v > 0 (replaces former hardcoded +5).",
     )
     parser.add_argument(
         "--nd_goal_terminal_reward",
         type=float,
-        default=8.0,
-        help="One-shot bonus the first step the agent enters the goal disk (adds to weighted reward). 0 = legacy (reward 0 every step while in goal).",
+        default=15.0,
+        help="One-shot bonus the first step the agent enters the goal disk (adds to weighted reward). "
+        "When >0, staying inside still receives shaped reward (not zeroed). 0 = legacy.",
     )
     parser.add_argument(
         "--nd_discount_formation",
         type=float,
         default=0.0,
-        help="Base weight on r_formation_raw in non-dynamic reward (default 0 = unused). "
-        "Effective weight = nd_discount_formation * time-varying factor from formation_time_weight_*.",
+        help="Base weight on r_formation_raw (always <=0 raw: Laplacian mismatch penalty only). "
+        "Effective scale = nd_discount_formation * formation_time_weight_* schedule. 0 = off.",
     )
     parser.add_argument(
         "--formation_time_weight_start",
@@ -699,8 +947,15 @@ def get_config():
     parser.add_argument(
         "--formation_time_weight_end",
         type=float,
-        default=0.4,
-        help="Multiplier on formation weight at episode horizon (tau=1). Linearly interpolated in between.",
+        default=0.65,
+        help="Multiplier on formation weight when tau_eff reaches 1. Higher = formation penalty stays stronger late.",
+    )
+    parser.add_argument(
+        "--formation_time_weight_decay_horizon",
+        type=float,
+        default=0.88,
+        help="τ_eff = min(1, τ/horizon) with τ = t_elapsed/time_limit. Larger = slower decay toward end weight "
+        "(formation penalty fades more slowly). 1.0 = linear over full episode.",
     )
     parser.add_argument(
         "--nd_discount_avoid",
@@ -711,14 +966,14 @@ def get_config():
     parser.add_argument(
         "--nd_discount_nav",
         type=float,
-        default=22.0,
+        default=28.0,
         help="Weight on r_nav_raw (distance progress + optional proximity/heading).",
     )
     parser.add_argument(
         "--nd_discount_goal",
         type=float,
-        default=200.0,
-        help="Weight on r_goal_raw inside goal disk.",
+        default=290.0,
+        help="Weight on r_goal_raw (arrival/stay/leave shaping inside goal disk).",
     )
 
     parser.add_argument(
@@ -934,7 +1189,7 @@ def get_config():
     parser.add_argument(
         "--save_reward_terms",
         action="store_true",
-        default=False,
+        default=True,
         help="If set, append per-step reward breakdown to logs/reward_terms.csv on the same episodes as TensorBoard (log_interval); use reward_terms_log_stride to subsample steps.",
     )
     parser.add_argument(
@@ -985,7 +1240,7 @@ def get_config():
 
     # agent parameters
     parser.add_argument("--num_humans", type=int, default=0, help="number of dynamic obstacles")
-    parser.add_argument("--num_attention_agents", type=int, default=5, help="number of agents that should be paid attention")
+    parser.add_argument("--num_attention_agents", type=int, default=10, help="number of agents that should be paid attention")
     parser.add_argument("--for_edge", type=int,default=2, help='the formation edge lenth')
     parser.add_argument("--robot_radius", type=float,default=0.3, help='the radius of robot')
     parser.add_argument("--human_radius", type=float,default=0.3, help='the radius of human')
@@ -1119,6 +1374,127 @@ def resolve_dynamic_target_reasoning_args(args):
     if getattr(args, "actor_neighbor_n", None) is None:
         args.actor_neighbor_n = int(getattr(args, "neighbor_n", 10))
     return args
+
+
+def compute_undetermined_robot_obs_dim(num_agents: int) -> int:
+    """
+    Undetermined goal: base 7 + per-goal (dx,dy,in_r,claimed_obs) * K + (K-1) others' tid + pending flag.
+    Env appends px, py => full row length is return + 2.
+    K == num_agents (swarm size).
+    """
+    k = int(num_agents)
+    return 7 + 4 * k + max(0, k - 1) + 1
+
+
+def compute_undetermined_v2_robot_obs_dim(goal_slots: int) -> int:
+    """
+    Undetermined v2: base 7 + M * (dx, dy, in_r, cobs, goal_k_norm) + pending. Px,py appended in env (+2).
+    M is fixed by --undetermined_v2_goal_slots (not tied to num_agents in the obs layout).
+    """
+    m = max(1, int(goal_slots))
+    return 7 + 5 * m + 1
+
+
+def compute_attn_comm_tail_dim(ally_slots: int, human_slots: int, message_dim: int) -> int:
+    """Ally geometry + recv messages + humans + obstacle block (no self-7, no px,py)."""
+    p = max(0, int(ally_slots))
+    h = max(0, int(human_slots))
+    m = max(0, int(message_dim))
+    return p * 6 + p * m + h * 5 + 4
+
+
+def compute_undetermined_v2_attn_hybrid_robot_obs_dim(
+    goal_slots: int, ally_slots: int, human_slots: int, message_dim: int
+) -> int:
+    """
+    Undetermined v2 core (7 + 5*M + 1) + AttnComm tail; env still appends px,py (+2) to the row.
+    """
+    return compute_undetermined_v2_robot_obs_dim(goal_slots) + compute_attn_comm_tail_dim(
+        ally_slots, human_slots, message_dim
+    )
+
+
+def apply_architecture_mode_preset(args) -> None:
+    """Reserved for named stacks; flags stay explicit on the CLI (no silent cross-mode coupling)."""
+    return
+
+
+def apply_undetermined_reward_floors(args) -> None:
+    """
+    When enable_undetermined_goal: emphasize reaching each agent's (gx, gy) over Laplacian formation (S-shape graph),
+    cap Hungarian assignment bonus, and keep navigation shaping bounded (clip + distance penalties + timeout).
+    """
+    if not getattr(args, "enable_undetermined_goal", False):
+        return
+    args.nd_discount_formation = 0.0
+    _nav = float(getattr(args, "nd_discount_nav", 22.0))
+    args.nd_discount_nav = min(max(_nav, 22.0), 34.0)
+    _gpc = float(getattr(args, "nd_goal_progress_coef", 6.0))
+    args.nd_goal_progress_coef = min(max(_gpc, 6.5), 10.5)
+    _dg = float(getattr(args, "nd_discount_goal", 200.0))
+    args.nd_discount_goal = max(_dg, 320.0)
+    _px = float(getattr(args, "nd_proximity_reward_scale", 0.0))
+    if _px > 1e-9:
+        args.nd_proximity_reward_scale = max(_px, 0.32)
+    _hs = float(getattr(args, "nd_heading_reward_scale", 0.0))
+    if _hs > 1e-9:
+        args.nd_heading_reward_scale = max(_hs, 0.22)
+    _tr = float(getattr(args, "nd_goal_terminal_reward", 8.0))
+    args.nd_goal_terminal_reward = max(_tr, 22.0)
+    _ar = float(getattr(args, "nd_arrival_reward", 4.0))
+    args.nd_arrival_reward = max(_ar, 9.0)
+    _stay = float(getattr(args, "nd_goal_stay_reward", 0.0))
+    args.nd_goal_stay_reward = max(_stay, 4.5)
+    _leave = float(getattr(args, "nd_goal_leave_penalty", 14.0))
+    args.nd_goal_leave_penalty = max(_leave, 36.0)
+    _uh = float(getattr(args, "undetermined_hungarian_reward_scale", 0.15))
+    args.undetermined_hungarian_reward_scale = min(_uh, 0.08)
+    bst = float(getattr(args, "undetermined_far_goal_progress_boost", 1.6))
+    args.undetermined_far_goal_progress_boost = min(bst, 1.14)
+    _pdp = float(getattr(args, "undetermined_goal_distance_penalty_scale", 0.0))
+    args.undetermined_goal_distance_penalty_scale = max(_pdp, 0.012)
+    _pdq = float(getattr(args, "undetermined_goal_dist_penalty_quad_scale", 0.0))
+    args.undetermined_goal_dist_penalty_quad_scale = max(_pdq, 0.0001)
+    _clip = float(getattr(args, "nd_nav_progress_clip", 0.0))
+    if _clip < 1e-9:
+        args.nd_nav_progress_clip = 0.42
+    else:
+        args.nd_nav_progress_clip = min(_clip, 0.55)
+    _to = float(getattr(args, "nd_timeout_no_goal_penalty", 0.0))
+    if _to > -1e-9:
+        args.nd_timeout_no_goal_penalty = -7.0
+    else:
+        args.nd_timeout_no_goal_penalty = min(_to, -3.0)
+
+
+def apply_undetermined_v2_reward_floors(args) -> None:
+    """
+    Undetermined v2 reward profile (run49-style failure modes: c_avoid / heavy dist penalties drowning nav).
+    Start from v1 floors then relax avoid coupling, soften world-frame distance pull, strengthen proximity/terminal.
+    """
+    if not getattr(args, "enable_undetermined_goal", False):
+        return
+    apply_undetermined_reward_floors(args)
+    args.nd_discount_formation = 0.0
+    da = float(getattr(args, "nd_discount_avoid", 50.0)) * float(getattr(args, "undetermined_v2_discount_avoid_mult", 0.42))
+    args.nd_discount_avoid = max(12.0, min(da, 28.0))
+    dn = float(getattr(args, "nd_discount_nav", 22.0)) * 0.88
+    args.nd_discount_nav = max(18.0, min(dn, 30.0))
+    args.nd_discount_goal = max(float(getattr(args, "nd_discount_goal", 200.0)), 360.0)
+    args.nd_goal_progress_coef = max(float(getattr(args, "nd_goal_progress_coef", 6.0)), 7.5)
+    px = float(getattr(args, "nd_proximity_reward_scale", 0.0))
+    if px > 1e-9:
+        args.nd_proximity_reward_scale = max(px, 0.42)
+    args.nd_goal_terminal_reward = max(float(getattr(args, "nd_goal_terminal_reward", 8.0)), 26.0)
+    args.nd_arrival_reward = max(float(getattr(args, "nd_arrival_reward", 4.0)), 10.0)
+    args.nd_goal_stay_reward = max(float(getattr(args, "nd_goal_stay_reward", 0.0)), 5.0)
+    args.nd_goal_leave_penalty = max(float(getattr(args, "nd_goal_leave_penalty", 14.0)), 38.0)
+    pdp = float(getattr(args, "undetermined_goal_distance_penalty_scale", 0.012))
+    args.undetermined_goal_distance_penalty_scale = pdp * float(getattr(args, "undetermined_v2_dist_penalty_mult", 0.38))
+    pdq = float(getattr(args, "undetermined_goal_dist_penalty_quad_scale", 0.00012))
+    args.undetermined_goal_dist_penalty_quad_scale = pdq * float(getattr(args, "undetermined_v2_dist_penalty_mult", 0.38))
+    args.undetermined_far_goal_progress_boost = min(float(getattr(args, "undetermined_far_goal_progress_boost", 1.12)), 1.11)
+    args.undetermined_hungarian_reward_scale = min(float(getattr(args, "undetermined_hungarian_reward_scale", 0.08)), 0.07)
 
 
 def compute_dynamic_robot_obs_dim(
