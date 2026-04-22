@@ -22,6 +22,8 @@ class Robot(Agent):
 
         self.target_id = 0
         self.prev_target_id = 0
+        # Undetermined v3: normalized previous-step applied target in [0,1] (or -1 before first commit).
+        self.undet_prev_tid_norm = -1.0
         self.undetermined_target_pending = False
         self.prev_px = None
         self.prev_py = None

@@ -668,6 +668,8 @@ class RewardCalculator:
         a = env.args
         team = self._ensure_attn_undetermined_team_cache()
         reward = float(team["r_team"])
+        r_sl, sl_v, sl_succ, sl_delta = self._undetermined_v2_sl_reward_raw(env, a)
+        reward += r_sl
         gcoef = float(getattr(a, "cons_decaf_goal_disk_coef", 0.0))
         r_goal_add = 0.0
         nd_goal_terms: dict[str, float] = {}
@@ -689,6 +691,10 @@ class RewardCalculator:
 
         robot._reward_terms = {
             "reward_mode": "attn_undetermined_goal",
+            "laplacian_S_L": float(sl_v),
+            "undetermined_v2_sl_raw": float(r_sl),
+            "undetermined_v2_sl_delta_raw": float(sl_delta),
+            "undetermined_v2_sl_success": float(sl_succ),
             "cons_decaf_rf": float(team["rf"]),
             "cons_decaf_rv": float(team["rv"]),
             "cons_decaf_rc": float(team["rc"]),
@@ -714,11 +720,16 @@ class RewardCalculator:
             return self._compute_dynamic_goal_reward(robot, for_feature)
         if getattr(self.env, "undetermined_goal_assignment", False):
             _a = self.env.args
-            if getattr(self.env, "undetermined_goal_v2", False) and str(
+            if (
+                getattr(self.env, "undetermined_goal_v2", False)
+                or getattr(self.env, "undetermined_goal_v3", False)
+            ) and str(
                 getattr(_a, "architecture_mode", "default")
             ) == "attn_undetermined_goal":
                 return self._compute_attn_undetermined_goal_reward(robot, for_feature)
-            if getattr(self.env, "undetermined_goal_v2", False):
+            if getattr(self.env, "undetermined_goal_v2", False) or getattr(
+                self.env, "undetermined_goal_v3", False
+            ):
                 return self._compute_undetermined_reward_v2(robot, for_feature)
             return self._compute_undetermined_reward(robot, for_feature)
         a = self.env.args
@@ -969,6 +980,56 @@ class RewardCalculator:
 
         return np.array([reward])
 
+    def _undetermined_v2_sl_reward_raw(self, env: Any, a: Any) -> tuple[float, float, float, float]:
+        """
+        Type-2 (formation / similarity success): S_L = 1 - ||L_hat - L_des||_F / ||L_des||_F (EnvCore.laplacian_S_L).
+        Dense term encourages high S_L; optional delta term rewards improvement vs previous step (pattern dynamics).
+        L_des is built from goal sites so targets act mainly as a topological hint for the desired Laplacian.
+        """
+        scale_succ = float(getattr(a, "undetermined_v2_sl_success_scale", 0.0))
+        scale_dense = float(getattr(a, "undetermined_v2_sl_dense_scale", 0.0))
+        scale_delta = float(getattr(a, "undetermined_v2_sl_delta_scale", 0.0))
+        thr = float(getattr(a, "undetermined_v2_sl_success_threshold", 0.97))
+        sl = getattr(env, "laplacian_S_L", float("nan"))
+        try:
+            sl = float(sl)
+        except (TypeError, ValueError):
+            return 0.0, float("nan"), 0.0, 0.0
+        if not math.isfinite(sl):
+            return 0.0, sl, 0.0, 0.0
+        pssh = float(getattr(a, "undetermined_v2_sl_post_success_sl_shaping_scale", 1.0))
+        sl_shaping_w = pssh if (sl >= thr and pssh < 0.999) else 1.0
+        r = 0.0
+        if scale_dense > 1e-12:
+            r += scale_dense * max(0.0, min(1.0, sl)) * sl_shaping_w
+        sl_prev = getattr(env, "laplacian_S_L_prev", float("nan"))
+        d_sl = 0.0
+        sp = float("nan")
+        try:
+            sp = float(sl_prev)
+            if math.isfinite(sp):
+                d_sl = max(0.0, sl - sp)
+        except (TypeError, ValueError):
+            d_sl = 0.0
+            sp = float("nan")
+        r_delta = 0.0
+        if scale_delta > 1e-12 and d_sl > 1e-12:
+            r_delta = scale_delta * d_sl * sl_shaping_w
+            r += r_delta
+        succ = 1.0 if sl >= thr else 0.0
+        crossing = sl >= thr and (not math.isfinite(sp) or sp < thr)
+        only_cross = bool(getattr(a, "undetermined_v2_sl_success_only_on_crossing", False))
+        sustain = float(getattr(a, "undetermined_v2_sl_success_sustain_frac", 0.0))
+        if scale_succ > 1e-12 and sl >= thr:
+            if only_cross:
+                if crossing:
+                    r += scale_succ
+                elif sustain > 1e-12:
+                    r += scale_succ * sustain
+            else:
+                r += scale_succ
+        return r, sl, succ, float(r_delta)
+
     def _compute_undetermined_reward_v2(self, robot: Any, for_feature: float) -> np.ndarray:
         """
         Undetermined v2: same structure as v1 with capped soft-collision signal, approach shaping toward (gx,gy),
@@ -1005,7 +1066,7 @@ class RewardCalculator:
             if float(robot.dist2goal) > d_th:
                 pc *= bst
         prog_delta = self._nd_progress_delta(robot, a)
-        r_nav += prog_delta * pc
+        prog_nav = prog_delta * pc
 
         apr_s = float(getattr(a, "undetermined_v2_approach_reward_scale", 0.0))
         apr_cap = float(getattr(a, "undetermined_v2_approach_reward_cap", 0.55))
@@ -1018,26 +1079,25 @@ class RewardCalculator:
         ):
             raw = float(robot.pre_dist2goal) - float(robot.dist2goal)
             approach_term = apr_s * min(max(raw, 0.0), apr_cap)
-            r_nav += approach_term
 
         pdp = float(getattr(a, "undetermined_goal_distance_penalty_scale", 0.0))
         und_dist_pen = 0.0
         if pdp > 1e-12 and robot.dist2goal is not None:
             und_dist_pen = pdp * float(robot.dist2goal)
-            r_nav -= und_dist_pen
 
         und_dist_quad = 0.0
         pdq = float(getattr(a, "undetermined_goal_dist_penalty_quad_scale", 0.0))
         if pdq > 1e-12 and robot.dist2goal is not None:
             dg = float(robot.dist2goal)
             und_dist_quad = pdq * dg * dg
-            r_nav -= und_dist_quad
 
+        prox_term = 0.0
         pr = float(getattr(a, "nd_proximity_reward_scale", 0.0))
         if pr != 0.0:
             sig = max(float(getattr(a, "nd_proximity_sigma", 10.0)), 1e-6)
-            r_nav += pr * float(np.exp(-robot.dist2goal / sig))
+            prox_term = pr * float(np.exp(-robot.dist2goal / sig))
 
+        head_term = 0.0
         hs = float(getattr(a, "nd_heading_reward_scale", 0.0))
         if hs != 0.0 and robot.v > 1e-6:
             gdx = float(robot.gx - robot.px)
@@ -1046,7 +1106,24 @@ class RewardCalculator:
             if ng > 1e-6:
                 c = (np.cos(robot.theta) * gdx + np.sin(robot.theta) * gdy) / ng
                 vref = max(float(getattr(a, "nd_heading_v_ref", 1.0)), 1e-6)
-                r_nav += hs * max(0.0, float(c)) * min(float(robot.v) / vref, 1.0)
+                head_term = hs * max(0.0, float(c)) * min(float(robot.v) / vref, 1.0)
+
+        r_sl, sl_v, sl_succ, sl_delta = self._undetermined_v2_sl_reward_raw(env, a)
+        thr_sl = float(getattr(a, "undetermined_v2_sl_success_threshold", 0.97))
+        in_sl_succ = math.isfinite(sl_v) and sl_v >= thr_sl
+        lit_arg = float(getattr(a, "undetermined_v2_sl_post_success_literal_scale", 1.0))
+        lit_apply = lit_arg if in_sl_succ and lit_arg < 0.999 else 1.0
+        pull_xy = prog_nav + approach_term - und_dist_pen - und_dist_quad + prox_term + head_term
+        pull_xy *= lit_apply
+        r_nav = pull_xy + r_sl
+
+        pre_succ = math.isfinite(sl_v) and sl_v < thr_sl
+        p_step = float(getattr(a, "undetermined_v2_sl_pre_success_step_penalty", 0.0))
+        if p_step != 0.0 and pre_succ:
+            r_nav += p_step
+        p_tr = float(getattr(a, "undetermined_v2_sl_pre_success_travel_penalty", 0.0))
+        if p_tr != 0.0 and pre_succ and hasattr(env, "dynamic_step_travel_sum"):
+            r_nav += p_tr * float(env.dynamic_step_travel_sum) / max(1, int(env.robot_num))
 
         if r_nav > 0 and robot.collision:
             r_nav = 0.0
@@ -1055,6 +1132,7 @@ class RewardCalculator:
         r_nav += tpen
 
         r_goal_add, nd_goal_terms = self._nd_goal_disk_raw_reward(robot, a)
+        r_goal_add *= lit_apply
         r_goal += r_goal_add
 
         if env.collision_flag:
@@ -1095,6 +1173,27 @@ class RewardCalculator:
             else:
                 reward = reward_shaped_nd + hung
 
+        sl_prev_nf = float("nan")
+        try:
+            sl_prev_nf = float(getattr(env, "laplacian_S_L_prev", float("nan")))
+        except (TypeError, ValueError):
+            sl_prev_nf = float("nan")
+        sl_crossing = (
+            1.0
+            if (
+                math.isfinite(sl_v)
+                and sl_v >= thr_sl
+                and (not math.isfinite(sl_prev_nf) or sl_prev_nf < thr_sl)
+            )
+            else 0.0
+        )
+        pre_step_raw = float(p_step) if (p_step != 0.0 and pre_succ) else 0.0
+        pre_tr_raw = (
+            float(p_tr) * float(env.dynamic_step_travel_sum) / max(1, int(env.robot_num))
+            if (p_tr != 0.0 and pre_succ and hasattr(env, "dynamic_step_travel_sum"))
+            else 0.0
+        )
+
         robot._reward_terms = {
             "reward_mode": "undetermined_v2",
             "r_avoid_raw": float(r_avoid),
@@ -1103,6 +1202,14 @@ class RewardCalculator:
             "r_goal_raw": float(r_goal),
             "nd_progress_delta_applied": float(prog_delta),
             "undetermined_v2_approach_raw": float(approach_term),
+            "laplacian_S_L": float(sl_v),
+            "undetermined_v2_sl_raw": float(r_sl),
+            "undetermined_v2_sl_delta_raw": float(sl_delta),
+            "undetermined_v2_sl_success": float(sl_succ),
+            "undetermined_v2_sl_type2_crossing": float(sl_crossing),
+            "undetermined_v2_sl_literal_relax_w": float(lit_apply),
+            "undetermined_v2_sl_pre_success_step_raw": float(pre_step_raw),
+            "undetermined_v2_sl_pre_success_travel_raw": float(pre_tr_raw),
             "undetermined_dist_penalty_raw": float(und_dist_pen),
             "undetermined_dist_penalty_quad_raw": float(und_dist_quad),
             "c_formation": float(c_formation),

@@ -21,6 +21,17 @@ Mode ``laplacian_type2`` (requires ``episode_meta`` with ``agent_goals`` or ``go
   **Type-2 success** = Laplacian similarity above threshold (default 0.97), distinct from target arrival.
   Reports: mean count of timesteps with type-2 per episode, mean first timestep (1-based) when type-2 holds,
   and mean agent path length (optionally only for episodes with ≥1 type-2 step).
+
+  Additionally, **S_L** = 1 - ||L_hat - L_des||_F / ||L_des||_F (same L_hat, L_des as above):
+  mean fraction of steps per episode with S_L >= ``--sl-threshold`` (``sl_type2_mean_step_rate``),
+  mean timesteps / first step / path length under S_L, and ``sl_type2_episode_rate`` (share of episodes
+  with at least one S_L-success step).
+
+  The Laplacian-similarity metric (``--laplacian-sim-metric`` / ``--laplacian-threshold``) has its own
+  ``lap_type2_mean_step_rate`` and ``lap_type2_episode_rate`` (parallel to the S_L pair).
+
+Performance: Laplacian replay uses batched NumPy (all timesteps per episode in one pass); meta rows are
+indexed by episode id; trajectory length uses vectorized segment sums.
 """
 
 from __future__ import annotations
@@ -45,7 +56,27 @@ _REPO = _repo_root()
 if str(_REPO) not in sys.path:
     sys.path.insert(0, str(_REPO))
 
-from envs.utils.utils import get_weight  # noqa: E402  (after sys.path)
+
+def _scaled_laplacian_batch(xy: np.ndarray) -> np.ndarray | None:
+    """
+    Vectorized symmetric normalized Laplacian (same as EnvCore.step).
+    xy: (T, n, 2) or (n, 2). Returns (T, n, n) or (1, n, n); None if n < 2.
+    """
+    if xy.ndim == 2:
+        xy = xy[np.newaxis, ...]
+    _t, n, _ = xy.shape
+    if n < 2:
+        return None
+    diff = xy[:, :, np.newaxis, :] - xy[:, np.newaxis, :, :]
+    w = np.sum(diff * diff, axis=-1)
+    row_sums = np.sum(w, axis=2)
+    eps = 1e-8
+    inv_sqrt = np.power(np.where(row_sums > 0, row_sums, eps), -0.5)
+    diag_l = row_sums[:, :, np.newaxis] * np.eye(n, dtype=np.float64)
+    l_mat = diag_l - w
+    inv_i = inv_sqrt[:, :, np.newaxis]
+    inv_j = inv_sqrt[:, np.newaxis, :]
+    return inv_i * l_mat * inv_j
 
 
 def load_episode_meta_records(run_dir: Path) -> list[dict[str, Any]] | None:
@@ -128,20 +159,10 @@ def _scaled_laplacian_from_positions(xy: np.ndarray) -> np.ndarray | None:
     """
     if xy.ndim != 2 or xy.shape[1] != 2:
         return None
-    n = int(xy.shape[0])
-    if n < 2:
+    b = _scaled_laplacian_batch(xy)
+    if b is None:
         return None
-    W = np.zeros((n, n), dtype=np.float64)
-    for i in range(n):
-        for j in range(n):
-            W[i, j] = get_weight(float(xy[i, 0]), float(xy[i, 1]), float(xy[j, 0]), float(xy[j, 1]))
-    D = np.diag(np.sum(W, axis=1))
-    L = D - W
-    row_sums = np.sum(W, axis=1)
-    eps = 1e-8
-    inv_sqrt = np.power(np.where(row_sums > 0, row_sums, eps), -0.5)
-    D_sys = np.diag(inv_sqrt)
-    return D_sys @ L @ D_sys
+    return b[0]
 
 
 def laplacian_similarity(
@@ -174,6 +195,55 @@ def laplacian_similarity(
     raise ValueError(f"unknown metric: {metric}")
 
 
+def laplacian_similarity_batch(
+    L_hat: np.ndarray,
+    L_des: np.ndarray,
+    *,
+    metric: str,
+) -> np.ndarray:
+    """L_hat: (T, n, n); L_des: (n, n). Returns shape (T,) float."""
+    metric = str(metric)
+    t = int(L_hat.shape[0])
+    if metric in ("cosine", "cosine01"):
+        a = L_hat.reshape(t, -1)
+        b = L_des.reshape(-1)
+        na = np.linalg.norm(a, axis=1)
+        nb = float(np.linalg.norm(b))
+        c = np.sum(a * b, axis=1) / (na * nb + 1e-14)
+        if metric == "cosine01":
+            return np.asarray(0.5 * (c + 1.0), dtype=np.float64)
+        return np.asarray(c, dtype=np.float64)
+    if metric == "rel_frob":
+        diff = L_hat - L_des
+        num = np.sum(diff * diff, axis=(1, 2))
+        den = np.sum(L_hat * L_hat, axis=(1, 2)) + float(np.sum(L_des * L_des)) + 1e-12
+        return 1.0 - num / den
+    raise ValueError(f"unknown metric: {metric}")
+
+
+def laplacian_S_L_batch(L_hat: np.ndarray, L_des: np.ndarray) -> np.ndarray:
+    """L_hat: (T, n, n). Returns shape (T,)."""
+    diff = L_hat - L_des
+    nf = np.sqrt(np.sum(diff * diff, axis=(1, 2)))
+    den = float(np.linalg.norm(L_des, ord="fro"))
+    if den < 1e-14:
+        return np.full(L_hat.shape[0], np.nan, dtype=np.float64)
+    return 1.0 - nf / den
+
+
+def laplacian_S_L(L_hat: np.ndarray, L_des: np.ndarray) -> float:
+    """
+    S_L = 1 - ||L_hat - L_des||_F / ||L_des||_F (relative Frobenius gap vs desired Laplacian norm).
+    Unbounded below when error exceeds ||L_des||_F; equals 1 when L_hat == L_des.
+    """
+    diff = L_hat - L_des
+    nf = float(np.linalg.norm(diff, ord="fro"))
+    den = float(np.linalg.norm(L_des, ord="fro"))
+    if den < 1e-14:
+        return float("nan")
+    return float(1.0 - nf / den)
+
+
 def _targets_xy_from_meta(rec: dict[str, Any], n_agents: int) -> np.ndarray | None:
     """Prefer agent_goals (per-robot gx,gy); else goal_positions if length matches."""
     ag = rec.get("agent_goals")
@@ -204,11 +274,19 @@ def episode_positions_T_n_2(
     t_max = min(len(s) for s in seqs)
     if t_max < 1:
         return None
-    out = np.zeros((t_max, len(agent_ids), 2), dtype=np.float64)
-    for i, aid in enumerate(agent_ids):
-        for t in range(t_max):
-            out[t, i, 0] = seqs[i][t][0]
-            out[t, i, 1] = seqs[i][t][1]
+    cols = [np.asarray(s[:t_max], dtype=np.float64) for s in seqs]
+    return np.stack(cols, axis=1)
+
+
+def meta_by_episode_map(meta_records: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    out: dict[int, dict[str, Any]] = {}
+    for r in meta_records:
+        try:
+            epi = int(r.get("episode", -1))
+        except (TypeError, ValueError):
+            continue
+        if epi >= 0:
+            out[epi] = r
     return out
 
 
@@ -227,10 +305,13 @@ def analyze_laplacian_type2_stats(
     *,
     sim_threshold: float,
     sim_metric: str,
+    sl_threshold: float,
 ) -> dict[str, Any]:
     """
     Type-2 success: Laplacian similarity above threshold (vs type-1 = reach goal in succ files).
     Uses goal positions at episode start from meta (dynamic goal motion between steps is not replayed).
+
+    S_L row uses ``sl_threshold`` on :func:`laplacian_S_L` (independent of ``sim_metric``).
     """
     dash = {
         "lap_type2_threshold": "-",
@@ -238,17 +319,32 @@ def analyze_laplacian_type2_stats(
         "lap_type2_mean_timesteps": "-",
         "lap_type2_mean_first_step": "-",
         "lap_type2_mean_path_length": "-",
+        "lap_type2_mean_step_rate": "-",
+        "lap_type2_episode_rate": "-",
         "lap_type2_episodes_used": "-",
         "lap_type2_episodes_skipped": "-",
+        "sl_S_L_threshold": "-",
+        "sl_type2_mean_timesteps": "-",
+        "sl_type2_mean_first_step": "-",
+        "sl_type2_mean_path_length": "-",
+        "sl_type2_mean_step_rate": "-",
+        "sl_type2_episode_rate": "-",
     }
     if not meta_records:
         return dash
     n_agents = len(agent_ids)
     thr = float(sim_threshold)
     metric = str(sim_metric)
+    sl_thr = float(sl_threshold)
 
     step_counts: list[int] = []
     first_steps: list[int] = []
+    step_counts_sl: list[int] = []
+    first_steps_sl: list[int] = []
+    step_rates_lap: list[float] = []
+    ep_lap_hit: list[int] = []
+    step_rates_sl: list[float] = []
+    ep_sl_hit: list[int] = []
     path_sum = 0.0
     path_n = 0
     used = 0
@@ -273,23 +369,38 @@ def analyze_laplacian_type2_stats(
             skipped += 1
             continue
 
-        ge_ts = 0
-        first_s: int | None = None
-        for t in range(pos.shape[0]):
-            L_hat = _scaled_laplacian_from_positions(pos[t])
-            if L_hat is None:
-                continue
-            sim = laplacian_similarity(L_hat, L_des, metric=metric)
-            if not math.isfinite(sim):
-                continue
-            if sim >= thr:
-                ge_ts += 1
-                if first_s is None:
-                    first_s = t + 1
+        l_hat_all = _scaled_laplacian_batch(pos)
+        if l_hat_all is None:
+            skipped += 1
+            continue
+        sim_vec = laplacian_similarity_batch(l_hat_all, L_des, metric=metric)
+        sl_vec = laplacian_S_L_batch(l_hat_all, L_des)
+        T = int(pos.shape[0])
+
+        ok_sim = np.isfinite(sim_vec) & (sim_vec >= thr)
+        ge_ts = int(np.sum(ok_sim))
+        if ok_sim.any():
+            first_s = int(np.argmax(ok_sim) + 1)
+        else:
+            first_s = None
+
+        ok_sl = np.isfinite(sl_vec) & (sl_vec >= sl_thr)
+        ge_ts_sl = int(np.sum(ok_sl))
+        if ok_sl.any():
+            first_s_sl = int(np.argmax(ok_sl) + 1)
+        else:
+            first_s_sl = None
 
         step_counts.append(ge_ts)
         if first_s is not None:
             first_steps.append(first_s)
+        step_rates_lap.append(float(ge_ts) / float(max(T, 1)))
+        ep_lap_hit.append(1 if ge_ts > 0 else 0)
+        step_counts_sl.append(ge_ts_sl)
+        if first_s_sl is not None:
+            first_steps_sl.append(first_s_sl)
+        step_rates_sl.append(float(ge_ts_sl) / float(max(T, 1)))
+        ep_sl_hit.append(1 if ge_ts_sl > 0 else 0)
 
         for aid in agent_ids:
             pts = coords_by_agent[aid].get(ep, [])
@@ -302,12 +413,20 @@ def analyze_laplacian_type2_stats(
         out = dict(dash)
         out["lap_type2_threshold"] = thr
         out["lap_type2_sim_metric"] = metric
+        out["sl_S_L_threshold"] = sl_thr
         out["lap_type2_episodes_skipped"] = skipped
         return out
 
     mean_first = float(np.mean(first_steps)) if first_steps else float("nan")
     mean_steps = float(np.mean(step_counts)) if step_counts else float("nan")
     mean_path = float(path_sum / path_n) if path_n else float("nan")
+    mean_step_rate_lap = float(np.mean(step_rates_lap)) if step_rates_lap else float("nan")
+    ep_rate_lap = float(np.mean(ep_lap_hit)) if ep_lap_hit else float("nan")
+
+    mean_first_sl = float(np.mean(first_steps_sl)) if first_steps_sl else float("nan")
+    mean_steps_sl = float(np.mean(step_counts_sl)) if step_counts_sl else float("nan")
+    mean_step_rate_sl = float(np.mean(step_rates_sl)) if step_rates_sl else float("nan")
+    ep_rate_sl = float(np.mean(ep_sl_hit)) if ep_sl_hit else float("nan")
 
     return {
         "lap_type2_threshold": thr,
@@ -315,8 +434,16 @@ def analyze_laplacian_type2_stats(
         "lap_type2_mean_timesteps": mean_steps,
         "lap_type2_mean_first_step": mean_first,
         "lap_type2_mean_path_length": mean_path,
+        "lap_type2_mean_step_rate": mean_step_rate_lap,
+        "lap_type2_episode_rate": ep_rate_lap,
         "lap_type2_episodes_used": used,
         "lap_type2_episodes_skipped": skipped,
+        "sl_S_L_threshold": sl_thr,
+        "sl_type2_mean_timesteps": mean_steps_sl,
+        "sl_type2_mean_first_step": mean_first_sl,
+        "sl_type2_mean_path_length": mean_path,
+        "sl_type2_mean_step_rate": mean_step_rate_sl,
+        "sl_type2_episode_rate": ep_rate_sl,
     }
 
 
@@ -480,12 +607,9 @@ def parse_coords_data_line(line: str) -> tuple[int, list[list[tuple[float, float
 def path_length(points: list[tuple[float, float]]) -> float:
     if len(points) < 2:
         return 0.0
-    s = 0.0
-    for i in range(1, len(points)):
-        x0, y0 = points[i - 1]
-        x1, y1 = points[i]
-        s += math.hypot(x1 - x0, y1 - y0)
-    return s
+    arr = np.asarray(points, dtype=np.float64)
+    d = np.diff(arr, axis=0)
+    return float(np.sqrt(np.sum(d * d, axis=1)).sum())
 
 
 def first_success_step_1based(flags: list[int]) -> int | None:
@@ -536,8 +660,16 @@ def _lap_type2_placeholder_row() -> dict[str, Any]:
         "lap_type2_mean_timesteps": "-",
         "lap_type2_mean_first_step": "-",
         "lap_type2_mean_path_length": "-",
+        "lap_type2_mean_step_rate": "-",
+        "lap_type2_episode_rate": "-",
         "lap_type2_episodes_used": "-",
         "lap_type2_episodes_skipped": "-",
+        "sl_S_L_threshold": "-",
+        "sl_type2_mean_timesteps": "-",
+        "sl_type2_mean_first_step": "-",
+        "sl_type2_mean_path_length": "-",
+        "sl_type2_mean_step_rate": "-",
+        "sl_type2_episode_rate": "-",
     }
 
 
@@ -547,6 +679,7 @@ def analyze_run(
     mode: str = "default",
     laplacian_threshold: float = 0.97,
     laplacian_sim_metric: str = "cosine01",
+    sl_threshold: float = 0.97,
 ) -> dict[str, Any] | None:
     succ_dir = run_dir / "succ"
     coords_dir = run_dir / "coords"
@@ -642,6 +775,7 @@ def analyze_run(
                 meta_recs,
                 sim_threshold=laplacian_threshold,
                 sim_metric=laplacian_sim_metric,
+                sl_threshold=sl_threshold,
             )
         )
     else:
@@ -696,6 +830,12 @@ def main() -> int:
         default="cosine01",
         help="cosine01: (cos+1)/2 in [0,1] for threshold like 0.97; cosine: raw [-1,1]; rel_frob: 1-rel error.",
     )
+    ap.add_argument(
+        "--sl-threshold",
+        type=float,
+        default=0.97,
+        help="Similarity success using S_L=1-||L_hat-L_des||_F/||L_des||_F: count steps with S_L >= this value.",
+    )
     args = ap.parse_args()
     root = args.root
     if root is None:
@@ -709,6 +849,7 @@ def main() -> int:
             mode=str(args.mode),
             laplacian_threshold=float(args.laplacian_threshold),
             laplacian_sim_metric=str(args.laplacian_sim_metric),
+            sl_threshold=float(args.sl_threshold),
         )
         if row:
             rows.append(row)
@@ -739,8 +880,16 @@ def main() -> int:
         "lap_type2_mean_timesteps",
         "lap_type2_mean_first_step",
         "lap_type2_mean_path_length",
+        "lap_type2_mean_step_rate",
+        "lap_type2_episode_rate",
         "lap_type2_episodes_used",
         "lap_type2_episodes_skipped",
+        "sl_S_L_threshold",
+        "sl_type2_mean_timesteps",
+        "sl_type2_mean_first_step",
+        "sl_type2_mean_path_length",
+        "sl_type2_mean_step_rate",
+        "sl_type2_episode_rate",
     ]
 
     def fmt(x: Any) -> str:

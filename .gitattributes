@@ -1,0 +1,2 @@
+# sbatch and bash require LF; editors on Windows must not save CRLF for these
+*.sh text eol=lf

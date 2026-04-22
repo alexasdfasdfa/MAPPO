@@ -4,6 +4,10 @@ import torch
 from tensorboardX import SummaryWriter
 from policy.utils.shared_buffer import SharedReplayBuffer
 from policy.mappo.undet_v2_latent_ckpt import apply_undet_v2_target_latent_heads
+from runner.checkpoint_paths import (
+    resolve_shared_actor_checkpoint_path,
+    resolve_shared_critic_checkpoint_path,
+)
 
 def _t2n(x):
     """Convert torch tensor to a numpy array."""
@@ -133,10 +137,22 @@ class Runner(object):
 
     def restore(self):
         """Restore policy's networks from a saved model."""
-        policy_actor_state_dict = torch.load(str(self.model_dir) + '/actor.pt')
+        actor_path = resolve_shared_actor_checkpoint_path(self.model_dir)
+        if actor_path is None:
+            raise FileNotFoundError(
+                f"model_dir={self.model_dir!r}: no actor checkpoint found "
+                f"(use <dir>/actor.pt, <dir>/4.pt, or model_dir=/path/to/actor.pt)"
+            )
+        policy_actor_state_dict = torch.load(str(actor_path), map_location=self.device)
         self.policy.actor.load_state_dict(policy_actor_state_dict)
         if not self.all_args.use_render:
-            policy_critic_state_dict = torch.load(str(self.model_dir) + '/critic.pt')
+            critic_path = resolve_shared_critic_checkpoint_path(self.model_dir, actor_path)
+            if critic_path is None:
+                raise FileNotFoundError(
+                    f"Finetune/training resume needs critic.pt beside {actor_path.parent} "
+                    f"(same folder as the actor checkpoint); not found."
+                )
+            policy_critic_state_dict = torch.load(str(critic_path), map_location=self.device)
             self.policy.critic.load_state_dict(policy_critic_state_dict)
  
     def log_train(self, train_infos, total_num_steps):

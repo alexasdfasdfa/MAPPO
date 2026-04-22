@@ -17,6 +17,25 @@ import torch.nn.functional as F
 
 UNDETERMINED_HEAD_PREFIX = "undetermined_head."
 
+# MAPPO/policy/mappo/undet_v2_latent_ckpt.py -> repo root is parents[2]
+_MAPPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_latent_model_base(raw: Union[str, Path, None]) -> Optional[Path]:
+    """
+    Interpret undet_v2_target_latent_model_dir relative to the MAPPO repo root so that
+    default ``../undet_v2_target_latent/checkpoints`` works regardless of process cwd.
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    p = Path(s).expanduser()
+    if p.is_absolute():
+        return p
+    return (_MAPPO_ROOT / p).resolve()
+
 
 def resolve_actor_pt_under_dir(base: Union[str, Path]) -> Optional[Path]:
     """Resolve export layout: run dir containing models/actor.pt, or path to a .pt file."""
@@ -37,6 +56,11 @@ def resolve_actor_pt_under_dir(base: Union[str, Path]) -> Optional[Path]:
 
 def _subset_undetermined_head(sd: dict) -> dict[str, torch.Tensor]:
     return {k: v for k, v in sd.items() if k.startswith(UNDETERMINED_HEAD_PREFIX)}
+
+
+def _standalone_selector_state_to_head_subset(model_sd: dict) -> dict[str, torch.Tensor]:
+    """Map TargetLatentSelector state_dict keys to MAPPO actor keys under undetermined_head.*."""
+    return {UNDETERMINED_HEAD_PREFIX + k: v for k, v in model_sd.items()}
 
 
 def _assert_head_shapes_match(actor: nn.Module, subset: dict[str, torch.Tensor], ckpt_path: Path) -> None:
@@ -71,11 +95,25 @@ def apply_undet_v2_target_latent_heads(
         and not bool(getattr(all_args, "use_attn_comm_actor", False))
     ):
         return False
-    ap = resolve_actor_pt_under_dir(raw)
+    base = resolve_latent_model_base(raw)
+    if base is None:
+        return False
+    ap = resolve_actor_pt_under_dir(base)
+    arch = str(getattr(all_args, "undet_v2_head_arch", "dot_product"))
     if ap is None:
+        st = base / "target_latent_selector.pt" if base.is_dir() else None
+        if st is not None and st.is_file() and arch == "pair_mlp":
+            ap = st
+    if ap is None:
+        st_only = base / "target_latent_selector.pt" if base.is_dir() else None
+        if st_only is not None and st_only.is_file() and arch != "pair_mlp":
+            raise ValueError(
+                f"undet_v2_target_latent_model_dir={raw!r}: found {st_only.name} only; "
+                f"use --undet_v2_head_arch pair_mlp (and matching M/hidden/d_emb) or add MAPPO actor.pt."
+            )
         raise FileNotFoundError(
-            f"undet_v2_target_latent_model_dir={raw!r}: need a path to actor.pt or a directory "
-            f"containing models/actor.pt or actor.pt"
+            f"undet_v2_target_latent_model_dir={raw!r} (resolved {base}): need models/actor.pt, actor.pt, "
+            f"target_latent_selector.pt (with --undet_v2_head_arch pair_mlp), or a direct *.pt path"
         )
     actors_list = list(actors)
     if not actors_list:
@@ -88,6 +126,16 @@ def apply_undet_v2_target_latent_heads(
             )
     sd = torch.load(str(ap), map_location=device)
     subset = _subset_undetermined_head(sd)
+    if not subset and isinstance(sd, dict) and "model" in sd:
+        if arch != "pair_mlp":
+            raise ValueError(
+                f"No {UNDETERMINED_HEAD_PREFIX!r} keys in {ap}: file is a standalone TargetLatentSelector "
+                f"checkpoint; use --undet_v2_head_arch pair_mlp and matching M / hidden / d_emb."
+            )
+        subset = _standalone_selector_state_to_head_subset(sd["model"])
+        if isinstance(sd.get("model_layout"), dict):
+            ml = sd["model_layout"]
+            print(f"[undet_v2_target_latent] checkpoint model_layout: {ml}")
     if not subset:
         raise ValueError(f"No {UNDETERMINED_HEAD_PREFIX!r} keys in {ap}")
     for actor in actors_list:

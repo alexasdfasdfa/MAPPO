@@ -10,7 +10,12 @@ from policy.mappo.utils.lstm import LSTMLayer
 from policy.mappo.utils.neighbor_attn_lstm import NeighborSelfAttnLSTM
 from policy.mappo.utils.attn_comm_encoder import AttnCommActorEncoder
 from policy.mappo.utils.popart import PopArt
-from policy.mappo.undetermined_target_head import UndeterminedTargetHead, UndeterminedTargetHeadV2
+from policy.mappo.undetermined_target_head import (
+    UndeterminedTargetHead,
+    UndeterminedTargetHeadV2,
+    UndeterminedTargetHeadV2PairMLP,
+    UndeterminedTargetHeadV3Attention,
+)
 from policy.utils.util import get_shape_from_obs_space
 from policy.mappo.utils.util import transform
 import time
@@ -54,11 +59,20 @@ class R_Actor(nn.Module):
         )
         k_ag = int(args.num_agents)
         self.enable_undetermined_goal = bool(getattr(args, "enable_undetermined_goal", False))
-        self.enable_undetermined_v2 = bool(getattr(args, "enable_undetermined_goal_v2", False))
+        self.enable_undetermined_v3 = bool(getattr(args, "enable_undetermined_goal_v3", False))
+        self.enable_undetermined_v2 = bool(
+            getattr(args, "enable_undetermined_goal_v2", False) or self.enable_undetermined_v3
+        )
         if self.enable_undetermined_goal:
             if self.enable_undetermined_v2:
                 m = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
-                self.undetermined_head = UndeterminedTargetHeadV2(args, m_slots=m)
+                _arch = str(getattr(args, "undet_v2_head_arch", "dot_product"))
+                if self.enable_undetermined_v3:
+                    self.undetermined_head = UndeterminedTargetHeadV3Attention(args, m_slots=m)
+                elif _arch == "pair_mlp":
+                    self.undetermined_head = UndeterminedTargetHeadV2PairMLP(args, m_slots=m)
+                else:
+                    self.undetermined_head = UndeterminedTargetHeadV2(args, m_slots=m)
             else:
                 self.undetermined_head = UndeterminedTargetHead(args, k_ag)
         else:
@@ -82,7 +96,7 @@ class R_Actor(nn.Module):
                 and self.enable_undetermined_v2
             ):
                 m = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
-                _hy_split = 7 + 5 * m + 1
+                _hy_split = 7 + 5 * m + 1 + (1 if self.enable_undetermined_v3 else 0)
             self.attn_comm_encoder = AttnCommActorEncoder(
                 args, hybrid_undetermined_v2_split=_hy_split
             )

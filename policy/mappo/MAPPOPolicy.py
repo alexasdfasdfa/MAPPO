@@ -13,7 +13,9 @@ def _undet_v2_motion_only_freeze_head(args) -> bool:
         return False
     if str(getattr(args, "undet_v2_latent_train_mode", "finetune_all")) != "motion_only":
         return False
-    if not getattr(args, "enable_undetermined_goal_v2", False):
+    if not getattr(args, "enable_undetermined_goal_v2", False) and not getattr(
+        args, "enable_undetermined_goal_v3", False
+    ):
         return False
     if getattr(args, "use_attn_comm_actor", False):
         return False

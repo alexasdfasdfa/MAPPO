@@ -24,6 +24,7 @@ from config.config import (
     compute_undetermined_robot_obs_dim,
     compute_undetermined_v2_robot_obs_dim,
     compute_undetermined_v2_attn_hybrid_robot_obs_dim,
+    compute_undetermined_v3_robot_obs_dim,
     apply_undetermined_reward_floors,
     apply_undetermined_v2_reward_floors,
 )
@@ -100,11 +101,32 @@ def parser_args(args, parser):
         all_args, "enable_undetermined_goal", False
     ):
         raise ValueError("--enable_undetermined_goal_v2 requires --enable_undetermined_goal")
+    if getattr(all_args, "enable_undetermined_goal_v3", False) and not getattr(
+        all_args, "enable_undetermined_goal", False
+    ):
+        raise ValueError("--enable_undetermined_goal_v3 requires --enable_undetermined_goal")
+    if getattr(all_args, "enable_undetermined_goal_v3", False) and getattr(
+        all_args, "enable_undetermined_goal_v2", False
+    ):
+        raise ValueError("--enable_undetermined_goal_v3 cannot be used together with --enable_undetermined_goal_v2")
+    if getattr(all_args, "enable_undetermined_v2_exchange", False):
+        if not getattr(all_args, "enable_undetermined_goal_v2", False):
+            raise ValueError("--enable_undetermined_v2_exchange requires --enable_undetermined_goal_v2")
+        if getattr(all_args, "enable_undetermined_goal_v3", False):
+            raise ValueError("--enable_undetermined_v2_exchange is incompatible with --enable_undetermined_goal_v3")
 
     _lat_dir = getattr(all_args, "undet_v2_target_latent_model_dir", None)
+    _pair_arch = str(getattr(all_args, "undet_v2_head_arch", "dot_product")) == "pair_mlp"
+    if _pair_arch and getattr(all_args, "use_attn_comm_actor", False):
+        raise ValueError("--undet_v2_head_arch pair_mlp is incompatible with --use_attn_comm_actor (pure v2 obs only).")
     if _lat_dir and str(_lat_dir).strip():
         if not getattr(all_args, "enable_undetermined_goal", False):
             raise ValueError("--undet_v2_target_latent_model_dir requires --enable_undetermined_goal")
+        if getattr(all_args, "enable_undetermined_goal_v3", False):
+            raise ValueError(
+                "--undet_v2_target_latent_model_dir is incompatible with --enable_undetermined_goal_v3 "
+                "(v3 always uses AttnComm hybrid obs)."
+            )
         if not getattr(all_args, "enable_undetermined_goal_v2", False):
             raise ValueError("--undet_v2_target_latent_model_dir requires --enable_undetermined_goal_v2")
         if getattr(all_args, "use_attn_comm_actor", False):
@@ -122,13 +144,66 @@ def parser_args(args, parser):
     if getattr(all_args, "enable_undetermined_goal", False):
         all_args.enable_dynamic_goal_assignment = False
         k = int(all_args.num_agents)
-        if getattr(all_args, "enable_undetermined_goal_v2", False):
+        if getattr(all_args, "enable_undetermined_goal_v3", False):
+            if not getattr(all_args, "use_attn_comm_actor", False):
+                raise ValueError("--enable_undetermined_goal_v3 requires --use_attn_comm_actor")
+            if str(getattr(all_args, "architecture_mode", "default")) != "attn_undetermined_goal":
+                raise ValueError(
+                    "--enable_undetermined_goal_v3 requires --architecture_mode attn_undetermined_goal"
+                )
+            if str(getattr(all_args, "undet_v2_head_arch", "dot_product")) == "pair_mlp":
+                raise ValueError("--enable_undetermined_goal_v3 requires --undet_v2_head_arch dot_product")
+            all_args.enable_undetermined_goal_v2 = False
+            p_v3 = max(0, int(getattr(all_args, "undetermined_v3_comm_ally_slots", 6)))
+            h_v3 = max(0, int(getattr(all_args, "undetermined_v3_comm_human_slots", 4)))
+            all_args.attn_comm_ally_slots = p_v3
+            all_args.attn_comm_human_slots = h_v3
+            m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
+            md = int(getattr(all_args, "attn_comm_message_dim", 16))
+            all_args.robot_obs_dim = compute_undetermined_v3_robot_obs_dim(m, p_v3, h_v3, md)
+            apply_undetermined_v2_reward_floors(all_args)
+            print(
+                f"[train] undetermined goal v3: robot_obs_dim={all_args.robot_obs_dim} (+2 px,py; +1 prev_tid_norm), K={k}, "
+                f"M={m}, comm_ally_slots={p_v3}, comm_human_slots={h_v3} (agent-count decoupled), "
+                f"hungarian_div={getattr(all_args, 'undetermined_v2_hungarian_team_divisor', 8.0)}, "
+                f"v3_target_kl_coef={float(getattr(all_args, 'undetermined_v3_target_kl_coef', 0.0))}"
+            )
+            print(
+                f"[train] undetermined v3 uses v2-style S_L reward: dense_scale={float(getattr(all_args, 'undetermined_v2_sl_dense_scale', 0.0))}, "
+                f"delta_scale={float(getattr(all_args, 'undetermined_v2_sl_delta_scale', 0.0))}, "
+                f"success_scale={float(getattr(all_args, 'undetermined_v2_sl_success_scale', 0.0))}, "
+                f"thr={float(getattr(all_args, 'undetermined_v2_sl_success_threshold', 0.97))}"
+            )
+        elif getattr(all_args, "enable_undetermined_goal_v2", False):
             m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
             all_args.robot_obs_dim = compute_undetermined_v2_robot_obs_dim(m)
             apply_undetermined_v2_reward_floors(all_args)
             print(
                 f"[train] undetermined goal v2: robot_obs_dim={all_args.robot_obs_dim} (+2 px,py), "
                 f"K={k}, v2_slots={m}, hungarian_div={getattr(all_args, 'undetermined_v2_hungarian_team_divisor', 8.0)}"
+            )
+            if getattr(all_args, "enable_undetermined_v2_exchange", False):
+                _xr = getattr(all_args, "undetermined_v2_exchange_radius", None)
+                _xr_s = float(_xr) if _xr is not None else float(getattr(all_args, "undetermined_comm_radius", 6.0))
+                print(
+                    f"[train] undetermined v2_exchange: radius={_xr_s}, min_gain="
+                    f"{float(getattr(all_args, 'undetermined_v2_exchange_min_gain', 0.05))}, "
+                    f"max_pairs/step={int(getattr(all_args, 'undetermined_v2_exchange_max_pairs_per_step', 1))}, "
+                    f"ignore_pending={bool(getattr(all_args, 'undetermined_v2_exchange_ignore_pending', False))}"
+                )
+            print(
+                f"[train] undetermined v2 type-2 (S_L) reward: dense_scale={float(getattr(all_args, 'undetermined_v2_sl_dense_scale', 0.0))}, "
+                f"delta_scale={float(getattr(all_args, 'undetermined_v2_sl_delta_scale', 0.0))}, "
+                f"success_scale={float(getattr(all_args, 'undetermined_v2_sl_success_scale', 0.0))}, "
+                f"thr={float(getattr(all_args, 'undetermined_v2_sl_success_threshold', 0.97))}, "
+                f"type2_pattern_first={bool(getattr(all_args, 'undetermined_v2_type2_pattern_first', False))}, "
+                f"type2_formation_efficiency={bool(getattr(all_args, 'undetermined_v2_type2_formation_efficiency', False))}, "
+                f"sl_post_lit={float(getattr(all_args, 'undetermined_v2_sl_post_success_literal_scale', 1.0))}, "
+                f"sl_post_shape={float(getattr(all_args, 'undetermined_v2_sl_post_success_sl_shaping_scale', 1.0))}, "
+                f"sl_succ_cross_only={bool(getattr(all_args, 'undetermined_v2_sl_success_only_on_crossing', False))}, "
+                f"sl_succ_sustain={float(getattr(all_args, 'undetermined_v2_sl_success_sustain_frac', 0.0))}, "
+                f"sl_pre_step={float(getattr(all_args, 'undetermined_v2_sl_pre_success_step_penalty', 0.0))}, "
+                f"sl_pre_trav={float(getattr(all_args, 'undetermined_v2_sl_pre_success_travel_penalty', 0.0))}"
             )
             if _lat_dir and str(_lat_dir).strip():
                 print(
@@ -165,8 +240,9 @@ def parser_args(args, parser):
                 "--architecture_mode attn_undetermined_goal (hybrid ConsMAC observation pack)."
             )
         resolve_attn_comm_args(all_args)
-        if str(getattr(all_args, "architecture_mode", "")) == "attn_undetermined_goal" and getattr(
-            all_args, "enable_undetermined_goal_v2", False
+        if str(getattr(all_args, "architecture_mode", "")) == "attn_undetermined_goal" and (
+            getattr(all_args, "enable_undetermined_goal_v2", False)
+            or getattr(all_args, "enable_undetermined_goal_v3", False)
         ):
             m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
             all_args.robot_obs_dim = compute_undetermined_v2_attn_hybrid_robot_obs_dim(
@@ -180,8 +256,9 @@ def parser_args(args, parser):
                 int(all_args.attn_comm_human_slots),
                 int(getattr(all_args, "attn_comm_message_dim", 16)),
             )
+            _mode = "v3" if getattr(all_args, "enable_undetermined_goal_v3", False) else "v2"
             print(
-                f"[train] architecture attn_undetermined_goal: hybrid robot_obs_dim={all_args.robot_obs_dim} (+2), "
+                f"[train] architecture attn_undetermined_goal ({_mode}): hybrid robot_obs_dim={all_args.robot_obs_dim} (+2), "
                 f"undetermined_v2_core={compute_undetermined_v2_robot_obs_dim(m)}, consmac_tail={_tl}"
             )
         else:

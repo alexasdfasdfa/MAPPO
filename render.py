@@ -27,6 +27,7 @@ from config.config import (
 )
 
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv
+from runner.checkpoint_paths import resolve_shared_actor_checkpoint_path
 
 
 def apply_dynamic_goal_obs_dim(all_args):
@@ -54,10 +55,9 @@ def align_render_args_from_actor_checkpoint(all_args):
     Read results/.../models/actor.pt and set enable_dynamic_goal_assignment,
     num_agents, and robot_obs_dim so the policy matches the checkpoint.
     """
-    md = Path(str(getattr(all_args, "model_dir", "") or ""))
-    actor_path = md / "actor.pt"
-    if not actor_path.is_file():
-        print(f"[render] auto_align: no {actor_path}, skip")
+    actor_path = resolve_shared_actor_checkpoint_path(getattr(all_args, "model_dir", None))
+    if actor_path is None or not actor_path.is_file():
+        print(f"[render] auto_align: no actor checkpoint under model_dir={getattr(all_args, 'model_dir', None)!r}, skip")
         return
     try:
         sd = torch.load(actor_path, map_location="cpu")
@@ -162,7 +162,29 @@ def align_render_args_from_actor_checkpoint(all_args):
     else:
         all_args.enable_dynamic_goal_assignment = False
         gh = "undetermined_head.goal_mlp.0.weight"
-        if gh in sd:
+        pair_k = "undetermined_head.mlp.0.weight"
+        if pair_k in sd and gh not in sd:
+            all_args.enable_undetermined_goal = True
+            all_args.enable_undetermined_goal_v2 = True
+            all_args.undet_v2_head_arch = "pair_mlp"
+            in_d = int(sd[pair_k].shape[1])
+            m_slots = (in_d - 13) // 5
+            if m_slots < 1 or (in_d - 13) % 5 != 0:
+                m_slots = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
+                print(
+                    f"[render] auto_align WARN: pair_mlp in_d={in_d} does not match 13+5*M; "
+                    f"using undetermined_v2_goal_slots={m_slots}"
+                )
+            all_args.undetermined_v2_goal_slots = m_slots
+            all_args.robot_obs_dim = compute_undetermined_v2_robot_obs_dim(m_slots)
+            if "undetermined_head.score_dir" in sd:
+                all_args.undetermined_target_embed_dim = int(sd["undetermined_head.score_dir"].shape[0])
+            print(
+                f"[render] auto_align: undetermined goal v2 pair_mlp, M={m_slots}, "
+                f"robot_obs_dim={all_args.robot_obs_dim}, undetermined_target_embed_dim="
+                f"{int(getattr(all_args, 'undetermined_target_embed_dim', 96))} (actor input dim {D})"
+            )
+        elif gh in sd:
             all_args.enable_undetermined_goal = True
             in_f = int(sd[gh].shape[1])
             rod_bc = max(7, D - 2)
@@ -209,9 +231,8 @@ def align_render_args_from_actor_checkpoint(all_args):
 def _warn_checkpoint_dynamic_goal_head_mismatch(all_args):
     if not getattr(all_args, "enable_dynamic_goal_assignment", False):
         return
-    md = Path(str(getattr(all_args, "model_dir", "") or ""))
-    actor_path = md / "actor.pt"
-    if not actor_path.is_file():
+    actor_path = resolve_shared_actor_checkpoint_path(getattr(all_args, "model_dir", None))
+    if actor_path is None or not actor_path.is_file():
         return
     try:
         sd = torch.load(actor_path, map_location="cpu")
@@ -312,7 +333,8 @@ def main(args):
     parser = get_config()
     all_args = parser_args(args, parser)
     all_args.use_render = True
-    all_args.model_dir = '/home/wangdx_lab/cse12211818/MAPPO/results/train/run83/models'
+    # Shared-policy checkpoint: folder with actor.pt, or 4.pt if actor.pt is missing, or a direct path to *.pt.
+    all_args.model_dir = str(Path(__file__).resolve().parent / "results/train/run93/models")
     all_args.n_rollout_threads = 1
     all_args.episode_length = 500
     all_args.visualize = False

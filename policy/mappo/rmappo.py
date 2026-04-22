@@ -35,6 +35,7 @@ class RMAPPO():
             and str(getattr(args, "undet_v2_latent_train_mode", "finetune_all")) == "finetune_all"
             and getattr(policy.actor, "undetermined_head", None) is not None
         )
+        self._undet_v3_kl_coef = float(getattr(args, "undetermined_v3_target_kl_coef", 0.0))
 
         self.clip_param = args.clip_param
         self.ppo_epoch = args.ppo_epoch
@@ -117,9 +118,42 @@ class RMAPPO():
         :return actor_grad_norm: (torch.Tensor) gradient norm from actor update.
         :return imp_weights: (torch.Tensor) importance sampling weights.
         """
-        share_obs_batch, robot_obs_batch, human_obs_batch, rnn_states_batch, rnn_states_critic_batch, \
-        comm_rnn_states_batch, actions_batch, value_preds_batch, return_batch, masks_batch, active_masks_batch, \
-        old_action_log_probs_batch, adv_targ, available_actions_batch = sample
+        if len(sample) == 15:
+            (
+                share_obs_batch,
+                robot_obs_batch,
+                human_obs_batch,
+                rnn_states_batch,
+                rnn_states_critic_batch,
+                comm_rnn_states_batch,
+                actions_batch,
+                value_preds_batch,
+                return_batch,
+                masks_batch,
+                active_masks_batch,
+                old_action_log_probs_batch,
+                adv_targ,
+                available_actions_batch,
+                old_undet_target_logits_batch,
+            ) = sample
+        else:
+            (
+                share_obs_batch,
+                robot_obs_batch,
+                human_obs_batch,
+                rnn_states_batch,
+                rnn_states_critic_batch,
+                comm_rnn_states_batch,
+                actions_batch,
+                value_preds_batch,
+                return_batch,
+                masks_batch,
+                active_masks_batch,
+                old_action_log_probs_batch,
+                adv_targ,
+                available_actions_batch,
+            ) = sample
+            old_undet_target_logits_batch = None
 
         old_action_log_probs_batch = check(old_action_log_probs_batch).to(**self.tpdv)
         adv_targ = check(adv_targ).to(**self.tpdv)
@@ -197,6 +231,27 @@ class RMAPPO():
             undet_head_aux = self._undet_v2_head_aux_coef * aux
             loss_actor = loss_actor + undet_head_aux
 
+        undet_v3_kl = None
+        if (
+            update_actor
+            and self._undet_v3_kl_coef > 1e-12
+            and old_undet_target_logits_batch is not None
+            and getattr(self._args, "enable_undetermined_goal_v3", False)
+        ):
+            ro = check(robot_obs_batch).to(**self.tpdv)
+            new_logits = self.policy.actor.get_undetermined_target_logits(ro)
+            old_l = check(old_undet_target_logits_batch).to(**self.tpdv).detach()
+            if new_logits.shape == old_l.shape:
+                p_new = torch.softmax(new_logits, dim=-1).clamp_min(1e-8)
+                log_p_new = torch.log(p_new)
+                p_old = torch.softmax(old_l, dim=-1).clamp_min(1e-8)
+                kl = (p_old * (torch.log(p_old) - log_p_new)).sum(dim=-1, keepdim=True)
+                if self._use_policy_active_masks:
+                    undet_v3_kl = (kl * active_masks_batch).sum() / active_masks_batch.sum()
+                else:
+                    undet_v3_kl = kl.mean()
+                loss_actor = loss_actor + self._undet_v3_kl_coef * undet_v3_kl
+
         l_ce_side = None
         if getattr(self.policy, "ce_optimizer", None) is not None:
             ce_parts = []
@@ -253,8 +308,18 @@ class RMAPPO():
         self.policy.critic_optimizer.step()
 
         undet_aux_item = float(undet_head_aux.detach().item()) if undet_head_aux is not None else None
+        undet_v3_kl_item = float(undet_v3_kl.detach().item()) if undet_v3_kl is not None else None
 
-        return value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, undet_aux_item
+        return (
+            value_loss,
+            critic_grad_norm,
+            policy_loss,
+            dist_entropy,
+            actor_grad_norm,
+            imp_weights,
+            undet_aux_item,
+            undet_v3_kl_item,
+        )
 
     def train(self, buffer, update_actor=True):
         """
@@ -284,6 +349,8 @@ class RMAPPO():
         train_info['ratio'] = 0
         if self._undet_v2_head_aux_on:
             train_info["undet_head_aux_loss"] = 0.0
+        if self._undet_v3_kl_coef > 1e-12 and getattr(self._args, "enable_undetermined_goal_v3", False):
+            train_info["undet_v3_target_kl"] = 0.0
 
         for _ in range(self.ppo_epoch):#耗时16
             if self._use_recurrent_policy:
@@ -294,8 +361,16 @@ class RMAPPO():
                 data_generator = buffer.feed_forward_generator(advantages, self.num_mini_batch)  #用yield在函数中返回可迭代的结果
 
             for sample in data_generator:#每轮耗时约1s
-                value_loss, critic_grad_norm, policy_loss, dist_entropy, actor_grad_norm, imp_weights, undet_aux_item \
-                    = self.ppo_update(sample, update_actor)
+                (
+                    value_loss,
+                    critic_grad_norm,
+                    policy_loss,
+                    dist_entropy,
+                    actor_grad_norm,
+                    imp_weights,
+                    undet_aux_item,
+                    undet_v3_kl_item,
+                ) = self.ppo_update(sample, update_actor)
 
                 train_info['value_loss'] += value_loss.item()
                 train_info['policy_loss'] += policy_loss.item()
@@ -305,6 +380,12 @@ class RMAPPO():
                 train_info['ratio'] += imp_weights.mean()
                 if self._undet_v2_head_aux_on and undet_aux_item is not None:
                     train_info["undet_head_aux_loss"] += undet_aux_item
+                if (
+                    self._undet_v3_kl_coef > 1e-12
+                    and getattr(self._args, "enable_undetermined_goal_v3", False)
+                    and undet_v3_kl_item is not None
+                ):
+                    train_info["undet_v3_target_kl"] += undet_v3_kl_item
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 

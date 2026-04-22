@@ -126,6 +126,14 @@ REWARD_TERMS_CSV_COLUMNS = (
     "nd_progress_delta_applied",
     "nd_timeout_no_goal_penalty_raw",
     "undetermined_hungarian_bonus",
+    "laplacian_S_L",
+    "undetermined_v2_sl_raw",
+    "undetermined_v2_sl_delta_raw",
+    "undetermined_v2_sl_success",
+    "undetermined_v2_sl_type2_crossing",
+    "undetermined_v2_sl_literal_relax_w",
+    "undetermined_v2_sl_pre_success_step_raw",
+    "undetermined_v2_sl_pre_success_travel_raw",
     "nd_goal_leave_penalty_raw",
     "reward_final",
 )
@@ -398,6 +406,7 @@ class EnvRunner(Runner):
                         actions_env,
                         broadcast_msg,
                         comm_rnn_out,
+                        undet_logits,
                     ) = self.collect(step)
 
                     if (
@@ -429,6 +438,7 @@ class EnvRunner(Runner):
                         rnn_states,
                         rnn_states_critic,
                         comm_rnn_out,
+                        undet_logits,
                     )
 
                     # insert data into buffer
@@ -570,6 +580,14 @@ class EnvRunner(Runner):
             np.concatenate(self.buffer.masks[step]),
             comm_rnn_states_actor=comm_flat,
         )
+        undet_logits_out = None
+        if getattr(self.buffer, "undet_target_logits", None) is not None:
+            lt = self.trainer.policy.get_undetermined_target_logits(
+                torch.from_numpy(robot_obs).float().to(self.device)
+            )
+            undet_logits_out = np.array(
+                np.split(_t2n(lt), self.n_rollout_threads)
+            ).astype(np.float32)
         # [self.envs, agents, dim]
         values = np.array(np.split(_t2n(value), self.n_rollout_threads))  # [env_num, agent_num, 1]
         actions = np.array(np.split(_t2n(action), self.n_rollout_threads))  # [env_num, agent_num, action_dim]
@@ -609,6 +627,7 @@ class EnvRunner(Runner):
             actions_env,
             bm,
             cr,
+            undet_logits_out,
         )
 
     def insert(self, data):
@@ -623,6 +642,7 @@ class EnvRunner(Runner):
             rnn_states,
             rnn_states_critic,
             comm_rnn_out,
+            undet_logits,
         ) = data
 
         rnn_states[dones == True] = np.zeros(
@@ -659,6 +679,7 @@ class EnvRunner(Runner):
             rewards,
             masks,
             comm_rnn_states_actor=comm_rnn_out if self.buffer.comm_rnn_states is not None else None,
+            undet_target_logits=undet_logits,
         )
 
     # @torch.no_grad()
@@ -822,7 +843,9 @@ class EnvRunner(Runner):
                     episode_meta_record["dynamic_target"] = True
                 if getattr(core_env, "undetermined_goal_assignment", False) and gp:
                     episode_meta_record["undetermined_goal"] = True
-                    if getattr(core_env, "undetermined_goal_v2", False):
+                    if getattr(core_env, "undetermined_goal_v3", False):
+                        episode_meta_record["undetermined_goal_v3"] = True
+                    elif getattr(core_env, "undetermined_goal_v2", False):
                         episode_meta_record["undetermined_goal_v2"] = True
                 if not episode_meta_record.get("dynamic_target") and not episode_meta_record.get(
                     "undetermined_goal"

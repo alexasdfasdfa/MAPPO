@@ -9,6 +9,7 @@ from config.config import (
     compute_undetermined_robot_obs_dim,
     compute_undetermined_v2_robot_obs_dim,
     compute_undetermined_v2_attn_hybrid_robot_obs_dim,
+    compute_undetermined_v3_robot_obs_dim,
     resolve_attn_comm_args,
 )
 import configparser
@@ -30,16 +31,34 @@ class DiscreteActionEnv(gym.Env):
                     "disable --enable_dynamic_goal_assignment."
                 )
             resolve_attn_comm_args(all_args)
-            exp = compute_attn_comm_robot_obs_dim(
-                int(all_args.attn_comm_ally_slots),
-                int(all_args.attn_comm_human_slots),
-                message_dim=int(getattr(all_args, "attn_comm_message_dim", 16)),
+            _hybrid_ud = (
+                getattr(all_args, "enable_undetermined_goal", False)
+                and str(getattr(all_args, "architecture_mode", "default")) == "attn_undetermined_goal"
+                and (
+                    getattr(all_args, "enable_undetermined_goal_v2", False)
+                    or getattr(all_args, "enable_undetermined_goal_v3", False)
+                )
             )
-            if int(getattr(all_args, "robot_obs_dim", 7)) != exp:
-                all_args.robot_obs_dim = exp
+            if not _hybrid_ud:
+                exp = compute_attn_comm_robot_obs_dim(
+                    int(all_args.attn_comm_ally_slots),
+                    int(all_args.attn_comm_human_slots),
+                    message_dim=int(getattr(all_args, "attn_comm_message_dim", 16)),
+                )
+                if int(getattr(all_args, "robot_obs_dim", 7)) != exp:
+                    all_args.robot_obs_dim = exp
         if getattr(all_args, "enable_undetermined_goal", False):
             k = int(all_args.num_agents)
-            if getattr(all_args, "enable_undetermined_goal_v2", False):
+            if getattr(all_args, "enable_undetermined_goal_v3", False):
+                m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
+                resolve_attn_comm_args(all_args)
+                exp = compute_undetermined_v3_robot_obs_dim(
+                    m,
+                    int(all_args.attn_comm_ally_slots),
+                    int(all_args.attn_comm_human_slots),
+                    int(getattr(all_args, "attn_comm_message_dim", 16)),
+                )
+            elif getattr(all_args, "enable_undetermined_goal_v2", False):
                 m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
                 if (
                     str(getattr(all_args, "architecture_mode", "default")) == "attn_undetermined_goal"
@@ -191,6 +210,11 @@ class DiscreteActionEnv(gym.Env):
 
     def apply_undetermined_targets(self, targets):
         self.env.apply_undetermined_targets(targets)
+        if getattr(self.env, "undetermined_goal_v3", False):
+            K = max(1, int(self.env.num_goal_targets))
+            den = float(max(1, K - 1))
+            for r in self.env.robots:
+                r.undet_prev_tid_norm = float(int(r.target_id) % K) / den
         return self.env.refresh_observations_after_target_change()
 
     def reset(self):

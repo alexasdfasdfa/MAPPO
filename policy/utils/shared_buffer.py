@@ -85,6 +85,18 @@ class SharedReplayBuffer(object):
         else:
             self.comm_rnn_states = None
 
+        m_slots = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
+        self._store_undet_logits = bool(getattr(args, "enable_undetermined_goal_v3", False)) and float(
+            getattr(args, "undetermined_v3_target_kl_coef", 0.0)
+        ) > 1e-12
+        if self._store_undet_logits:
+            self.undet_target_logits = np.zeros(
+                (self.episode_length, self.n_rollout_threads, num_agents, m_slots),
+                dtype=np.float32,
+            )
+        else:
+            self.undet_target_logits = None
+
         self.value_preds = np.zeros(
             (self.episode_length + 1, self.n_rollout_threads, num_agents, 1), dtype=np.float32)
         self.returns = np.zeros_like(self.value_preds)
@@ -125,6 +137,7 @@ class SharedReplayBuffer(object):
         active_masks=None,
         available_actions=None,
         comm_rnn_states_actor=None,
+        undet_target_logits=None,
     ):
         """
         Insert data into the buffer.
@@ -158,6 +171,8 @@ class SharedReplayBuffer(object):
             self.available_actions[self.step + 1] = available_actions.copy()
         if self.comm_rnn_states is not None and comm_rnn_states_actor is not None:
             self.comm_rnn_states[self.step + 1] = comm_rnn_states_actor.copy()
+        if self.undet_target_logits is not None and undet_target_logits is not None:
+            self.undet_target_logits[self.step] = np.asarray(undet_target_logits, dtype=np.float32).copy()
 
         self.step = (self.step + 1) % self.episode_length
 
@@ -209,6 +224,8 @@ class SharedReplayBuffer(object):
             self.available_actions[0] = self.available_actions[-1].copy()
         if self.comm_rnn_states is not None:
             self.comm_rnn_states[0] = self.comm_rnn_states[-1].copy()
+        if self.undet_target_logits is not None:
+            self.undet_target_logits[0] = self.undet_target_logits[-1].copy()
 
     def chooseafter_update(self):
         """Copy last timestep data to first index. This method is used for Hanabi."""
@@ -315,6 +332,10 @@ class SharedReplayBuffer(object):
         active_masks = self.active_masks[:-1].reshape(-1, 1)
         action_log_probs = self.action_log_probs.reshape(-1, self.action_log_probs.shape[-1])
         advantages = advantages.reshape(-1, 1)
+        if self.undet_target_logits is not None:
+            undet_old = self.undet_target_logits.reshape(-1, self.undet_target_logits.shape[-1])
+        else:
+            undet_old = None
 
         for indices in sampler:
             # obs size [T+1 N M Dim]-->[T N M Dim]-->[T*N*M,Dim]-->[index,Dim]
@@ -352,6 +373,11 @@ class SharedReplayBuffer(object):
             else:
                 adv_targ = advantages[indices]
 
+            if undet_old is not None:
+                old_undet_target_logits_batch = undet_old[indices]
+            else:
+                old_undet_target_logits_batch = None
+
             yield (
                 share_obs_batch,
                 robot_obs_batch,
@@ -367,6 +393,7 @@ class SharedReplayBuffer(object):
                 old_action_log_probs_batch,
                 adv_targ,
                 available_actions_batch,
+                old_undet_target_logits_batch,
             )
 
     def naive_recurrent_generator(self, advantages, num_mini_batch):
@@ -401,6 +428,11 @@ class SharedReplayBuffer(object):
         active_masks = self.active_masks.reshape(-1, batch_size, 1)
         action_log_probs = self.action_log_probs.reshape(-1, batch_size, self.action_log_probs.shape[-1])
         advantages = advantages.reshape(-1, batch_size, 1)
+        if self.undet_target_logits is not None:
+            _um = self.undet_target_logits.shape[-1]
+            undet_l = self.undet_target_logits.reshape(-1, batch_size, _um)
+        else:
+            undet_l = None
 
         for start_ind in range(0, batch_size, num_envs_per_batch):
             share_obs_batch = []
@@ -416,6 +448,7 @@ class SharedReplayBuffer(object):
             old_action_log_probs_batch = []
             adv_targ = []
             comm_rnn_batch_list = [] if comm_rnn is not None else None
+            undet_batch_list = [] if undet_l is not None else None
 
             for offset in range(num_envs_per_batch):
                 ind = perm[start_ind + offset]
@@ -434,6 +467,8 @@ class SharedReplayBuffer(object):
                 active_masks_batch.append(active_masks[:-1, ind])
                 old_action_log_probs_batch.append(action_log_probs[:, ind])
                 adv_targ.append(advantages[:, ind])
+                if undet_l is not None:
+                    undet_batch_list.append(undet_l[:-1, ind])
 
             # [N[T, dim]]
             T, N = self.episode_length, num_envs_per_batch
@@ -485,6 +520,10 @@ class SharedReplayBuffer(object):
                 comm_rnn_batch = _flatten(T, N, comm_rnn_stack)
             else:
                 comm_rnn_batch = None
+            if undet_batch_list is not None:
+                old_undet_target_logits_batch = _flatten(T, N, np.stack(undet_batch_list, axis=1))
+            else:
+                old_undet_target_logits_batch = None
 
             yield (
                 share_obs_batch,
@@ -501,6 +540,7 @@ class SharedReplayBuffer(object):
                 old_action_log_probs_batch,
                 adv_targ,
                 available_actions_batch,
+                old_undet_target_logits_batch,
             )
 
     def recurrent_generator(self, advantages, num_mini_batch, data_chunk_length):
@@ -542,6 +582,12 @@ class SharedReplayBuffer(object):
             comm_rnn = self.comm_rnn_states[:-1].transpose(1, 2, 0, 3).reshape(-1, self.comm_state_dim)
         else:
             comm_rnn = None
+        if self.undet_target_logits is not None:
+            undet_old = self.undet_target_logits.transpose(1, 2, 0, 3).reshape(
+                -1, self.undet_target_logits.shape[-1]
+            )
+        else:
+            undet_old = None
 
         if self.available_actions is not None:
             available_actions = _cast(self.available_actions[:-1])
@@ -560,6 +606,7 @@ class SharedReplayBuffer(object):
             old_action_log_probs_batch = []
             adv_targ = []
             comm_rnn_chunks = [] if comm_rnn is not None else None
+            undet_chunks = [] if undet_old is not None else None
 
             for index in indices:
 
@@ -569,6 +616,8 @@ class SharedReplayBuffer(object):
                 obs_batch.append(obs[ind:ind + data_chunk_length])
                 if comm_rnn is not None:
                     comm_rnn_chunks.append(comm_rnn[ind:ind + data_chunk_length])
+                if undet_old is not None:
+                    undet_chunks.append(undet_old[ind:ind + data_chunk_length])
                 actions_batch.append(actions[ind:ind + data_chunk_length])
                 if self.available_actions is not None:
                     available_actions_batch.append(available_actions[ind:ind + data_chunk_length])
@@ -633,6 +682,10 @@ class SharedReplayBuffer(object):
                 comm_rnn_batch = _flatten(L, N, comm_rnn_stack)
             else:
                 comm_rnn_batch = None
+            if undet_chunks is not None:
+                old_undet_target_logits_batch = _flatten(L, N, np.stack(undet_chunks, axis=1))
+            else:
+                old_undet_target_logits_batch = None
 
             yield (
                 share_obs_batch,
@@ -649,5 +702,6 @@ class SharedReplayBuffer(object):
                 old_action_log_probs_batch,
                 adv_targ,
                 available_actions_batch,
+                old_undet_target_logits_batch,
             )
            

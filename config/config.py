@@ -105,12 +105,91 @@ def get_config():
         help="Number of nearest-goal slots packed into each robot obs in undetermined v2 (capped by K at runtime).",
     )
     parser.add_argument(
+        "--enable_undetermined_v2_exchange",
+        action="store_true",
+        default=False,
+        help="Undetermined v2 only: each env step, a heuristic may swap two agents' discrete targets when they lie "
+        "within a local domain radius and swapping strictly reduces max(dist to own goal) across the pair "
+        "(l1=d(i,g_i), l2=d(j,g_j) vs d1=d(i,g_j), d2=d(j,g_i) after swap: require max(l1,l2)>max(d1,d2) by "
+        "min_gain). Incompatible with --enable_undetermined_goal_v3.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_radius",
+        type=float,
+        default=None,
+        help="Pairwise exchange domain (meters): only agent pairs with center distance <= this are candidates. "
+        "None defaults to --undetermined_comm_radius.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_min_gain",
+        type=float,
+        default=0.05,
+        help="Minimum strict improvement in bottleneck distance max(l1,l2)-max(d1,d2) (meters) for the pair "
+        "to perform a swap; l1/l2 are pre-swap distances to assigned goals, d1/d2 post-swap.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_max_pairs_per_step",
+        type=int,
+        default=1,
+        help="Max number of disjoint pairs to swap per step (greedy: best gains first).",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_ignore_pending",
+        action="store_true",
+        default=False,
+        help="If set, allow swaps even when an agent has undetermined_target_pending; default skips such agents.",
+    )
+    parser.add_argument(
+        "--enable_undetermined_goal_v3",
+        action="store_true",
+        default=False,
+        help="Undetermined v3: same nearest-M goal core and v2-style target head + rewards as v2, but observation always "
+        "includes AttnComm tail (ally recv + messages + humans). Ally/human slot counts come from "
+        "--undetermined_v3_comm_* (fixed caps), not from num_agents, so checkpoints/layout stay agent-count agnostic. "
+        "Requires --enable_undetermined_goal, --use_attn_comm_actor, --architecture_mode attn_undetermined_goal, "
+        "and disables --enable_undetermined_goal_v2.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_comm_ally_slots",
+        type=int,
+        default=6,
+        help="Undetermined v3: max in-radius ally slots in the comm tail (decoupled from num_agents). "
+        "Train syncs attn_comm_ally_slots to this when v3 is enabled.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_comm_human_slots",
+        type=int,
+        default=4,
+        help="Undetermined v3: max in-radius human slots in the comm tail (decoupled from num_agents).",
+    )
+    parser.add_argument(
+        "--undetermined_v3_attn_embed_dim",
+        type=int,
+        default=64,
+        help="Undetermined v3: embedding width for scaled dot-product attention over M goal slots (target head).",
+    )
+    parser.add_argument(
+        "--undetermined_v3_fuse_hidden",
+        type=int,
+        default=128,
+        help="Undetermined v3: hidden units for fusion MLP that adds a residual to slot logits from "
+        "(ego, prev target norm, slot features).",
+    )
+    parser.add_argument(
+        "--undetermined_v3_target_kl_coef",
+        type=float,
+        default=0.0,
+        help="Undetermined v3: KL( softmax(new_logits) || softmax(old_logits.detach)) on the M-slot target head, "
+        "where old logits are those stored at rollout collection (trust-region / slow drift of target choice). "
+        "0 disables extra buffer + loss.",
+    )
+    parser.add_argument(
         "--undet_v2_target_latent_model_dir",
         type=str,
         default=None,
-        help="When --enable_undetermined_goal_v2 and --use_attn_comm_actor is disabled: path to a run folder "
-        "(e.g. results/train/<undet_v2_target_latent>/ with models/actor.pt) or a direct actor.pt. "
-        "After optional model_dir restore, loads only undetermined_head.* into the actor(s) for target selection.",
+        help="Sibling folder (resolved from MAPPO repo root): MAPPO actor.pt with undetermined_head.*, or "
+        "target_latent_selector.pt when --undet_v2_head_arch pair_mlp (loads into undetermined_head). "
+        "Empty string disables.",
     )
     parser.add_argument(
         "--undet_v2_latent_train_mode",
@@ -124,10 +203,44 @@ def get_config():
     parser.add_argument(
         "--undet_v2_target_head_aux_coef",
         type=float,
-        default=0.1,
+        default=0.15,
         help="When undet_v2_latent_train_mode=finetune_all (undetermined v2, no attn actor): weight on auxiliary "
-        "cross-entropy that matches the nearest-M slot to the goal implied by obs (gx,gy). Set 0 to disable aux "
-        "(head will then not get gradients from PPO). Ignored in motion_only.",
+        "cross-entropy that matches the nearest-M slot to the goal implied by obs (gx,gy). Higher helps scratch "
+        "training without latent pretrain. Set 0 to disable aux (head gets no PPO grads). Ignored in motion_only.",
+    )
+    parser.add_argument(
+        "--undet_v2_head_arch",
+        type=str,
+        default="dot_product",
+        choices=["dot_product", "pair_mlp"],
+        help="Undetermined v2 target head: dot_product (ego_mlp+goal_mlp) or pair_mlp (same architecture as "
+        "undet_v2_target_latent TargetLatentSelector; required to load target_latent_selector.pt). "
+        "pair_mlp needs pure v2 obs (no AttnComm hybrid tail). For pair_mlp set --undetermined_target_embed_dim "
+        "to match standalone d_emb (often 96).",
+    )
+    parser.add_argument(
+        "--undet_v2_pair_mlp_hidden",
+        type=int,
+        default=384,
+        help="Hidden width in pair_mlp head (match undet_v2_target_latent --hidden).",
+    )
+    parser.add_argument(
+        "--undet_v2_pair_mlp_no_layernorm",
+        action="store_true",
+        default=False,
+        help="Disable LayerNorm in pair_mlp head (match standalone --no-layernorm).",
+    )
+    parser.add_argument(
+        "--undet_v2_pair_coord_scale",
+        type=float,
+        default=10.0,
+        help="coord_scale for rel/cs in pair_mlp forward (match undet_v2_target_latent --box).",
+    )
+    parser.add_argument(
+        "--undet_v2_pair_dist_box",
+        type=float,
+        default=10.0,
+        help="Box length for learned dist bias in pair_mlp (match training box side).",
     )
     parser.add_argument(
         "--undetermined_v2_hungarian_team_divisor",
@@ -166,6 +279,90 @@ def get_config():
         help="Max per-step approach shaping (world units) after clip, before nd_discount_nav.",
     )
     parser.add_argument(
+        "--undetermined_v2_sl_dense_scale",
+        type=float,
+        default=0.28,
+        help="Undetermined v2 only: dense type-2 (formation) reward = scale * clip(S_L,0,1) added to r_nav, "
+        "S_L=1-||L_hat-L_des||_F/||L_des||_F (L_des from goal sites — topological hint vs literal waypoint chasing). 0=off.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_success_scale",
+        type=float,
+        default=2.5,
+        help="Undetermined v2 only: extra bonus on r_nav when S_L >= --undetermined_v2_sl_success_threshold "
+        "(type-2 / similarity success). 0=off.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_success_threshold",
+        type=float,
+        default=0.97,
+        help="S_L threshold for --undetermined_v2_sl_success_scale (similarity / formation success).",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_delta_scale",
+        type=float,
+        default=0.0,
+        help="Undetermined v2 type-2: add scale * max(0, S_L - S_L_prev) to dense shaping (same channel as sl_raw). "
+        "Rewards improving Laplacian match vs previous step; goals induce L_des as a topological hint.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_type2_pattern_first",
+        action="store_true",
+        default=False,
+        help="Undetermined v2: after floors, weaken literal (gx,gy) anchoring (approach + dist penalties + progress) "
+        "and strengthen type-2 (raise S_L dense/success caps, set sl_delta_scale if still 0). Use for class-2 / pattern emphasis.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_type2_formation_efficiency",
+        action="store_true",
+        default=True,
+        help="Undetermined v2: preset for type-2 success — relax literal goal pull and S_L shaping after S_L>=thr "
+        "(allow formation drift vs targets), reward first crossing into success, add light pre-success step/travel cost "
+        "to favor fewer steps and shorter motion before formation.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_post_success_literal_scale",
+        type=float,
+        default=1.0,
+        help="Undetermined v2: when laplacian S_L >= success threshold, scale (gx,gy) shaping: progress, approach, "
+        "dist penalties, proximity, heading, and nd goal-disk raw. 1.0=no change; ~0.25–0.35 allows drift after formation.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_post_success_sl_shaping_scale",
+        type=float,
+        default=1.0,
+        help="Undetermined v2: when S_L >= success threshold, scale S_L dense + delta terms (so small post-success "
+        "S_L dips from drift are less punitive). 1.0=no change.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_success_only_on_crossing",
+        action="store_true",
+        default=False,
+        help="Undetermined v2: pay undetermined_v2_sl_success_scale mainly when S_L first crosses the threshold "
+        "(S_L_prev < thr <= S_L); optional sustain via --undetermined_v2_sl_success_sustain_frac.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_success_sustain_frac",
+        type=float,
+        default=0.0,
+        help="Undetermined v2: when --undetermined_v2_sl_success_only_on_crossing, add success_scale*sustain_frac "
+        "on subsequent steps while S_L>=thr (0 = no per-step sustain).",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_pre_success_step_penalty",
+        type=float,
+        default=0.0,
+        help="Undetermined v2: add this raw value to r_nav each step while S_L < success threshold (use small negative "
+        "e.g. -0.02 to encourage fewer iterations before formation). 0=off.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_sl_pre_success_travel_penalty",
+        type=float,
+        default=0.0,
+        help="Undetermined v2: each step while S_L < thr, add this * (team step travel sum / N) to r_nav (negative "
+        "values penalize motion before formation). Requires undetermined/dynamic path sync travel. 0=off.",
+    )
+    parser.add_argument(
         "--undetermined_far_goal_progress_dist_thresh",
         type=float,
         default=4.0,
@@ -192,10 +389,11 @@ def get_config():
     parser.add_argument(
         "--architecture_mode",
         type=str,
-        default="attn_undetermined_goal",
+        default="default",
         choices=["default", "attn_undetermined_goal"],
-        help="attn_undetermined_goal: Cons-DecAF-style stack — undetermined goal v2 obs unchanged; ConsMAC via "
-        "AttnComm tail; CTDE MAPPO + nearest_n_radius critic; reward Eq.(1)-(4) in Xiang et al. (arXiv:2307.12287).",
+        help="attn_undetermined_goal: Cons-DecAF-style stack — undetermined goal v2/v3 nearest-M core unchanged; "
+        "ConsMAC via AttnComm tail; CTDE MAPPO + nearest_n_radius critic; reward Eq.(1)-(4) in Xiang et al. "
+        "(arXiv:2307.12287). Use with --enable_undetermined_goal_v3 for v3 (comm tail P/H decoupled from num_agents).",
     )
     parser.add_argument(
         "--cons_mac_ce_bins",
@@ -779,7 +977,7 @@ def get_config():
     parser.add_argument(
         "--use_attn_comm_actor",
         action="store_true",
-        default=True,
+        default=False,
         help="Use grouped GAT-style encoders + intent message attention on robot obs (requires fixed targets).",
     )
     parser.add_argument(
@@ -1189,7 +1387,7 @@ def get_config():
     parser.add_argument(
         "--save_reward_terms",
         action="store_true",
-        default=True,
+        default=False,
         help="If set, append per-step reward breakdown to logs/reward_terms.csv on the same episodes as TensorBoard (log_interval); use reward_terms_log_stride to subsample steps.",
     )
     parser.add_argument(
@@ -1236,7 +1434,13 @@ def get_config():
     parser.add_argument("--method", type=str, default='ppo', help="ppo, orca, apf")
 
     # pretrained parameters
-    parser.add_argument("--model_dir",type=str,default=None,help="by default None. set the path to pretrained model.",)
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        default=None,
+        help="Pretrained shared policy: directory containing actor.pt (and critic.pt for training resume), "
+        "or the same directory with 4.pt if actor.pt is absent, or a direct path to a *.pt actor file.",
+    )
 
     # agent parameters
     parser.add_argument("--num_humans", type=int, default=0, help="number of dynamic obstacles")
@@ -1414,6 +1618,18 @@ def compute_undetermined_v2_attn_hybrid_robot_obs_dim(
     )
 
 
+def compute_undetermined_v3_robot_obs_dim(
+    goal_slots: int, ally_slots: int, human_slots: int, message_dim: int
+) -> int:
+    """
+    Undetermined v3: v2 nearest-M core + one scalar (prev applied target id norm) before px,py in the core block,
+    then the same AttnComm tail; ally/human slot counts are v3 hyperparameters (not tied to num_agents).
+    """
+    return compute_undetermined_v2_robot_obs_dim(goal_slots) + 1 + compute_attn_comm_tail_dim(
+        ally_slots, human_slots, message_dim
+    )
+
+
 def apply_architecture_mode_preset(args) -> None:
     """Reserved for named stacks; flags stay explicit on the CLI (no silent cross-mode coupling)."""
     return
@@ -1495,6 +1711,49 @@ def apply_undetermined_v2_reward_floors(args) -> None:
     args.undetermined_goal_dist_penalty_quad_scale = pdq * float(getattr(args, "undetermined_v2_dist_penalty_mult", 0.38))
     args.undetermined_far_goal_progress_boost = min(float(getattr(args, "undetermined_far_goal_progress_boost", 1.12)), 1.11)
     args.undetermined_hungarian_reward_scale = min(float(getattr(args, "undetermined_hungarian_reward_scale", 0.08)), 0.07)
+
+    if getattr(args, "undetermined_v2_type2_formation_efficiency", False):
+        # Fast formation + short path before type-2 success; after success, allow drift vs literal targets.
+        if float(getattr(args, "undetermined_v2_sl_post_success_literal_scale", 1.0)) > 0.999:
+            args.undetermined_v2_sl_post_success_literal_scale = 0.28
+        if float(getattr(args, "undetermined_v2_sl_post_success_sl_shaping_scale", 1.0)) > 0.999:
+            args.undetermined_v2_sl_post_success_sl_shaping_scale = 0.42
+        args.undetermined_v2_sl_success_only_on_crossing = True
+        if float(getattr(args, "undetermined_v2_sl_success_sustain_frac", 0.0)) < 1e-12:
+            args.undetermined_v2_sl_success_sustain_frac = 0.12
+        if float(getattr(args, "undetermined_v2_sl_pre_success_step_penalty", 0.0)) > -1e-12:
+            args.undetermined_v2_sl_pre_success_step_penalty = -0.018
+        if float(getattr(args, "undetermined_v2_sl_pre_success_travel_penalty", 0.0)) > -1e-12:
+            args.undetermined_v2_sl_pre_success_travel_penalty = -0.055
+
+    if getattr(args, "undetermined_v2_type2_pattern_first", False):
+        # Type-2 / formation emphasis: targets mainly shape L_des; soften per-agent pull to literal (gx, gy).
+        args.undetermined_v2_approach_reward_scale = float(
+            getattr(args, "undetermined_v2_approach_reward_scale", 0.85)
+        ) * 0.48
+        args.nd_goal_progress_coef = float(getattr(args, "nd_goal_progress_coef", 7.5)) * 0.82
+        args.undetermined_goal_distance_penalty_scale = float(
+            getattr(args, "undetermined_goal_distance_penalty_scale", 0.012)
+        ) * 0.52
+        args.undetermined_goal_dist_penalty_quad_scale = float(
+            getattr(args, "undetermined_goal_dist_penalty_quad_scale", 0.00012)
+        ) * 0.52
+        args.undetermined_far_goal_progress_boost = min(
+            float(getattr(args, "undetermined_far_goal_progress_boost", 1.11)), 1.06
+        )
+        d0 = float(getattr(args, "undetermined_v2_sl_dense_scale", 0.28))
+        args.undetermined_v2_sl_dense_scale = max(d0, 0.36)
+        s0 = float(getattr(args, "undetermined_v2_sl_success_scale", 2.5))
+        args.undetermined_v2_sl_success_scale = max(s0, 3.2)
+        if float(getattr(args, "undetermined_v2_sl_delta_scale", 0.0)) < 1e-9:
+            args.undetermined_v2_sl_delta_scale = 3.5
+        # Light post–type-2-success drift vs literal (gx,gy); full crossing/step/travel preset is
+        # --undetermined_v2_type2_formation_efficiency (keeps older pattern_first runs comparable).
+        if not getattr(args, "undetermined_v2_type2_formation_efficiency", False):
+            if float(getattr(args, "undetermined_v2_sl_post_success_literal_scale", 1.0)) > 0.999:
+                args.undetermined_v2_sl_post_success_literal_scale = 0.28
+            if float(getattr(args, "undetermined_v2_sl_post_success_sl_shaping_scale", 1.0)) > 0.999:
+                args.undetermined_v2_sl_post_success_sl_shaping_scale = 0.42
 
 
 def compute_dynamic_robot_obs_dim(

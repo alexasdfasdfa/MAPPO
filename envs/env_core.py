@@ -1,4 +1,5 @@
 import logging
+import math
 import numpy as np
 import rvo2
 from numpy.linalg import norm
@@ -165,6 +166,8 @@ class EnvCore(object):
         self.observation_states = None
         self.attention_weights = None
         self.L_des = None
+        self.laplacian_S_L = float("nan")
+        self.laplacian_S_L_prev = float("nan")
         self.for_edge = args.for_edge
 
         self.is_reset = None
@@ -190,10 +193,36 @@ class EnvCore(object):
         self.num_goal_targets = self.robot_num
 
         self.undetermined_goal_assignment = bool(getattr(args, "enable_undetermined_goal", False))
+        self.undetermined_goal_v3 = bool(getattr(args, "enable_undetermined_goal_v3", False))
         self.undetermined_goal_v2 = bool(getattr(args, "enable_undetermined_goal_v2", False))
         self.undetermined_v2_goal_slots = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
+        self.undetermined_v3_comm_P = max(0, int(getattr(args, "undetermined_v3_comm_ally_slots", 6)))
+        self.undetermined_v3_comm_H = max(0, int(getattr(args, "undetermined_v3_comm_human_slots", 4)))
+        if self.undetermined_goal_v3:
+            if not self.undetermined_goal_assignment:
+                raise ValueError("enable_undetermined_goal_v3 requires enable_undetermined_goal")
+            if not bool(getattr(args, "use_attn_comm_actor", False)):
+                raise ValueError("enable_undetermined_goal_v3 requires use_attn_comm_actor (integrated communication)")
+            if str(getattr(args, "architecture_mode", "default")) != "attn_undetermined_goal":
+                raise ValueError(
+                    "enable_undetermined_goal_v3 requires --architecture_mode attn_undetermined_goal"
+                )
+            if self.undetermined_goal_v2:
+                raise ValueError("enable_undetermined_goal_v3 is incompatible with enable_undetermined_goal_v2")
+            if str(getattr(args, "undet_v2_head_arch", "dot_product")) == "pair_mlp":
+                raise ValueError("enable_undetermined_goal_v3 requires --undet_v2_head_arch dot_product (hybrid obs)")
         if self.undetermined_goal_v2 and not self.undetermined_goal_assignment:
             raise ValueError("enable_undetermined_goal_v2 requires enable_undetermined_goal")
+        self.undetermined_v2_exchange = bool(getattr(args, "enable_undetermined_v2_exchange", False))
+        if self.undetermined_v2_exchange:
+            if not self.undetermined_goal_v2:
+                raise ValueError("enable_undetermined_v2_exchange requires enable_undetermined_goal_v2")
+            if self.undetermined_goal_v3:
+                raise ValueError("enable_undetermined_v2_exchange is not supported with enable_undetermined_goal_v3")
+        _ex_r = getattr(args, "undetermined_v2_exchange_radius", None)
+        self.undetermined_v2_exchange_radius = float(
+            _ex_r if _ex_r is not None else float(getattr(args, "undetermined_comm_radius", 6.0))
+        )
         self.dynamic_goal_assignment = bool(getattr(args, "enable_dynamic_goal_assignment", False))
         if self.undetermined_goal_assignment:
             self.dynamic_goal_assignment = False
@@ -422,22 +451,17 @@ class EnvCore(object):
                 )
         return positions
 
-    def _pack_robot_obs_row_attn_comm(self, robot_index, robot, for_feature):
-        """Fixed targets: self + in-radius allies/humans (nearest-first, capped by slots) + summary."""
+    def _attn_comm_tail_vector(self, robot_index, robot, for_feature, P: int, H: int) -> np.ndarray:
+        """
+        Ally geometry (6*P) + last-step recv messages (msg_dim*P) + human feats (5*H) + obstacle summary (4).
+        P/H are explicit slot counts (v3 uses fixed P,H decoupled from num_agents; standalone AttnComm uses attn_comm_P/H).
+        """
         px, py = float(robot.px), float(robot.py)
         theta = float(robot.theta)
-        P, H = self.attn_comm_P, self.attn_comm_H
+        P = max(0, int(P))
+        H = max(0, int(H))
         Rc = max(float(self.attn_comm_radius), 1e-6)
         scale = max(Rc, 1.0)
-        base = [
-            robot.gx - px,
-            robot.gy - py,
-            robot.v,
-            robot.theta,
-            for_feature,
-            robot.vx_formation,
-            robot.vy_formation,
-        ]
         others = []
         for j, oj in enumerate(self.robots):
             if j == robot_index:
@@ -458,8 +482,8 @@ class EnvCore(object):
                 )
             )
         others.sort(key=lambda t: t[0])
-        ally_feats = []
-        recv_feats = []
+        ally_feats: list[float] = []
+        recv_feats: list[float] = []
         for idx in range(P):
             if idx < len(others):
                 t = others[idx]
@@ -488,7 +512,7 @@ class EnvCore(object):
                 )
             )
         hum_list.sort(key=lambda t: t[0])
-        hum_feats = []
+        hum_feats: list[float] = []
         for idx in range(H):
             if idx < len(hum_list):
                 hum_feats.extend(hum_list[idx][1:6])
@@ -501,7 +525,27 @@ class EnvCore(object):
             float(robot.vx_formation),
             float(robot.vy_formation),
         ]
-        vec = np.array(base + ally_feats + recv_feats + hum_feats + obst + [px, py], dtype=np.float32)
+        tail = np.array(ally_feats + recv_feats + hum_feats + obst, dtype=np.float32)
+        _md = int(self.attn_comm_msg_dim)
+        _exp = P * 6 + P * _md + H * 5 + 4
+        assert tail.shape[0] == _exp, (tail.shape[0], _exp, P, H, _md)
+        return tail
+
+    def _pack_robot_obs_row_attn_comm(self, robot_index, robot, for_feature):
+        """Fixed targets: self + in-radius allies/humans (nearest-first, capped by slots) + summary."""
+        px, py = float(robot.px), float(robot.py)
+        P, H = self.attn_comm_P, self.attn_comm_H
+        base = [
+            robot.gx - px,
+            robot.gy - py,
+            robot.v,
+            robot.theta,
+            for_feature,
+            robot.vx_formation,
+            robot.vy_formation,
+        ]
+        tail = self._attn_comm_tail_vector(robot_index, robot, for_feature, P, H)
+        vec = np.array(base + tail.tolist() + [px, py], dtype=np.float32)
         # Standalone AttnComm row only; hybrid mode sets self.robot_obs_dim to v2+tail (see compute_undetermined_v2_attn_hybrid_robot_obs_dim).
         _p, _h, _md = int(P), int(H), int(self.attn_comm_msg_dim)
         _attn_row_len = 7 + _p * 6 + _p * _md + _h * 5 + 4 + 2
@@ -622,15 +666,34 @@ class EnvCore(object):
         Px, py remain the last two scalars for the target head and critic-friendly slicing.
         """
         v2 = self._pack_undetermined_v2_obs(robot_index, robot, for_feature)
-        attn_row = self._pack_robot_obs_row_attn_comm(robot_index, robot, for_feature)
-        tail = attn_row[7:-2]
+        tail = self._attn_comm_tail_vector(robot_index, robot, for_feature, self.attn_comm_P, self.attn_comm_H)
         vec = np.concatenate([v2[:-2], tail, v2[-2:]], dtype=np.float32)
         assert vec.shape[0] == self.robot_obs_dim + 2
+        return vec
+
+    def _pack_undetermined_v3_obs(self, robot_index, robot, for_feature):
+        """
+        Undetermined v3: v2 nearest-M core + one scalar (prev applied target id norm) before px,py,
+        then AttnComm tail from --undetermined_v3_comm_* (fixed caps).
+        """
+        v2 = self._pack_undetermined_v2_obs(robot_index, robot, for_feature)
+        prev_scalar = np.array([float(getattr(robot, "undet_prev_tid_norm", -1.0))], dtype=np.float32)
+        core_pre_tail = np.concatenate([v2[:-2], prev_scalar], dtype=np.float32)
+        tail = self._attn_comm_tail_vector(
+            robot_index, robot, for_feature, self.undetermined_v3_comm_P, self.undetermined_v3_comm_H
+        )
+        vec = np.concatenate([core_pre_tail, tail, v2[-2:]], dtype=np.float32)
+        assert vec.shape[0] == self.robot_obs_dim + 2, (
+            f"undetermined v3 pack len {vec.shape[0]} != robot_obs_dim+2={self.robot_obs_dim + 2} "
+            f"(M={self.undetermined_v2_goal_slots}, P={self.undetermined_v3_comm_P}, H={self.undetermined_v3_comm_H})"
+        )
         return vec
 
     def _pack_robot_obs_row(self, robot_index, robot, for_feature):
         px, py = robot.px, robot.py
         if self.undetermined_goal_assignment:
+            if self.undetermined_goal_v3:
+                return self._pack_undetermined_v3_obs(robot_index, robot, for_feature)
             if self.undetermined_goal_v2:
                 if (
                     str(getattr(self.args, "architecture_mode", "default")) == "attn_undetermined_goal"
@@ -773,7 +836,7 @@ class EnvCore(object):
         _opt_ass, opt_total = optimal_assignment_cost(pos, goals)
         gap = float(cur - opt_total)
         scale = float(getattr(self.args, "undetermined_hungarian_reward_scale", 0.15))
-        if getattr(self, "undetermined_goal_v2", False):
+        if getattr(self, "undetermined_goal_v2", False) or getattr(self, "undetermined_goal_v3", False):
             div = float(getattr(self.args, "undetermined_v2_hungarian_team_divisor", 8.0))
             div = max(div, 1.0)
             per = -scale * gap / div
@@ -867,6 +930,79 @@ class EnvCore(object):
             for lose in idxs[1:]:
                 if lose != winner:
                     self.robots[lose].undetermined_target_pending = True
+
+    def _undetermined_v2_exchange_heuristic(self):
+        """
+        Optional v2 mode: swap discrete targets for two agents in a local domain when swapping lowers the
+        bottleneck distance max(l1,l2) > max(d1,d2), where l1=d(i,g_i), l2=d(j,g_j) before swap and
+        d1=d(i,g_j), d2=d(j,g_i) after (world metric to goal centers). Greedy ordering uses max reduction
+        so the farther-of-two assignment improves (parallel cover / iteration count). Greedy disjoint pairs.
+        """
+        if not getattr(self, "undetermined_v2_exchange", False):
+            return
+        if self.goal_positions is None:
+            return
+        K = int(self.num_goal_targets)
+        if K < 2:
+            return
+        R_ex = float(self.undetermined_v2_exchange_radius)
+        min_gain = float(getattr(self.args, "undetermined_v2_exchange_min_gain", 0.05))
+        max_pairs = max(1, int(getattr(self.args, "undetermined_v2_exchange_max_pairs_per_step", 1)))
+        ignore_pending = bool(getattr(self.args, "undetermined_v2_exchange_ignore_pending", False))
+
+        candidates = []
+        for i in range(self.robot_num):
+            ri = self.robots[i]
+            if ri.collision or ri.success:
+                continue
+            if not ignore_pending and bool(getattr(ri, "undetermined_target_pending", False)):
+                continue
+            for j in range(i + 1, self.robot_num):
+                rj = self.robots[j]
+                if rj.collision or rj.success:
+                    continue
+                if not ignore_pending and bool(getattr(rj, "undetermined_target_pending", False)):
+                    continue
+                if cal_distance(ri.px, ri.py, rj.px, rj.py) > R_ex + 1e-9:
+                    continue
+                ti = int(ri.target_id) % K
+                tj = int(rj.target_id) % K
+                if ti == tj:
+                    continue
+                gxi, gyi = self.goal_positions[ti]
+                gxj, gyj = self.goal_positions[tj]
+                l1 = cal_distance(ri.px, ri.py, gxi, gyi)
+                l2 = cal_distance(rj.px, rj.py, gxj, gyj)
+                d1 = cal_distance(ri.px, ri.py, gxj, gyj)
+                d2 = cal_distance(rj.px, rj.py, gxi, gyi)
+                before_max = max(l1, l2)
+                after_max = max(d1, d2)
+                gain_max = before_max - after_max
+                if gain_max > min_gain + 1e-9:
+                    candidates.append((gain_max, i, j))
+
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        used = set()
+        n_swaps = 0
+        for _gain, i, j in candidates:
+            if i in used or j in used:
+                continue
+            ri, rj = self.robots[i], self.robots[j]
+            ti = int(ri.target_id) % K
+            tj = int(rj.target_id) % K
+            ri.target_id = tj
+            rj.target_id = ti
+            ri.undetermined_target_pending = False
+            rj.undetermined_target_pending = False
+            used.add(i)
+            used.add(j)
+            n_swaps += 1
+            if n_swaps >= max_pairs:
+                break
+        if n_swaps > 0:
+            self._undetermined_sync_all_goals()
+            self._undetermined_auction_duplicate_targets()
+            self._compute_undetermined_hungarian_shaping()
 
     def _dynamic_path_sync_and_conflict_count(self):
         self.dynamic_step_travel_sum = 0.0
@@ -983,6 +1119,8 @@ class EnvCore(object):
                 
             #initialize robots
             self.collision_flag = False
+            self.laplacian_S_L = float("nan")
+            self.laplacian_S_L_prev = float("nan")
             set_bias = np.random.random() * 0.5
             px = -5
             py = -5
@@ -1217,6 +1355,13 @@ class EnvCore(object):
         id_index = 0   #for formation encode
         reachgoal_num = 0   #for calculate the success rate
 
+        # v3: prev channel = normalized target_id carried into this step (end of last step / post-apply).
+        if getattr(self, "undetermined_goal_v3", False):
+            K = max(1, int(self.num_goal_targets))
+            den = float(max(1, K - 1))
+            for r in self.robots:
+                r.undet_prev_tid_norm = float(int(r.target_id) % K) / den
+
         #human action
         for human in self.humans:
              # observation for humans is always coordinates
@@ -1277,6 +1422,7 @@ class EnvCore(object):
         if self.undetermined_goal_assignment:
             self._undetermined_refresh_pending_from_observation()
             self._undetermined_comm_conflict_auction()
+            self._undetermined_v2_exchange_heuristic()
 
         assert W[-1][-2] != 0,'W compute error!'
 
@@ -1310,7 +1456,14 @@ class EnvCore(object):
                 raise RuntimeError(f"L_des shape mismatch and rebuild failed: L_hat.shape={L_hat.shape}, L_des.shape={(None if self.L_des is None else self.L_des.shape)}")
 
         for_feature = np.trace(np.transpose((L_hat - self.L_des)) @ (L_hat - self.L_des))
-        # print(for_feature)
+        _nf = float(np.sqrt(max(float(for_feature), 0.0)))
+        _den = float(np.linalg.norm(self.L_des, ord="fro"))
+        try:
+            _cur_sl = float(self.laplacian_S_L)
+            self.laplacian_S_L_prev = _cur_sl if math.isfinite(_cur_sl) else float("nan")
+        except (TypeError, ValueError, AttributeError):
+            self.laplacian_S_L_prev = float("nan")
+        self.laplacian_S_L = float(1.0 - _nf / _den) if _den > 1e-12 else float("nan")
 
         #navigation
         for robot in self.robots:
