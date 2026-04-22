@@ -1,0 +1,28 @@
+# Conda env for MAPPO training/render (name: swE2).
+# Create:  conda env create -f environment_swE2.yml
+# Activate: conda activate swE2
+# Remove:    conda env remove -n swE2
+#
+# PyTorch: default below is CPU-only from conda-forge. For GPU (CUDA), prefer the shell script
+# scripts/create_swE2_env.sh or install torch separately per https://pytorch.org/get-started/locally/
+
+name: swE2
+channels:
+  - conda-forge
+dependencies:
+  - python=3.9
+  - pip
+  - pip:
+      # Keep in sync with requirements.txt
+      - torch
+      - torchvision
+      - gym
+      - numpy
+      - pandas
+      - matplotlib
+      - configparser
+      - pathlib
+      - setproctitle
+      - absl-py
+      - imageio
+      - tensorboardX

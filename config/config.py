@@ -107,7 +107,7 @@ def get_config():
     parser.add_argument(
         "--enable_undetermined_v2_exchange",
         action="store_true",
-        default=False,
+        default=True,
         help="Undetermined v2 only: each env step, a heuristic may swap two agents' discrete targets when they lie "
         "within a local domain radius and swapping strictly reduces max(dist to own goal) across the pair "
         "(l1=d(i,g_i), l2=d(j,g_j) vs d1=d(i,g_j), d2=d(j,g_i) after swap: require max(l1,l2)>max(d1,d2) by "
@@ -315,7 +315,7 @@ def get_config():
     parser.add_argument(
         "--undetermined_v2_type2_formation_efficiency",
         action="store_true",
-        default=True,
+        default=False,
         help="Undetermined v2: preset for type-2 success — relax literal goal pull and S_L shaping after S_L>=thr "
         "(allow formation drift vs targets), reward first crossing into success, add light pre-success step/travel cost "
         "to favor fewer steps and shorter motion before formation.",
