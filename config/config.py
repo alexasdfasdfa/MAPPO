@@ -140,6 +140,34 @@ def get_config():
         help="If set, allow swaps even when an agent has undetermined_target_pending; default skips such agents.",
     )
     parser.add_argument(
+        "--undetermined_v2_exchange_bottleneck_shaping_scale",
+        type=float,
+        default=0.0,
+        help="Undetermined v2 + v2_exchange only: per-step team shaping when fleet bottleneck distance "
+        "M=max_k dist2goal shrinks (proxy for shortening the slowest agent's remaining path). "
+        "Each agent gets (scale * ΔM) / (divisor * N) added to shaped reward; 0 disables.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_team_dist_shaping_scale",
+        type=float,
+        default=0.0,
+        help="Undetermined v2 + v2_exchange only: per-step team shaping when sum_k dist2goal shrinks "
+        "(proxy for less total work to goals). Each agent gets (scale * ΔS) / (divisor * N); 0 disables.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_swap_bonus_scale",
+        type=float,
+        default=0.0,
+        help="Undetermined v2 + v2_exchange only: extra bonus for agents that participated in a target swap "
+        "this step, from pre-swap to post-swap fleet M and total distance (see swap_sum_weight). 0 disables.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_shaping_team_divisor",
+        type=float,
+        default=8.0,
+        help="Same role as undetermined_v2_hungarian_team_divisor: scales exchange shaping / swap bonus.",
+    )
+    parser.add_argument(
         "--enable_undetermined_goal_v3",
         action="store_true",
         default=False,

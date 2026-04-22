@@ -666,10 +666,16 @@ class RewardCalculator:
         """Undetermined execution + ConsMAC obs; reward from paper Eq.(1)-(4), identical per agent."""
         env = self.env
         a = env.args
+        try:
+            _ridx_ex = env.robots.index(robot)
+        except ValueError:
+            _ridx_ex = -1
         team = self._ensure_attn_undetermined_team_cache()
         reward = float(team["r_team"])
         r_sl, sl_v, sl_succ, sl_delta = self._undetermined_v2_sl_reward_raw(env, a)
         reward += r_sl
+        if _ridx_ex >= 0:
+            reward += self._undetermined_v2_exchange_shaping_bonus(_ridx_ex)
         gcoef = float(getattr(a, "cons_decaf_goal_disk_coef", 0.0))
         r_goal_add = 0.0
         nd_goal_terms: dict[str, float] = {}
@@ -1030,6 +1036,42 @@ class RewardCalculator:
                 r += scale_succ
         return r, sl, succ, float(r_delta)
 
+    def _undetermined_v2_exchange_shaping_bonus(self, ridx: int) -> float:
+        """
+        Extra shaping when --enable_undetermined_v2_exchange:
+        (1) Team bonus when fleet bottleneck max_k dist2goal drops (eases slowest-agent proxy).
+        (2) Team bonus when sum_k dist2goal drops (less total remaining work).
+        (3) Swap-step bonus split among agents that exchanged targets this env step.
+        """
+        env = self.env
+        if not getattr(env, "undetermined_v2_exchange", False):
+            return 0.0
+        a = env.args
+        sm = float(getattr(a, "undetermined_v2_exchange_bottleneck_shaping_scale", 0.0))
+        ss = float(getattr(a, "undetermined_v2_exchange_team_dist_shaping_scale", 0.0))
+        sb = float(getattr(a, "undetermined_v2_exchange_swap_bonus_scale", 0.0))
+        if sm < 1e-15 and ss < 1e-15 and sb < 1e-15:
+            return 0.0
+        n = max(1, int(env.robot_num))
+        div = max(1.0, float(getattr(a, "undetermined_v2_exchange_shaping_team_divisor", 8.0)))
+        out = 0.0
+        if sm > 1e-15:
+            out += sm * float(getattr(env, "undetermined_v2_fleet_M_drop", 0.0)) / (div * float(n))
+        if ss > 1e-15:
+            out += ss * float(getattr(env, "undetermined_v2_fleet_S_drop", 0.0)) / (div * float(n))
+        # Swap-step bonus: reward reduction in **total** assigned-goal distance from the exchange
+        # (bottleneck M is already encouraged via fleet_M_drop above, which includes post-swap dist2goal).
+        if sb > 1e-15 and 0 <= ridx < int(env.robot_num):
+            mask = getattr(env, "undetermined_v2_exchange_agent_mask", None)
+            if mask is not None and bool(mask[ridx]):
+                sg = max(0.0, float(getattr(env, "undetermined_v2_exchange_step_S_gain", 0.0)))
+                n_sw = int(np.count_nonzero(mask))
+                if n_sw < 1:
+                    n_sw = 1
+                chunk = sb * sg / div
+                out += chunk / float(n_sw)
+        return float(out)
+
     def _compute_undetermined_reward_v2(self, robot: Any, for_feature: float) -> np.ndarray:
         """
         Undetermined v2: same structure as v1 with capped soft-collision signal, approach shaping toward (gx,gy),
@@ -1116,6 +1158,8 @@ class RewardCalculator:
         pull_xy = prog_nav + approach_term - und_dist_pen - und_dist_quad + prox_term + head_term
         pull_xy *= lit_apply
         r_nav = pull_xy + r_sl
+        v2ex_bonus = self._undetermined_v2_exchange_shaping_bonus(ridx)
+        r_nav += v2ex_bonus
 
         pre_succ = math.isfinite(sl_v) and sl_v < thr_sl
         p_step = float(getattr(a, "undetermined_v2_sl_pre_success_step_penalty", 0.0))
@@ -1218,6 +1262,7 @@ class RewardCalculator:
             "c_nav": float(c_nav),
             "c_goal": float(c_goal),
             "undetermined_hungarian_bonus": float(hung),
+            "undetermined_v2_exchange_shaping_raw": float(v2ex_bonus),
             "reward_shaped": float(reward_shaped_nd),
             "reward_final": float(reward),
             "nd_terminal_tr": float(tr),

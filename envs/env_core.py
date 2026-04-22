@@ -223,6 +223,14 @@ class EnvCore(object):
         self.undetermined_v2_exchange_radius = float(
             _ex_r if _ex_r is not None else float(getattr(args, "undetermined_comm_radius", 6.0))
         )
+        # v2_exchange reward shaping: fleet bottleneck (max dist2goal) & sum dist; swap-step gains (see RewardCalculator)
+        self.undetermined_v2_fleet_M_prev = float("nan")
+        self.undetermined_v2_fleet_S_prev = float("nan")
+        self.undetermined_v2_fleet_M_drop = 0.0
+        self.undetermined_v2_fleet_S_drop = 0.0
+        self.undetermined_v2_exchange_step_M_gain = 0.0
+        self.undetermined_v2_exchange_step_S_gain = 0.0
+        self.undetermined_v2_exchange_agent_mask = np.zeros(self.robot_num, dtype=np.bool_)
         self.dynamic_goal_assignment = bool(getattr(args, "enable_dynamic_goal_assignment", False))
         if self.undetermined_goal_assignment:
             self.dynamic_goal_assignment = False
@@ -942,6 +950,9 @@ class EnvCore(object):
             return
         if self.goal_positions is None:
             return
+        self.undetermined_v2_exchange_agent_mask.fill(False)
+        self.undetermined_v2_exchange_step_M_gain = 0.0
+        self.undetermined_v2_exchange_step_S_gain = 0.0
         K = int(self.num_goal_targets)
         if K < 2:
             return
@@ -1007,12 +1018,20 @@ class EnvCore(object):
             rj.target_id = ti
             ri.undetermined_target_pending = False
             rj.undetermined_target_pending = False
+            self.undetermined_v2_exchange_agent_mask[i] = True
+            self.undetermined_v2_exchange_agent_mask[j] = True
             used.add(i)
             used.add(j)
             n_swaps += 1
             if n_swaps >= max_pairs:
                 break
         if n_swaps > 0:
+            S_before = float(sum(cur_dist))
+            new_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
+            M_after = max(new_dist) if new_dist else 0.0
+            S_after = float(sum(new_dist))
+            self.undetermined_v2_exchange_step_M_gain = float(M_fleet - M_after)
+            self.undetermined_v2_exchange_step_S_gain = float(S_before - S_after)
             self._undetermined_sync_all_goals()
             self._undetermined_auction_duplicate_targets()
             self._compute_undetermined_hungarian_shaping()
@@ -1222,6 +1241,13 @@ class EnvCore(object):
                 self.dynamic_formation_success_once = False
                 self.dynamic_episode_had_collision = False
                 self.undetermined_hungarian_bonus = np.zeros(self.robot_num, dtype=np.float64)
+                self.undetermined_v2_fleet_M_prev = float("nan")
+                self.undetermined_v2_fleet_S_prev = float("nan")
+                self.undetermined_v2_fleet_M_drop = 0.0
+                self.undetermined_v2_fleet_S_drop = 0.0
+                self.undetermined_v2_exchange_step_M_gain = 0.0
+                self.undetermined_v2_exchange_step_S_gain = 0.0
+                self.undetermined_v2_exchange_agent_mask = np.zeros(self.robot_num, dtype=np.bool_)
             else:
                 K = len(rel_targets)
 
@@ -1485,6 +1511,33 @@ class EnvCore(object):
             
             robot.pre_dist2goal = robot.dist2goal
             robot.dist2goal = cal_distance(robot.px,robot.py,robot.gx,robot.gy)
+
+        if getattr(self, "undetermined_v2_exchange", False):
+            cur_dists = []
+            s_sum = 0.0
+            for robot in self.robots:
+                if robot.collision or robot.success:
+                    d = 0.0
+                else:
+                    d = float(robot.dist2goal) if robot.dist2goal is not None else 0.0
+                cur_dists.append(d)
+                s_sum += d
+            cur_M = max(cur_dists) if cur_dists else 0.0
+            prev_M = float(getattr(self, "undetermined_v2_fleet_M_prev", float("nan")))
+            prev_S = float(getattr(self, "undetermined_v2_fleet_S_prev", float("nan")))
+            if math.isfinite(prev_M):
+                self.undetermined_v2_fleet_M_drop = max(0.0, prev_M - cur_M)
+            else:
+                self.undetermined_v2_fleet_M_drop = 0.0
+            if math.isfinite(prev_S):
+                self.undetermined_v2_fleet_S_drop = max(0.0, prev_S - s_sum)
+            else:
+                self.undetermined_v2_fleet_S_drop = 0.0
+            self.undetermined_v2_fleet_M_prev = cur_M
+            self.undetermined_v2_fleet_S_prev = s_sum
+        else:
+            self.undetermined_v2_fleet_M_drop = 0.0
+            self.undetermined_v2_fleet_S_drop = 0.0
 
         if (self.dynamic_goal_assignment or self.undetermined_goal_assignment) and self.claimed_by is not None:
             cb = self.claimed_by

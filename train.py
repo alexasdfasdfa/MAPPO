@@ -191,6 +191,12 @@ def parser_args(args, parser):
                     f"max_pairs/step={int(getattr(all_args, 'undetermined_v2_exchange_max_pairs_per_step', 1))}, "
                     f"ignore_pending={bool(getattr(all_args, 'undetermined_v2_exchange_ignore_pending', False))}"
                 )
+                print(
+                    f"[train] v2_exchange reward shaping: M_drop_scale={float(getattr(all_args, 'undetermined_v2_exchange_bottleneck_shaping_scale', 0.0))}, "
+                    f"S_drop_scale={float(getattr(all_args, 'undetermined_v2_exchange_team_dist_shaping_scale', 0.0))}, "
+                    f"swap_S_bonus_scale={float(getattr(all_args, 'undetermined_v2_exchange_swap_bonus_scale', 0.0))}, "
+                    f"div={float(getattr(all_args, 'undetermined_v2_exchange_shaping_team_divisor', 8.0))}"
+                )
             print(
                 f"[train] undetermined v2 type-2 (S_L) reward: dense_scale={float(getattr(all_args, 'undetermined_v2_sl_dense_scale', 0.0))}, "
                 f"delta_scale={float(getattr(all_args, 'undetermined_v2_sl_delta_scale', 0.0))}, "

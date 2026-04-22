@@ -389,7 +389,7 @@ def main(args):
     all_args = parser_args(args, parser)
     all_args.use_render = True
     # Shared-policy checkpoint: folder with actor.pt, or 4.pt if actor.pt is missing, or a direct path to *.pt.
-    all_args.model_dir = str(Path(__file__).resolve().parent / "results/train/run85/models")
+    all_args.model_dir = str(Path(__file__).resolve().parent / "results/train/run6/models")
     all_args.n_rollout_threads = 1
     all_args.episode_length = 500
     all_args.visualize = False

@@ -10,3 +10,28 @@ __pycache__/
 *.pyo
 .pytest_cache/
 logs/
+*.log
+nohup.out
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python packaging / tooling
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local env / secrets (do not commit)
+.env
+.env.*
+!.env.example

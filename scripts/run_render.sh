@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Load conda, activate env swE2, run MAPPO training under nohup (survives terminal close).
-# Logs go to logs/… or your .log path; follow with: tail -f "<logfile>"
+# Load conda, activate swE2, run MAPPO render.py from repo root; tee stdout/stderr to logs/.
 #
 # Usage:
-#     cd /home/inno/MAPPO
-#     bash scripts/run_train_undet_v2.sh
+#   cd /path/to/MAPPO
+#   bash scripts/run_render.sh
+#   bash scripts/run_render.sh /path/to/custom.log    # optional log path (must end with .log)
+#   bash scripts/run_render.sh -- --model_dir ...     # extra args after -- go to render.py
+#
+# Examples:
+#   bash scripts/run_render.sh -- --model_dir results/.../train/run1 --use_render
+#   bash scripts/run_render.sh my_render.log -- --model_dir results/foo/train/run1
 #
 # Requires: conda, env "swE2" (see scripts/create_swE2_env.sh)
 
 set -euo pipefail
-date
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -39,7 +44,12 @@ if [[ "${1:-}" =~ \.log$ ]]; then
   LOG_FILE="$1"
   shift
 else
-  LOG_FILE="${LOG_DIR}/train_undet_v2_$(date +%Y%m%d_%H%M%S).log"
+  LOG_FILE="${LOG_DIR}/render_$(date +%Y%m%d_%H%M%S).log"
+fi
+
+# Optional: strip a lone "--" so `bash run_render.sh -- --model_dir ...` works like train script
+if [[ "${1:-}" == "--" ]]; then
+  shift
 fi
 
 echo "Repo:    ${REPO_ROOT}"
@@ -49,21 +59,7 @@ echo "Log:     ${LOG_FILE}"
 echo "Python:  $(command -v python)"
 echo "--------"
 
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/lib_train_runner.sh"
 set -o pipefail
-run_train_with_nohup train.py \
-  --train_font_pattern_length 10 \
-  --train_font_pattern_policy all \
-  --enable_undetermined_goal \
-  --enable_undetermined_goal_v2 \
-  --undetermined_v2_type2_formation_efficiency \
-  --undetermined_v2_goal_slots 10 \
-  --undet_v2_head_arch pair_mlp \
-  --undetermined_target_embed_dim 32 \
-  --undet_v2_pair_mlp_hidden 384 \
-  --undet_v2_target_latent_model_dir "../selector_n15.pt" \
-  --undet_v2_latent_train_mode finetune_all \
-  "$@"
+python render.py "$@" 2>&1 | tee "${LOG_FILE}"
 
 echo "Finished. Log saved to: ${LOG_FILE}"
