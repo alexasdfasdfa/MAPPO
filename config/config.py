@@ -107,7 +107,7 @@ def get_config():
     parser.add_argument(
         "--enable_undetermined_v2_exchange",
         action="store_true",
-        default=False,
+        default=True,
         help="Undetermined v2 only: each env step, a heuristic may swap two agents' discrete targets when they lie "
         "within a local domain radius and swapping strictly reduces the **fleet** bottleneck "
         "M=max_k d(robot_k, goal[target_k]) (only the two agents change targets; gain = M_before - M_after >= "

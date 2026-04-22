@@ -225,6 +225,8 @@ python scripts/summarize_render_results.py --mode laplacian_type2 \
 
 在 **合成 2D 指派** 上训练 **`TargetLatentSelector`**（与 MAPPO **`--undet_v2_head_arch pair_mlp`** 下 **`UndeterminedTargetHeadV2PairMLP`** 同构；权重可经 **`--undet_v2_target_latent_model_dir`** 加载）。观测与 undetermined v2 packing 对齐（见该目录 **`pack_obs.py`**）。
 
+**匈牙利监督 `M0`（默认面向 bottleneck）**：默认 **`--hungarian-objective bottleneck`**，在代价矩阵上用 **欧氏距离** 做 **minimax** 指派（最小化「最远一对」边长），与 MAPPO 侧 **`v2_exchange` / 编队公平性** 更一致；旧行为 **`--hungarian-objective sum`**（最小总平方距离）。`run.sh` 可用环境变量 **`HUNGARIAN_OBJECTIVE=sum`** 覆盖。checkpoint 的 **`model_layout.hungarian_objective`** 会记录所用目标。
+
 **与 MAPPO 默认对齐（推荐）**：`train.py` 默认从 **MAPPO 仓库** 的 **`config/config.py`** 解析超参并写入本脚本的 **`--goal-slots` / `--hidden` / `--d-emb` / `--obs-goal-radius` / `--box` / LayerNorm** 等（实现见 **`mappo_defaults.py`**）。MAPPO 与 `undet_v2_target_latent` **同级**时无需额外配置；否则传入 **`--mappo-root /path/to/MAPPO`**。若要用脚本内手写默认、不从 MAPPO 拉取：**`--no-from-mappo`**。
 
 **交互式启动**（必须先 `cd` 到 **`undet_v2_target_latent`**，保证相对路径与 Slurm 一致）：
@@ -256,6 +258,7 @@ sbatch run.sh
 | **`--no-from-mappo`** | 不从 MAPPO 拉默认，改用本脚本 argparse 的静态默认。 |
 | `--n` | 合成任务中智能体数 = 目标数（**n×n** 匹配）。 |
 | `--goal-slots` | 槽数 **M**；未传且未 `--no-from-mappo` 时与 MAPPO **`--undetermined_v2_goal_slots`** 一致。 |
+| `--hungarian-objective` | **`bottleneck`**（默认）或 **`sum`**：监督标签 `M0` 分别为 minimax 欧氏指派 / 总平方代价指派。 |
 | `--steps` | 本脚本优化步数（**不是** MAPPO 的 `num_env_steps`）。 |
 | **`--save-dir`** | 权重目录（默认 **`checkpoints/`**）。 |
 | **`--save-name`** | 权重文件名（默认 **`target_latent_selector.pt`**）。MAPPO 默认会在 **`../undet_v2_target_latent/checkpoints/`** 下查找该名或 **`selector_n*.pt`** 的拷贝策略见 **`run.sh`** 末尾注释。 |
