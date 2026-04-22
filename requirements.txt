@@ -5,6 +5,7 @@ gym
 
 numpy
 pandas
+scipy>=1.10
 
 matplotlib
 configparser
@@ -13,3 +14,7 @@ setproctitle
 absl-py
 imageio
 tensorboardX
+
+# Python bindings for RVO2 (import name: rvo2). Builds vendored C++ RVO2 via CMake.
+cython>=3.0
+pyrvo2 @ git+https://github.com/sybrenstuvel/Python-RVO2.git

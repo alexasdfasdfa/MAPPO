@@ -7,6 +7,10 @@
 # GPU (CUDA) PyTorch: after creation, reinstall torch per your CUDA version, e.g.:
 #   conda activate swE2
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+#
+# requirements.txt includes Python-RVO2 (import rvo2). Build needs system tools:
+#   sudo apt install cmake git build-essential
+# Or: bash scripts/build_rvo2.sh   # default installs Python-RVO2 (import rvo2)
 
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
