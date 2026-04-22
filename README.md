@@ -6,11 +6,56 @@ Works based on *Application of LLM Guided Reinforcement Learning in Formation Co
 - Seperated Dataset
 - Data Generator
 - **Undetermined goal v2**: nearest-goal slot observation pack, `UndeterminedTargetHeadV2`, auction + Hungarian shaping (see below)
-- **Undetermined v2_exchange** (optional): pairwise **target_id** swaps inside a local radius when the swap lowers the **fleet** bottleneck \(M=\max_k d(\text{robot}_k,\text{goal}_{\text{target}_k})\) by at least **`--undetermined_v2_exchange_min_gain`**, to shorten the worst agent’s remaining distance to its assigned goal (see below)
+- **Undetermined v2_exchange** (optional): pairwise **`target_id`** swaps inside a local radius; default criterion **`fleet_m`** lowers fleet \(M=\max_k d(\text{robot}_k,\text{goal}_{\text{target}_k})\) by **`--undetermined_v2_exchange_min_gain`**; alternatives **`pair_max`** and **`cone_mutual_greedy_m`** (velocity cones + strict mutual improvement + greedy \(M\)) — see **v2_exchange** below
 
 ## TODO
 
 - Faster Code
+
+---
+
+## Clustered robot spawns (`cluster_comm` / `cluster_disk`)
+
+When `--randomize_robot_initial_positions` is enabled, `envs/env_core.py` samples robot start positions inside the rectangle **`[robot_init_x_min, robot_init_x_max] × [robot_init_y_min, robot_init_y_max]`** according to **`--robot_initial_spawn_mode`**:
+
+| Mode | Meaning |
+|------|--------|
+| `random_box` | Independent uniform samples per agent with a minimum pairwise separation margin (default baseline). |
+| `cluster_comm` | Random center and rotation; agents lie on a **regular N-gon ring** whose radius is derived from an effective communication / visibility reference (see below). |
+| `cluster_disk` | Random disk fully inside the rectangle; agents are sampled **uniformly in the disk** (area-uniform via `r = R√U`, `θ` uniform) with **rejection** until pairwise separation holds; uses the **same** reference-radius logic as `cluster_comm`. |
+
+**Effective radius** (only if **`--robot_init_cluster_comm_radius`** is **not** set): **`--robot_init_cluster_radius_mode`**
+
+- **`comm`**: minimum of positive **`attn_comm_radius`** and **`undetermined_comm_radius`** (legacy).
+- **`comm_vis_adaptive`**: minimum of all positive radii among attention comm, undetermined comm, **`undetermined_obs_goal_radius`**, **`dynamic_target_vis_radius`** (when dynamic goals are enabled), and **`neighbor_radius`** when **`agent_state_mode=nearest_n_radius`**.
+
+Set a single positive **`--robot_init_cluster_comm_radius`** to override the reference radius for both `cluster_comm` and `cluster_disk`.
+
+**Code**: `envs/env_core.py` — `_cluster_comm_reference_radius`, `_sample_clustered_robot_starts_in_comm_range`, `_sample_clustered_robot_starts_in_disk`.
+
+### How to launch (cluster + exchange preset)
+
+`scripts/run_train_undet_v2_exchange.sh` defaults to **`cluster_disk`** and **`comm_vis_adaptive`**. From the repo root:
+
+```bash
+cd /path/to/MAPPO
+bash scripts/run_train_undet_v2_exchange.sh
+# optional: bash scripts/run_train_undet_v2_exchange.sh /path/to/train.log
+```
+
+Manual equivalents (excerpt):
+
+```bash
+python train.py ... --randomize_robot_initial_positions \
+  --robot_initial_spawn_mode cluster_disk \
+  --robot_init_cluster_radius_mode comm_vis_adaptive
+```
+
+Render with the same flags:
+
+```bash
+bash scripts/run_render_undet_v2_exchange.sh -- --model_dir results/.../train/runN/models
+```
 
 ---
 
@@ -72,19 +117,46 @@ Layout (indices are 0-based in the packed row **before** px, py; the actor uses 
 
 ### v2_exchange (optional heuristic target swap)
 
-**v2 only** — cannot be used with `--enable_undetermined_goal_v3`. When enabled, each env `step()` runs **after** `_undetermined_comm_conflict_auction()` and tries **pairwise swaps** of discrete `target_id` between two robots that lie in each other’s **exchange domain** (center-to-center distance ≤ radius). Let \(M_{\text{before}}=\max_k d(p_k, g_{\text{target}_k})\) over agents (collision/success agents contribute 0). For a candidate pair \((i,j)\), let \(M_{\text{after}}\) be the same max after **only** \(i\) and \(j\) exchange targets (all other agents unchanged). A swap is applied only if
+**v2 only** — cannot be used with `--enable_undetermined_goal_v3`. When enabled, each env `step()` runs **after** `_undetermined_comm_conflict_auction()` and may **pairwise swap** discrete `target_id` values between two robots whose centers are within **`--undetermined_v2_exchange_radius`** (default: same as **`--undetermined_comm_radius`**). After any swap: `_undetermined_sync_all_goals()`, duplicate auction, and Hungarian shaping are refreshed; both agents’ **`undetermined_target_pending`** are cleared for that pair.
 
-**\(M_{\text{before}} - M_{\text{after}} >\) `--undetermined_v2_exchange_min_gain`** (meters). This targets the **worst-off** agent by current distance-to-assigned-goal. Candidate pairs are sorted by that fleet gain (largest first); **disjoint** pairs are taken greedily, at most **`--undetermined_v2_exchange_max_pairs_per_step`** per step. After any swap: `_undetermined_sync_all_goals()`, duplicate auction, and Hungarian shaping are refreshed; both agents’ **`undetermined_target_pending`** are cleared for that pair.
+**Accept criterion** — choose with **`--undetermined_v2_exchange_accept_criterion`**:
+
+| Value | Rule (summary) |
+|-------|----------------|
+| **`fleet_m`** (default) | Fleet bottleneck \(M=\max_k d(p_k, g_{\text{target}_k})\) (collision/success contribute 0). For pair \((i,j)\), compute \(M_{\text{after}}\) if **only** \(i,j\) swap targets. Accept iff **\(M_{\text{before}}-M_{\text{after}} >\) `undetermined_v2_exchange_min_gain`**. Sort pairs by fleet gain (largest first); take **disjoint** pairs greedily, up to **`max_pairs_per_step`**. |
+| **`pair_max`** | Local pair only: accept iff \(\max(d_i, d_j)-\max(d'_i,d'_j) >\) **`min_gain`**, where \(d\) are distances to **current** goals and \(d'\) after swapping the two goals. Same greedy disjoint cap. |
+| **`cone_mutual_greedy_m`** | (1) **Mutual strict improvement**: \(d(i,T_j)<d(i,T_i)\) and \(d(j,T_i)<d(j,T_j)\) with **strict** inequalities. (2) **Bidirectional velocity cones**: each agent’s forward axis is its velocity (or heading if speed is below **`forward_speed_eps`**); the other agent must lie strictly inside a cone of half-angle **`cone_half_deg`**. (3) **Heuristic multi-pair**: among agents not yet used this step, repeatedly pick the pair that **minimizes** fleet \(M\) **after** a single swap while still strictly lowering \(M\) vs the current state; tie-break lexicographic \((i,j)\). At most **`max_pairs_per_step`** such rounds. **`min_gain` is not used** for acceptance in this mode (only strict numeric gap on \(M\)). |
 
 | Parameter | Default | Role |
 |-----------|---------|------|
 | `--enable_undetermined_v2_exchange` | off | Turn on the heuristic. Requires **`--enable_undetermined_goal_v2`**. |
-| `--undetermined_v2_exchange_radius` | `None` → **`--undetermined_comm_radius`** | Domain radius (m): only pairs with distance ≤ this are considered. |
-| `--undetermined_v2_exchange_min_gain` | `0.05` | Minimum reduction \(M_{\text{before}}-M_{\text{after}}\) of the fleet max distance-to-assigned-goal (m). |
-| `--undetermined_v2_exchange_max_pairs_per_step` | `1` | Cap on disjoint swaps per env step. |
-| `--undetermined_v2_exchange_ignore_pending` | off | If set, pairs may swap even when one or both agents have **`undetermined_target_pending`**; default skips any agent that is pending. |
+| `--undetermined_v2_exchange_radius` | `None` → **`undetermined_comm_radius`** | Pairwise domain (m): center distance must be ≤ this. |
+| `--undetermined_v2_exchange_min_gain` | `0.05` | Used by **`fleet_m`** / **`pair_max`** as minimum improvement (meters); ignored for **`cone_mutual_greedy_m`**. |
+| `--undetermined_v2_exchange_max_pairs_per_step` | `1` | **`fleet_m` / `pair_max`**: max disjoint swaps per step. **`cone_mutual_greedy_m`**: max **greedy rounds** (each round swaps one disjoint pair). |
+| `--undetermined_v2_exchange_ignore_pending` | off | If set, allow swaps involving agents with **`undetermined_target_pending`**. |
+| `--undetermined_v2_exchange_cone_half_deg` | `60` | Half-angle (degrees) of forward cone for **`cone_mutual_greedy_m`**. |
+| `--undetermined_v2_exchange_forward_speed_eps` | `1e-3` | Below this speed, forward axis uses \((\cos\theta,\sin\theta)\). |
 
-**Code**: `envs/env_core.py` — `_undetermined_v2_exchange_heuristic()`. **CLI checks**: `train.py` (`parser_args`) rejects v3 + exchange together.
+**Code**: `envs/env_core.py` — `_undetermined_v2_exchange_heuristic()`, `_undetermined_v2_exchange_cone_mutual_greedy_m()`. **CLI checks**: `train.py` rejects v3 + exchange together.
+
+#### How to launch (exchange presets)
+
+From the repo root, the bundled script enables **v2 + v2_exchange** with **`cone_mutual_greedy_m`**, **`max_pairs_per_step=8`**, and **`cluster_disk`** + **`comm_vis_adaptive`** (see **Clustered robot spawns** above):
+
+```bash
+cd /path/to/MAPPO
+bash scripts/run_train_undet_v2_exchange.sh
+
+bash scripts/run_render_undet_v2_exchange.sh -- --model_dir results/.../train/runN/models
+```
+
+Classic **fleet_m** + one swap per step (minimal example):
+
+```bash
+python train.py ... --enable_undetermined_goal --enable_undetermined_goal_v2 --enable_undetermined_v2_exchange \
+  --undetermined_v2_exchange_accept_criterion fleet_m \
+  --undetermined_v2_exchange_max_pairs_per_step 1
+```
 
 ### v2-specific reward / discount knobs
 

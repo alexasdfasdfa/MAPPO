@@ -109,9 +109,9 @@ def get_config():
         action="store_true",
         default=True,
         help="Undetermined v2 only: each env step, a heuristic may swap two agents' discrete targets when they lie "
-        "within a local domain radius and swapping strictly reduces the **fleet** bottleneck "
-        "M=max_k d(robot_k, goal[target_k]) (only the two agents change targets; gain = M_before - M_after >= "
-        "min_gain). Incompatible with --enable_undetermined_goal_v3.",
+        "within a local domain radius and the swap passes --undetermined_v2_exchange_accept_criterion "
+        "(default fleet_m: fleet-wide M; pair_max: max(d_i,gi,d_j,gj)-max(d_i,gj,d_j,gi)>min_gain). "
+        "Incompatible with --enable_undetermined_goal_v3.",
     )
     parser.add_argument(
         "--undetermined_v2_exchange_radius",
@@ -124,20 +124,43 @@ def get_config():
         "--undetermined_v2_exchange_min_gain",
         type=float,
         default=0.05,
-        help="Minimum fleet bottleneck improvement M_before - M_after (meters) for a candidate pair swap, "
-        "where M = max over agents of distance to current assigned goal center.",
+        help="Minimum improvement (meters) to accept a swap: under fleet_m, M_before-M_after for fleet M; "
+        "under pair_max, max(d_i,gi,d_j,gj)-max(d_i,gj,d_j,gi) for the two agents.",
     )
     parser.add_argument(
         "--undetermined_v2_exchange_max_pairs_per_step",
         type=int,
         default=1,
-        help="Max number of disjoint pairs to swap per step (greedy: best gains first).",
+        help="fleet_m/pair_max: max disjoint swaps per step. cone_mutual_greedy_m: max greedy swap rounds "
+        "(each round picks one pair that strictly lowers fleet M among unused agents).",
     )
     parser.add_argument(
         "--undetermined_v2_exchange_ignore_pending",
         action="store_true",
         default=False,
         help="If set, allow swaps even when an agent has undetermined_target_pending; default skips such agents.",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_accept_criterion",
+        type=str,
+        default="fleet_m",
+        choices=("fleet_m", "pair_max", "cone_mutual_greedy_m"),
+        help="fleet_m: fleet M drop > min_gain. pair_max: pair max-dist gain > min_gain. "
+        "cone_mutual_greedy_m: velocity-cone + strict mutual d(i,Tj)<d(i,Ti) & d(j,Ti)<d(j,Tj); then greedy "
+        "disjoint swaps each minimizing fleet M (see cone_* and max_pairs_per_step).",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_cone_half_deg",
+        type=float,
+        default=60.0,
+        help="cone_mutual_greedy_m: half-angle (degrees) of each agent's forward cone around its velocity; "
+        "neighbor must lie strictly inside (dot > cos(half)).",
+    )
+    parser.add_argument(
+        "--undetermined_v2_exchange_forward_speed_eps",
+        type=float,
+        default=1e-3,
+        help="cone_mutual_greedy_m: if speed < this, forward axis uses (cos(theta), sin(theta)).",
     )
     parser.add_argument(
         "--undetermined_v2_exchange_bottleneck_shaping_scale",
@@ -1207,6 +1230,32 @@ def get_config():
         action="store_true",
         default=True,
         help="Sample robot starts in a box with minimum separation (dynamic and non-dynamic mode).",
+    )
+    parser.add_argument(
+        "--robot_initial_spawn_mode",
+        type=str,
+        default="random_box",
+        choices=("random_box", "cluster_comm", "cluster_disk"),
+        help="When randomize_robot_initial_positions is True: random_box=i.i.d. in the init rectangle; "
+        "cluster_comm=regular polygon on a ring (legacy); cluster_disk=uniform in a disk (rejection sampling) "
+        "using the same reference radius as cluster_comm (see robot_init_cluster_*).",
+    )
+    parser.add_argument(
+        "--robot_init_cluster_radius_mode",
+        type=str,
+        default="comm",
+        choices=("comm", "comm_vis_adaptive"),
+        help="cluster_comm reference radius when --robot_init_cluster_comm_radius is unset: "
+        "comm=min of positive attn_comm_radius and undetermined_comm_radius (legacy). "
+        "comm_vis_adaptive=min of all positive among attn radius, undetermined comm, undetermined_obs_goal_radius, "
+        "dynamic_target_vis_radius (if dynamic goals), neighbor_radius (if agent_state_mode=nearest_n_radius).",
+    )
+    parser.add_argument(
+        "--robot_init_cluster_comm_radius",
+        type=float,
+        default=None,
+        help="If set (>0), overrides cluster reference radius for cluster_comm/cluster_disk. Otherwise see "
+        "--robot_init_cluster_radius_mode.",
     )
     parser.add_argument("--robot_init_x_min", type=float, default=-8.0)
     parser.add_argument("--robot_init_x_max", type=float, default=8.0)

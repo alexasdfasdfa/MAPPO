@@ -64,6 +64,10 @@ python render.py \
   --enable_undetermined_goal \
   --enable_undetermined_goal_v2 \
   --enable_undetermined_v2_exchange \
+  --undetermined_v2_exchange_accept_criterion cone_mutual_greedy_m \
+  --undetermined_v2_exchange_max_pairs_per_step 8 \
+  --robot_initial_spawn_mode cluster_disk \
+  --robot_init_cluster_radius_mode comm_vis_adaptive \
   --undetermined_v2_type2_formation_efficiency \
   --undetermined_v2_goal_slots 10 \
   --undet_v2_head_arch pair_mlp \

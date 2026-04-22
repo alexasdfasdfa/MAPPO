@@ -459,6 +459,333 @@ class EnvCore(object):
                 )
         return positions
 
+    def _cluster_comm_reference_radius(self) -> float:
+        """Radius used to pack cluster_comm spawns (pairwise geometry vs comm / optional vis radii)."""
+        args = self.args
+        ovr = getattr(args, "robot_init_cluster_comm_radius", None)
+        if ovr is not None and float(ovr) > 0.0:
+            return float(ovr)
+        mode = str(getattr(args, "robot_init_cluster_radius_mode", "comm"))
+        if mode == "comm_vis_adaptive":
+            vals: list[float] = []
+            if float(self.attn_comm_radius) > 1e-6:
+                vals.append(float(self.attn_comm_radius))
+            if bool(getattr(self, "undetermined_goal_assignment", False)):
+                if float(self.undetermined_comm_radius) > 1e-6:
+                    vals.append(float(self.undetermined_comm_radius))
+                if float(self.undetermined_obs_goal_radius) > 1e-6:
+                    vals.append(float(self.undetermined_obs_goal_radius))
+            if bool(getattr(self, "dynamic_goal_assignment", False)):
+                if float(self.dynamic_vis_radius) > 1e-6:
+                    vals.append(float(self.dynamic_vis_radius))
+            if str(getattr(args, "agent_state_mode", "all")) == "nearest_n_radius":
+                nr = float(getattr(args, "neighbor_radius", 0.0))
+                if nr > 1e-6:
+                    vals.append(nr)
+            if not vals:
+                return 6.0
+            return float(min(vals))
+        a = float(self.attn_comm_radius)
+        u = float(self.undetermined_comm_radius)
+        pos = [x for x in (a, u) if x > 1e-6]
+        if not pos:
+            return 6.0
+        if len(pos) == 1:
+            return pos[0]
+        return float(min(pos))
+
+    def _sample_clustered_robot_starts_in_comm_range(self):
+        """
+        Place robots on a regular polygon around a random center so they are tightly grouped.
+        Ring radius is chosen so adjacent agents respect robot_init_min_separation_margin, and
+        (when feasible) the diameter stays within ~cluster comm reference radius.
+        """
+        args = self.args
+        x0, x1 = float(args.robot_init_x_min), float(args.robot_init_x_max)
+        y0, y1 = float(args.robot_init_y_min), float(args.robot_init_y_max)
+        margin = float(args.robot_init_min_separation_margin)
+        rr = float(self.robots[0].radius)
+        n_ag = int(self.robot_num)
+        r_comm = float(self._cluster_comm_reference_radius())
+
+        if n_ag <= 1:
+            for _ in range(8000):
+                px = float(np.random.uniform(x0, x1))
+                py = float(np.random.uniform(y0, y1))
+                return [(px, py)]
+            raise RuntimeError("cluster_comm: failed to sample center for single agent.")
+
+        sin_half = math.sin(math.pi / float(n_ag))
+        r_min = (2.0 * rr + margin) / (2.0 * max(sin_half, 1e-9))
+        r_cap = 0.48 * r_comm
+        if r_min <= r_cap:
+            r_ring = r_min
+        else:
+            r_ring = r_min
+            if not getattr(self, "_cluster_comm_radius_warned", False):
+                logging.warning(
+                    "[EnvCore] robot_initial_spawn_mode=cluster_comm: minimum ring radius %.4f exceeds %.4f "
+                    "(~half of comm reference %.4f); some pairs may lie outside nominal comm range.",
+                    r_min,
+                    r_cap,
+                    r_comm,
+                )
+                self._cluster_comm_radius_warned = True
+
+        for _attempt in range(8000):
+            cx = float(np.random.uniform(x0, x1))
+            cy = float(np.random.uniform(y0, y1))
+            phase = float(np.random.uniform(0.0, 2.0 * math.pi))
+            positions: list[tuple[float, float]] = []
+            ok = True
+            for i in range(n_ag):
+                ang = phase + (2.0 * math.pi * float(i)) / float(n_ag)
+                px = cx + r_ring * math.cos(ang)
+                py = cy + r_ring * math.sin(ang)
+                if not (x0 <= px <= x1 and y0 <= py <= y1):
+                    ok = False
+                    break
+                positions.append((px, py))
+            if not ok:
+                continue
+            for i in range(n_ag):
+                for j in range(i + 1, n_ag):
+                    if cal_distance(positions[i][0], positions[i][1], positions[j][0], positions[j][1]) < (
+                        2.0 * rr + margin - 1e-9
+                    ):
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if ok:
+                return positions
+
+        raise RuntimeError(
+            "cluster_comm: could not place agents inside robot_init_* bounds; widen the box or reduce num_agents."
+        )
+
+    def _sample_clustered_robot_starts_in_disk(self):
+        """
+        Uniform random positions inside a disk (rejection sampling) with pairwise min separation.
+        Disk radius is capped by cluster reference radius and init box; center is uniform in the valid box.
+        """
+        args = self.args
+        x0, x1 = float(args.robot_init_x_min), float(args.robot_init_x_max)
+        y0, y1 = float(args.robot_init_y_min), float(args.robot_init_y_max)
+        margin = float(args.robot_init_min_separation_margin)
+        rr = float(self.robots[0].radius)
+        n_ag = int(self.robot_num)
+        sep = 2.0 * rr + margin
+        r_ref = float(self._cluster_comm_reference_radius())
+        box_w = x1 - x0
+        box_h = y1 - y0
+        r_box = 0.5 * max(1e-6, min(box_w, box_h)) - 1e-3
+        r_cap = min(0.48 * r_ref, r_box)
+
+        def try_pack(cx: float, cy: float, r_disk: float):
+            if r_disk <= 1e-9:
+                return None
+            if cx - r_disk < x0 or cx + r_disk > x1 or cy - r_disk < y0 or cy + r_disk > y1:
+                return None
+            pos: list[tuple[float, float]] = []
+            for _ in range(n_ag):
+                for _t in range(400):
+                    ang = float(np.random.uniform(0.0, 2.0 * math.pi))
+                    rad = r_disk * math.sqrt(float(np.random.uniform(0.0, 1.0)))
+                    px = cx + rad * math.cos(ang)
+                    py = cy + rad * math.sin(ang)
+                    if not (x0 <= px <= x1 and y0 <= py <= y1):
+                        continue
+                    ok = True
+                    for qx, qy in pos:
+                        if cal_distance(px, py, qx, qy) < sep - 1e-9:
+                            ok = False
+                            break
+                    if ok:
+                        pos.append((px, py))
+                        break
+                else:
+                    return None
+            return pos
+
+        if n_ag <= 1:
+            for _ in range(8000):
+                px = float(np.random.uniform(x0, x1))
+                py = float(np.random.uniform(y0, y1))
+                return [(px, py)]
+            raise RuntimeError("cluster_disk: failed to sample single-agent position.")
+
+        for scale in range(28):
+            r_disk = min(r_cap * (1.06**float(scale)), r_box)
+            if r_disk < 0.5 * sep:
+                continue
+            for _attempt in range(500):
+                cx = float(np.random.uniform(x0 + r_disk, x1 - r_disk))
+                cy = float(np.random.uniform(y0 + r_disk, y1 - r_disk))
+                packed = try_pack(cx, cy, r_disk)
+                if packed is not None:
+                    return packed
+
+        raise RuntimeError(
+            "cluster_disk: could not place agents; widen robot_init_* , reduce num_agents, or raise comm/vis radii."
+        )
+
+    def _robot_forward_unit_xy(self, robot) -> tuple[float, float]:
+        speed_eps = float(getattr(self.args, "undetermined_v2_exchange_forward_speed_eps", 1e-3))
+        vx = float(robot.vx) if robot.vx is not None else 0.0
+        vy = float(robot.vy) if robot.vy is not None else 0.0
+        sp = math.hypot(vx, vy)
+        if sp > speed_eps:
+            return vx / sp, vy / sp
+        th = float(robot.theta) if robot.theta is not None else 0.0
+        return math.cos(th), math.sin(th)
+
+    def _point_in_forward_cone_strict(
+        self, px: float, py: float, fx: float, fy: float, qx: float, qy: float, cos_thr: float
+    ) -> bool:
+        dx = qx - px
+        dy = qy - py
+        dist = math.hypot(dx, dy)
+        if dist < 1e-9:
+            return False
+        dx /= dist
+        dy /= dist
+        return (fx * dx + fy * dy) > cos_thr + 1e-12
+
+    def _fleet_M_S_for_tids(self, tids: list[int]) -> tuple[float, float]:
+        K = int(self.num_goal_targets)
+        ds: list[float] = []
+        for k, r in enumerate(self.robots):
+            if r.collision or r.success:
+                ds.append(0.0)
+                continue
+            tid = int(tids[k]) % K
+            gx, gy = self.goal_positions[tid]
+            ds.append(float(cal_distance(r.px, r.py, gx, gy)))
+        if not ds:
+            return 0.0, 0.0
+        return float(max(ds)), float(sum(ds))
+
+    def _undetermined_v2_exchange_cone_mutual_greedy_m(self) -> None:
+        """
+        Velocity forward-cone (both agents), strict mutual shorter distance to swapped targets, then
+        greedy rounds: among unused agents pick the pair that yields minimum fleet M after a swap
+        while strictly lowering M vs current (heuristic to approximate multi-pair min-max).
+        """
+        K = int(self.num_goal_targets)
+        R_ex = float(self.undetermined_v2_exchange_radius)
+        max_swaps = max(1, int(getattr(self.args, "undetermined_v2_exchange_max_pairs_per_step", 1)))
+        ignore_pending = bool(getattr(self.args, "undetermined_v2_exchange_ignore_pending", False))
+        half_deg = float(getattr(self.args, "undetermined_v2_exchange_cone_half_deg", 60.0))
+        cos_thr = math.cos(math.radians(half_deg))
+
+        def dist_assigned(idx: int) -> float:
+            r = self.robots[idx]
+            if r.collision or r.success:
+                return 0.0
+            tid = int(r.target_id) % K
+            gx, gy = self.goal_positions[tid]
+            return cal_distance(r.px, r.py, gx, gy)
+
+        cur_dist0 = [dist_assigned(k) for k in range(self.robot_num)]
+        M0 = float(max(cur_dist0) if cur_dist0 else 0.0)
+        S0 = float(sum(cur_dist0))
+
+        def tid_list() -> list[int]:
+            return [int(self.robots[k].target_id) % K for k in range(self.robot_num)]
+
+        def mutual_strict(ri, rj, ti: int, tj: int) -> bool:
+            gxi, gyi = self.goal_positions[ti]
+            gxj, gyj = self.goal_positions[tj]
+            d_i_ti = cal_distance(ri.px, ri.py, gxi, gyi)
+            d_j_tj = cal_distance(rj.px, rj.py, gxj, gyj)
+            d_i_tj = cal_distance(ri.px, ri.py, gxj, gyj)
+            d_j_ti = cal_distance(rj.px, rj.py, gxi, gyi)
+            return bool(d_i_tj < d_i_ti and d_j_ti < d_j_tj)
+
+        def cones_ok(ri, rj) -> bool:
+            fi_x, fi_y = self._robot_forward_unit_xy(ri)
+            fj_x, fj_y = self._robot_forward_unit_xy(rj)
+            if not self._point_in_forward_cone_strict(
+                float(ri.px), float(ri.py), fi_x, fi_y, float(rj.px), float(rj.py), cos_thr
+            ):
+                return False
+            if not self._point_in_forward_cone_strict(
+                float(rj.px), float(rj.py), fj_x, fj_y, float(ri.px), float(ri.py), cos_thr
+            ):
+                return False
+            return True
+
+        agent_used = [False] * self.robot_num
+        n_swaps = 0
+
+        while n_swaps < max_swaps:
+            tids = tid_list()
+            M_cur, _S_cur = self._fleet_M_S_for_tids(tids)
+            best_M = None
+            best_pair = None
+            for i in range(self.robot_num):
+                if agent_used[i]:
+                    continue
+                ri = self.robots[i]
+                if ri.collision or ri.success:
+                    continue
+                if not ignore_pending and bool(getattr(ri, "undetermined_target_pending", False)):
+                    continue
+                for j in range(i + 1, self.robot_num):
+                    if agent_used[j]:
+                        continue
+                    rj = self.robots[j]
+                    if rj.collision or rj.success:
+                        continue
+                    if not ignore_pending and bool(getattr(rj, "undetermined_target_pending", False)):
+                        continue
+                    if cal_distance(ri.px, ri.py, rj.px, rj.py) > R_ex + 1e-9:
+                        continue
+                    ti = int(tids[i]) % K
+                    tj = int(tids[j]) % K
+                    if ti == tj:
+                        continue
+                    if not mutual_strict(ri, rj, ti, tj):
+                        continue
+                    if not cones_ok(ri, rj):
+                        continue
+                    t2 = list(tids)
+                    t2[i], t2[j] = t2[j], t2[i]
+                    M_after, _ = self._fleet_M_S_for_tids(t2)
+                    if M_after < M_cur - 1e-9:
+                        if best_M is None or M_after < best_M - 1e-9:
+                            best_M = float(M_after)
+                            best_pair = (i, j)
+                        elif best_pair is not None and abs(M_after - best_M) <= 1e-9:
+                            if (i, j) < best_pair:
+                                best_pair = (i, j)
+            if best_pair is None:
+                break
+            i, j = best_pair
+            ri, rj = self.robots[i], self.robots[j]
+            ti = int(ri.target_id) % K
+            tj = int(rj.target_id) % K
+            ri.target_id = tj
+            rj.target_id = ti
+            ri.undetermined_target_pending = False
+            rj.undetermined_target_pending = False
+            self.undetermined_v2_exchange_agent_mask[i] = True
+            self.undetermined_v2_exchange_agent_mask[j] = True
+            agent_used[i] = True
+            agent_used[j] = True
+            n_swaps += 1
+
+        if n_swaps > 0:
+            new_dist = [dist_assigned(k) for k in range(self.robot_num)]
+            M_end = float(max(new_dist) if new_dist else 0.0)
+            S_end = float(sum(new_dist))
+            self.undetermined_v2_exchange_step_M_gain = float(M0 - M_end)
+            self.undetermined_v2_exchange_step_S_gain = float(S0 - S_end)
+            self._undetermined_sync_all_goals()
+            self._undetermined_auction_duplicate_targets()
+            self._compute_undetermined_hungarian_shaping()
+
     def _attn_comm_tail_vector(self, robot_index, robot, for_feature, P: int, H: int) -> np.ndarray:
         """
         Ally geometry (6*P) + last-step recv messages (msg_dim*P) + human feats (5*H) + obstacle summary (4).
@@ -941,10 +1268,14 @@ class EnvCore(object):
 
     def _undetermined_v2_exchange_heuristic(self):
         """
-        Optional v2 mode: swap discrete targets for two nearby agents when the swap lowers the **fleet**
-        bottleneck: M = max_k d(robot_k, goal[target_k]) over agents (Euclidean to assigned goal center).
-        Gain = M_before - M_after (only agents i,j change assignment in the after picture). Greedy disjoint
-        pairs ordered by largest fleet gain; ``--undetermined_v2_exchange_min_gain`` is a margin on that gain.
+        Optional v2 mode: swap discrete targets for two nearby agents (within exchange radius) when a
+        criterion passes (see ``--undetermined_v2_exchange_accept_criterion``):
+
+        - fleet_m: fleet bottleneck M = max_k d(robot_k, goal[target_k]) drops by more than min_gain.
+        - pair_max: only the pair (i,j): max(d(i,goal_i),d(j,goal_j)) - max(d(i,goal_j),d(j,goal_i)) > min_gain.
+        - cone_mutual_greedy_m: velocity cones + strict mutual improvement; greedy disjoint swaps minimizing M.
+
+        Greedy disjoint pairs ordered by largest gain (fleet or pair, matching the criterion).
         """
         if not getattr(self, "undetermined_v2_exchange", False):
             return
@@ -955,6 +1286,10 @@ class EnvCore(object):
         self.undetermined_v2_exchange_step_S_gain = 0.0
         K = int(self.num_goal_targets)
         if K < 2:
+            return
+        crit = str(getattr(self.args, "undetermined_v2_exchange_accept_criterion", "fleet_m"))
+        if crit == "cone_mutual_greedy_m":
+            self._undetermined_v2_exchange_cone_mutual_greedy_m()
             return
         R_ex = float(self.undetermined_v2_exchange_radius)
         min_gain = float(getattr(self.args, "undetermined_v2_exchange_min_gain", 0.05))
@@ -1002,8 +1337,17 @@ class EnvCore(object):
                     others = max(others, cur_dist[k])
                 M_after = max(others, d_i_after, d_j_after)
                 gain_fleet = M_fleet - M_after
-                if gain_fleet > min_gain + 1e-9:
-                    candidates.append((gain_fleet, i, j))
+                d1 = float(cur_dist[i])
+                d2 = float(cur_dist[j])
+                gain_pair = max(d1, d2) - max(d_i_after, d_j_after)
+                if crit == "pair_max":
+                    sort_gain = gain_pair
+                    accept = gain_pair > min_gain + 1e-9
+                else:
+                    sort_gain = gain_fleet
+                    accept = gain_fleet > min_gain + 1e-9
+                if accept:
+                    candidates.append((sort_gain, i, j))
 
         candidates.sort(key=lambda t: t[0], reverse=True)
         used = set()
@@ -1225,7 +1569,13 @@ class EnvCore(object):
 
             rand_pos = None
             if getattr(self.args, "randomize_robot_initial_positions", False):
-                rand_pos = self._sample_collision_free_robot_starts()
+                _spawn_mode = str(getattr(self.args, "robot_initial_spawn_mode", "random_box"))
+                if _spawn_mode == "cluster_comm":
+                    rand_pos = self._sample_clustered_robot_starts_in_comm_range()
+                elif _spawn_mode == "cluster_disk":
+                    rand_pos = self._sample_clustered_robot_starts_in_disk()
+                else:
+                    rand_pos = self._sample_collision_free_robot_starts()
 
             if self.dynamic_goal_assignment or self.undetermined_goal_assignment:
                 self.goal_positions = [

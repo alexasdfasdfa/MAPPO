@@ -185,8 +185,11 @@ def parser_args(args, parser):
             if getattr(all_args, "enable_undetermined_v2_exchange", False):
                 _xr = getattr(all_args, "undetermined_v2_exchange_radius", None)
                 _xr_s = float(_xr) if _xr is not None else float(getattr(all_args, "undetermined_comm_radius", 6.0))
+                _ex_crit = str(getattr(all_args, "undetermined_v2_exchange_accept_criterion", "fleet_m"))
                 print(
-                    f"[train] undetermined v2_exchange (fleet max distance to assigned goal): radius={_xr_s}, "
+                    f"[train] undetermined v2_exchange (accept={_ex_crit}; "
+                    f"fleet_m uses fleet M=max_k dist2goal; cone_mutual_greedy_m uses cones+mutual+greedy M): "
+                    f"radius={_xr_s}, "
                     f"min_gain={float(getattr(all_args, 'undetermined_v2_exchange_min_gain', 0.05))}, "
                     f"max_pairs/step={int(getattr(all_args, 'undetermined_v2_exchange_max_pairs_per_step', 1))}, "
                     f"ignore_pending={bool(getattr(all_args, 'undetermined_v2_exchange_ignore_pending', False))}"
@@ -371,6 +374,10 @@ def main(args):
         f"dynamic_target: {_dyn}\n"
         f"undetermined_goal: {_und}\n"
         f"initial_randomize: {_ir}\n"
+        f"robot_initial_spawn_mode: {str(getattr(all_args, 'robot_initial_spawn_mode', 'random_box'))}\n"
+        f"robot_init_cluster_radius_mode: {str(getattr(all_args, 'robot_init_cluster_radius_mode', 'comm'))}\n"
+        f"undetermined_v2_exchange_accept_criterion: "
+        f"{str(getattr(all_args, 'undetermined_v2_exchange_accept_criterion', 'fleet_m'))}\n"
         f"num_agents: {int(all_args.num_agents)}\n"
     )
     if _asm == "nearest_n_radius":
