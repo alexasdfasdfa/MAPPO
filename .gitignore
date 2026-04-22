@@ -3,6 +3,7 @@ swarm.*.out
 results/
 data.csv
 fig/
+render.py
 
 # Python bytecode (should not be versioned; regenerate on run)
 __pycache__/
