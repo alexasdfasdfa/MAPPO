@@ -186,8 +186,8 @@ def parser_args(args, parser):
                 _xr = getattr(all_args, "undetermined_v2_exchange_radius", None)
                 _xr_s = float(_xr) if _xr is not None else float(getattr(all_args, "undetermined_comm_radius", 6.0))
                 print(
-                    f"[train] undetermined v2_exchange: radius={_xr_s}, min_gain="
-                    f"{float(getattr(all_args, 'undetermined_v2_exchange_min_gain', 0.05))}, "
+                    f"[train] undetermined v2_exchange (fleet max distance to assigned goal): radius={_xr_s}, "
+                    f"min_gain={float(getattr(all_args, 'undetermined_v2_exchange_min_gain', 0.05))}, "
                     f"max_pairs/step={int(getattr(all_args, 'undetermined_v2_exchange_max_pairs_per_step', 1))}, "
                     f"ignore_pending={bool(getattr(all_args, 'undetermined_v2_exchange_ignore_pending', False))}"
                 )

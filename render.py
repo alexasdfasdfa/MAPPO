@@ -1,6 +1,9 @@
 #!/usr/bin/env python
+from __future__ import annotations
+
 import sys
 import os
+import re
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 if _REPO_ROOT not in sys.path:
@@ -27,7 +30,59 @@ from config.config import (
 )
 
 from envs.env_wrappers import DummyVecEnv, SubprocVecEnv
-from runner.checkpoint_paths import resolve_shared_actor_checkpoint_path
+from runner.checkpoint_paths import (
+    resolve_shared_actor_checkpoint_path,
+    resolve_shared_critic_checkpoint_path,
+)
+
+
+def _parse_train_run_id_from_model_dir(model_dir: str) -> str | None:
+    m = re.search(r"[/\\]train[/\\]run(\d+)", str(model_dir), flags=re.IGNORECASE)
+    return m.group(1) if m else None
+
+
+def _write_render_run_flags(
+    repo_root: Path,
+    run_dir: Path,
+    curr_run: str,
+    all_args,
+    device: torch.device,
+) -> None:
+    """Mirror train's run_flags: record checkpoint + optional train run id; also under fig/render/<n>/."""
+    md = str(getattr(all_args, "model_dir", "") or "")
+    actor_path = resolve_shared_actor_checkpoint_path(md)
+    ap_resolved = ""
+    if actor_path is not None and actor_path.is_file():
+        ap_resolved = str(actor_path.resolve())
+    critic_path = resolve_shared_critic_checkpoint_path(md, actor_path)
+    cp_resolved = ""
+    if critic_path is not None and critic_path.is_file():
+        cp_resolved = str(critic_path.resolve())
+    train_rid = _parse_train_run_id_from_model_dir(md)
+    lines = [
+        f"render_results_subdir: {curr_run}\n",
+        f"model_dir: {md}\n",
+        f"actor_checkpoint: {ap_resolved}\n",
+        f"critic_checkpoint: {cp_resolved}\n",
+        f"train_run_id: {train_rid if train_rid is not None else '-'}\n",
+        f"device: {device}\n",
+        f"num_agents: {int(getattr(all_args, 'num_agents', 0))}\n",
+        f"render_episodes: {int(getattr(all_args, 'render_episodes', 0))}\n",
+        f"episode_length: {int(getattr(all_args, 'episode_length', 0))}\n",
+        f"algorithm_name: {getattr(all_args, 'algorithm_name', '')}\n",
+        f"no_render_auto_align_checkpoint: {bool(getattr(all_args, 'no_render_auto_align_checkpoint', False))}\n",
+    ]
+    text = "".join(lines)
+    flags_path = run_dir / "run_flags.txt"
+    flags_path.write_text(text, encoding="utf-8")
+    try:
+        n = int(str(curr_run).lower().replace("run", ""))
+    except ValueError:
+        n = None
+    if n is not None:
+        fig_dir = repo_root / "fig" / "render" / str(n)
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        (fig_dir / "run_flags.txt").write_text(text, encoding="utf-8")
 
 
 def apply_dynamic_goal_obs_dim(all_args):
@@ -334,7 +389,7 @@ def main(args):
     all_args = parser_args(args, parser)
     all_args.use_render = True
     # Shared-policy checkpoint: folder with actor.pt, or 4.pt if actor.pt is missing, or a direct path to *.pt.
-    all_args.model_dir = str(Path(__file__).resolve().parent / "results/train/run93/models")
+    all_args.model_dir = str(Path(__file__).resolve().parent / "results/train/run98/models")
     all_args.n_rollout_threads = 1
     all_args.episode_length = 500
     all_args.visualize = False
@@ -404,6 +459,8 @@ def main(args):
     run_dir = run_dir / curr_run
     if not run_dir.exists():
         os.makedirs(str(run_dir))
+
+    _write_render_run_flags(Path(_REPO_ROOT).resolve(), run_dir, curr_run, all_args, device)
 
     setproctitle.setproctitle("@" + str(all_args.user_name))     #进程名称
 

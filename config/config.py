@@ -107,10 +107,10 @@ def get_config():
     parser.add_argument(
         "--enable_undetermined_v2_exchange",
         action="store_true",
-        default=True,
+        default=False,
         help="Undetermined v2 only: each env step, a heuristic may swap two agents' discrete targets when they lie "
-        "within a local domain radius and swapping strictly reduces max(dist to own goal) across the pair "
-        "(l1=d(i,g_i), l2=d(j,g_j) vs d1=d(i,g_j), d2=d(j,g_i) after swap: require max(l1,l2)>max(d1,d2) by "
+        "within a local domain radius and swapping strictly reduces the **fleet** bottleneck "
+        "M=max_k d(robot_k, goal[target_k]) (only the two agents change targets; gain = M_before - M_after >= "
         "min_gain). Incompatible with --enable_undetermined_goal_v3.",
     )
     parser.add_argument(
@@ -124,8 +124,8 @@ def get_config():
         "--undetermined_v2_exchange_min_gain",
         type=float,
         default=0.05,
-        help="Minimum strict improvement in bottleneck distance max(l1,l2)-max(d1,d2) (meters) for the pair "
-        "to perform a swap; l1/l2 are pre-swap distances to assigned goals, d1/d2 post-swap.",
+        help="Minimum fleet bottleneck improvement M_before - M_after (meters) for a candidate pair swap, "
+        "where M = max over agents of distance to current assigned goal center.",
     )
     parser.add_argument(
         "--undetermined_v2_exchange_max_pairs_per_step",
@@ -194,7 +194,7 @@ def get_config():
     parser.add_argument(
         "--undet_v2_latent_train_mode",
         type=str,
-        default="finetune_all",
+        default="motion_only",
         choices=["motion_only", "finetune_all"],
         help="With undet_v2_target_latent_model_dir: motion_only freezes undetermined_head (train navigation / "
         "base actor only). finetune_all keeps the head trainable and adds a small supervised slot loss during PPO "
@@ -315,7 +315,7 @@ def get_config():
     parser.add_argument(
         "--undetermined_v2_type2_formation_efficiency",
         action="store_true",
-        default=False,
+        default=True,
         help="Undetermined v2: preset for type-2 success — relax literal goal pull and S_L shaping after S_L>=thr "
         "(allow formation drift vs targets), reward first crossing into success, add light pre-success step/travel cost "
         "to favor fewer steps and shorter motion before formation.",

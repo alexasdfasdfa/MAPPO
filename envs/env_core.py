@@ -933,10 +933,10 @@ class EnvCore(object):
 
     def _undetermined_v2_exchange_heuristic(self):
         """
-        Optional v2 mode: swap discrete targets for two agents in a local domain when swapping lowers the
-        bottleneck distance max(l1,l2) > max(d1,d2), where l1=d(i,g_i), l2=d(j,g_j) before swap and
-        d1=d(i,g_j), d2=d(j,g_i) after (world metric to goal centers). Greedy ordering uses max reduction
-        so the farther-of-two assignment improves (parallel cover / iteration count). Greedy disjoint pairs.
+        Optional v2 mode: swap discrete targets for two nearby agents when the swap lowers the **fleet**
+        bottleneck: M = max_k d(robot_k, goal[target_k]) over agents (Euclidean to assigned goal center).
+        Gain = M_before - M_after (only agents i,j change assignment in the after picture). Greedy disjoint
+        pairs ordered by largest fleet gain; ``--undetermined_v2_exchange_min_gain`` is a margin on that gain.
         """
         if not getattr(self, "undetermined_v2_exchange", False):
             return
@@ -949,6 +949,17 @@ class EnvCore(object):
         min_gain = float(getattr(self.args, "undetermined_v2_exchange_min_gain", 0.05))
         max_pairs = max(1, int(getattr(self.args, "undetermined_v2_exchange_max_pairs_per_step", 1)))
         ignore_pending = bool(getattr(self.args, "undetermined_v2_exchange_ignore_pending", False))
+
+        def dist_to_assigned_goal(idx: int) -> float:
+            r = self.robots[idx]
+            if r.collision or r.success:
+                return 0.0
+            tid = int(r.target_id) % K
+            gx, gy = self.goal_positions[tid]
+            return cal_distance(r.px, r.py, gx, gy)
+
+        cur_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
+        M_fleet = max(cur_dist) if cur_dist else 0.0
 
         candidates = []
         for i in range(self.robot_num):
@@ -971,15 +982,17 @@ class EnvCore(object):
                     continue
                 gxi, gyi = self.goal_positions[ti]
                 gxj, gyj = self.goal_positions[tj]
-                l1 = cal_distance(ri.px, ri.py, gxi, gyi)
-                l2 = cal_distance(rj.px, rj.py, gxj, gyj)
-                d1 = cal_distance(ri.px, ri.py, gxj, gyj)
-                d2 = cal_distance(rj.px, rj.py, gxi, gyi)
-                before_max = max(l1, l2)
-                after_max = max(d1, d2)
-                gain_max = before_max - after_max
-                if gain_max > min_gain + 1e-9:
-                    candidates.append((gain_max, i, j))
+                d_i_after = cal_distance(ri.px, ri.py, gxj, gyj)
+                d_j_after = cal_distance(rj.px, rj.py, gxi, gyi)
+                others = 0.0
+                for k in range(self.robot_num):
+                    if k == i or k == j:
+                        continue
+                    others = max(others, cur_dist[k])
+                M_after = max(others, d_i_after, d_j_after)
+                gain_fleet = M_fleet - M_after
+                if gain_fleet > min_gain + 1e-9:
+                    candidates.append((gain_fleet, i, j))
 
         candidates.sort(key=lambda t: t[0], reverse=True)
         used = set()

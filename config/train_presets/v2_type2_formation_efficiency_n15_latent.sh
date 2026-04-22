@@ -19,5 +19,5 @@ python train.py \
   --undetermined_target_embed_dim 32 \
   --undet_v2_pair_mlp_hidden 384 \
   --undet_v2_target_latent_model_dir "../undet_v2_target_latent/checkpoints/selector_n15.pt" \
-  --undet_v2_latent_train_mode finetune_all \
+  --undet_v2_latent_train_mode motion_only \
 

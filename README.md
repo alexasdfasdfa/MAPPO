@@ -6,7 +6,7 @@ Works based on *Application of LLM Guided Reinforcement Learning in Formation Co
 - Seperated Dataset
 - Data Generator
 - **Undetermined goal v2**: nearest-goal slot observation pack, `UndeterminedTargetHeadV2`, auction + Hungarian shaping (see below)
-- **Undetermined v2_exchange** (optional): heuristic pairwise **target_id** swaps inside a local radius when **max(l1,l2) > max(d1,d2)** (pre/post distance to goals for the pair), to cut redundant auction / re-selection iterations (see below)
+- **Undetermined v2_exchange** (optional): pairwise **target_id** swaps inside a local radius when the swap lowers the **fleet** bottleneck \(M=\max_k d(\text{robot}_k,\text{goal}_{\text{target}_k})\) by at least **`--undetermined_v2_exchange_min_gain`**, to shorten the worst agent’s remaining distance to its assigned goal (see below)
 
 ## TODO
 
@@ -72,15 +72,15 @@ Layout (indices are 0-based in the packed row **before** px, py; the actor uses 
 
 ### v2_exchange (optional heuristic target swap)
 
-**v2 only** — cannot be used with `--enable_undetermined_goal_v3`. When enabled, each env `step()` runs **after** `_undetermined_comm_conflict_auction()` and tries **pairwise swaps** of discrete `target_id` between two robots that lie in each other’s **exchange domain** (center-to-center distance ≤ radius). Let \(l_1=d(p_i,g_i)\), \(l_2=d(p_j,g_j)\) with current assignments, and \(d_1=d(p_i,g_j)\), \(d_2=d(p_j,g_i)\) if they **exchanged** goals. A swap is applied only if
+**v2 only** — cannot be used with `--enable_undetermined_goal_v3`. When enabled, each env `step()` runs **after** `_undetermined_comm_conflict_auction()` and tries **pairwise swaps** of discrete `target_id` between two robots that lie in each other’s **exchange domain** (center-to-center distance ≤ radius). Let \(M_{\text{before}}=\max_k d(p_k, g_{\text{target}_k})\) over agents (collision/success agents contribute 0). For a candidate pair \((i,j)\), let \(M_{\text{after}}\) be the same max after **only** \(i\) and \(j\) exchange targets (all other agents unchanged). A swap is applied only if
 
-**max(l₁,l₂) − max(d₁,d₂) > `--undetermined_v2_exchange_min_gain`** (meters). This **bottleneck / max** rule favors lowering the farther agent’s distance to its assigned goal (better parallel cover than sum-only). Candidate pairs are sorted by that margin (largest first); **disjoint** pairs are taken greedily, at most **`--undetermined_v2_exchange_max_pairs_per_step`** per step. After any swap: `_undetermined_sync_all_goals()`, duplicate auction, and Hungarian shaping are refreshed; both agents’ **`undetermined_target_pending`** are cleared for that pair.
+**\(M_{\text{before}} - M_{\text{after}} >\) `--undetermined_v2_exchange_min_gain`** (meters). This targets the **worst-off** agent by current distance-to-assigned-goal. Candidate pairs are sorted by that fleet gain (largest first); **disjoint** pairs are taken greedily, at most **`--undetermined_v2_exchange_max_pairs_per_step`** per step. After any swap: `_undetermined_sync_all_goals()`, duplicate auction, and Hungarian shaping are refreshed; both agents’ **`undetermined_target_pending`** are cleared for that pair.
 
 | Parameter | Default | Role |
 |-----------|---------|------|
 | `--enable_undetermined_v2_exchange` | off | Turn on the heuristic. Requires **`--enable_undetermined_goal_v2`**. |
 | `--undetermined_v2_exchange_radius` | `None` → **`--undetermined_comm_radius`** | Domain radius (m): only pairs with distance ≤ this are considered. |
-| `--undetermined_v2_exchange_min_gain` | `0.05` | Minimum strict reduction \(\max(l_1,l_2)-\max(d_1,d_2)\) (m) required to swap. |
+| `--undetermined_v2_exchange_min_gain` | `0.05` | Minimum reduction \(M_{\text{before}}-M_{\text{after}}\) of the fleet max distance-to-assigned-goal (m). |
 | `--undetermined_v2_exchange_max_pairs_per_step` | `1` | Cap on disjoint swaps per env step. |
 | `--undetermined_v2_exchange_ignore_pending` | off | If set, pairs may swap even when one or both agents have **`undetermined_target_pending`**; default skips any agent that is pending. |
 

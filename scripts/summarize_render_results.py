@@ -5,7 +5,10 @@ Aggregate statistics from MAPPO render outputs under results/render/run*/.
 Reads succ/success_agent*.txt and coords/coords_agent*.txt produced by EnvRunner.render().
 
 Trajectory metrics (env index 0 only when lines contain " | " multi-env chunks):
-  - pair_success_rate, episode_all_agents_success_rate, mean_first_success_step, mean_path_length
+  - pair_success_rate, episode_all_agents_success_rate,
+  - mean_all_agents_formation_step (first 1-based step where every agent's succ flag is 1; mean over episodes
+    that achieve full formation within the horizon; complements Laplacian type-2 when similarity rates are 0),
+  - mean_first_success_step (mean of per-agent first success among successful agent-episode pairs), mean_path_length
 
 Episode meta (episode_meta.json preferred, else episode_meta.jsonl), when target_ids_by_step + goal_positions exist:
   - meta_target_mean / meta_target_var: pooled over all steps and agents in target_ids_by_step
@@ -619,6 +622,31 @@ def first_success_step_1based(flags: list[int]) -> int | None:
     return None
 
 
+def first_all_agents_formation_step_1based(
+    succ_by_agent: dict[int, dict[int, list[int]]],
+    agent_ids: list[int],
+    episode: int,
+) -> int | None:
+    """
+    Earliest 1-based timestep t such that every agent has succ flag 1 at step t-1.
+    Render logs mark 1 once reach_goal holds and leave it 1, so this equals max_i first_success_step(agent i)
+    when full formation is reached; None if trajectories missing or no step has all agents at goal.
+    """
+    series: list[list[int]] = []
+    for aid in agent_ids:
+        fl = succ_by_agent[aid].get(episode, [])
+        if not fl:
+            return None
+        series.append(fl)
+    t_max = min(len(s) for s in series)
+    if t_max < 1:
+        return None
+    for t in range(t_max):
+        if all(int(s[t]) != 0 for s in series):
+            return t + 1
+    return None
+
+
 def load_agent_succ_episodes(succ_dir: Path, agent_id: int) -> dict[int, list[int]]:
     p = succ_dir / f"success_agent{agent_id}.txt"
     out: dict[int, list[int]] = {}
@@ -716,11 +744,15 @@ def analyze_run(
     pair_total = 0
     pair_ok = 0
     first_steps: list[int] = []
+    formation_steps: list[int] = []
     path_lengths: list[float] = []
     episodes_all_ok = 0
 
     for ep in episodes:
         ep_all_success = True
+        fs_form = first_all_agents_formation_step_1based(succ_by_agent, agent_ids, ep)
+        if fs_form is not None:
+            formation_steps.append(fs_form)
         for aid in agent_ids:
             pair_total += 1
             flags = succ_by_agent[aid].get(ep, [])
@@ -759,6 +791,12 @@ def analyze_run(
         "pattern": meta.get("pattern", ""),
         "pair_success_rate": pair_ok / pair_total if pair_total else 0.0,
         "episode_all_agents_success_rate": episodes_all_ok / len(episodes) if episodes else 0.0,
+        "mean_all_agents_formation_step": (
+            float(sum(formation_steps) / len(formation_steps)) if formation_steps else float("nan")
+        ),
+        "formation_complete_episode_rate": (
+            float(len(formation_steps) / len(episodes)) if episodes else float("nan")
+        ),
         "mean_first_success_step": sum(first_steps) / len(first_steps) if first_steps else float("nan"),
         "mean_path_length": sum(path_lengths) / len(path_lengths) if path_lengths else float("nan"),
         "num_success_pairs": pair_ok,
@@ -866,6 +904,8 @@ def main() -> int:
         "pattern",
         "pair_success_rate",
         "episode_all_agents_success_rate",
+        "mean_all_agents_formation_step",
+        "formation_complete_episode_rate",
         "mean_first_success_step",
         "mean_path_length",
         "num_success_pairs",

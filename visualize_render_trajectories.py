@@ -5,6 +5,7 @@ Build one multi-agent trajectory GIF per episode from render coord logs.
 Reads:  <repo>/results/render/run{n}/coords/coords_agent*.txt,
         run{n}/episode_meta.jsonl (pattern, goals; dynamic runs add goal_positions + target_ids_by_step)
 Writes: <cwd>/fig/render/n/{ep_id}.gif
+        Copies results/render/run{n}/run_flags.txt → <cwd>/fig/render/n/run_flags.txt when present (model / train run id).
         Dynamic: colors follow current target_id (shared palette over K slots); rings match that target.
         Static: ring at goal slot k uses palette[k]; agent i uses palette[i % K]. Coords files sorted by agent id (not lexicographic).
 
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 from pathlib import Path
 
 import imageio.v2 as imageio
@@ -417,6 +419,16 @@ def main() -> None:
         to_run = episodes
 
     out_dir = Path.cwd() / "fig" / "render" / str(args.n)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _flags_src = run_dir / "run_flags.txt"
+    if _flags_src.is_file():
+        shutil.copy2(_flags_src, out_dir / "run_flags.txt")
+        print(f"Copied {_flags_src} -> {out_dir / 'run_flags.txt'}")
+        _repo_fig = _repo_root() / "fig" / "render" / str(args.n)
+        if _repo_fig.resolve() != out_dir.resolve():
+            _repo_fig.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(_flags_src, _repo_fig / "run_flags.txt")
+            print(f"Copied {_flags_src} -> {_repo_fig / 'run_flags.txt'}")
 
     for ep_id, traj in to_run:
         T, A, _ = traj.shape
