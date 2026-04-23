@@ -141,7 +141,7 @@ Layout (indices are 0-based in the packed row **before** px, py; the actor uses 
 
 #### How to launch (exchange presets)
 
-From the repo root, the bundled script enables **v2 + v2_exchange** with **`cone_mutual_greedy_m`**, **`max_pairs_per_step=8`**, and **`cluster_disk`** + **`comm_vis_adaptive`** (see **Clustered robot spawns** above):
+From the repo root, the bundled script enables **v2 + v2_exchange** with **`fleet_m`** (default fleet bottleneck criterion), **`max_pairs_per_step=1`**, and **`cluster_disk`** + **`comm_vis_adaptive`** (see **Clustered robot spawns** above):
 
 ```bash
 cd /path/to/MAPPO

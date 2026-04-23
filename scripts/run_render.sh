@@ -11,6 +11,9 @@
 #   bash scripts/run_render.sh -- --model_dir results/.../train/run1 --use_render
 #   bash scripts/run_render.sh my_render.log -- --model_dir results/foo/train/run1
 #
+# Default spawn (before your args): cluster_disk + comm_vis_adaptive. Override with e.g.
+#   --robot_initial_spawn_mode random_box
+#
 # Requires: conda, env "swE2" (see scripts/create_swE2_env.sh)
 
 set -euo pipefail
@@ -60,6 +63,8 @@ echo "Python:  $(command -v python)"
 echo "--------"
 
 set -o pipefail
-python render.py "$@" 2>&1 | tee "${LOG_FILE}"
-
+python render.py \
+  "$@" 2>&1 | tee "${LOG_FILE}"
+  # --robot_initial_spawn_mode cluster_disk \
+  # --robot_init_cluster_radius_mode comm_vis_adaptive \
 echo "Finished. Log saved to: ${LOG_FILE}"

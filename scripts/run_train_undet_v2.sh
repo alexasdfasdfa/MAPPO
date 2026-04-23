@@ -6,6 +6,8 @@
 #     cd /home/inno/MAPPO
 #     bash scripts/run_train_undet_v2.sh
 #
+# Spawn: cluster_disk (uniform in disk) + comm_vis_adaptive ref radius (see README / config.py).
+#
 # Requires: conda, env "swE2" (see scripts/create_swE2_env.sh)
 
 set -euo pipefail
@@ -57,6 +59,8 @@ run_train_with_nohup train.py \
   --train_font_pattern_policy all \
   --enable_undetermined_goal \
   --enable_undetermined_goal_v2 \
+  --robot_initial_spawn_mode cluster_disk \
+  --robot_init_cluster_radius_mode comm_vis_adaptive \
   --undetermined_v2_type2_formation_efficiency \
   --undetermined_v2_goal_slots 10 \
   --undet_v2_head_arch pair_mlp \

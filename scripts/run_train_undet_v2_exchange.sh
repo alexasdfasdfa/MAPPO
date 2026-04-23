@@ -2,8 +2,7 @@
 # Same as run_train_undet_v2.sh plus undetermined v2 target exchange (pairwise swaps).
 # Training runs under nohup (survives terminal close); see lib_train_runner.sh.
 # CLI flag: --enable_undetermined_v2_exchange (see README.md "v2_exchange").
-# Exchange: cone_mutual_greedy_m = velocity cone + strict mutual closer targets + greedy rounds
-#   minimizing fleet M (see --undetermined_v2_exchange_max_pairs_per_step).
+# Exchange: fleet_m (default) = fleet bottleneck M must drop by > min_gain per swap; see config.py.
 # Spawn: cluster_disk = uniform in disk with same ref radius as cluster_comm (comm_vis_adaptive).
 # Default shaping: reward shrinking fleet bottleneck max(dist2goal), sum(dist2goal), and
 # swap-induced drop in total assigned distance (tune via undetermined_v2_exchange_*_scale).
@@ -66,8 +65,8 @@ run_train_with_nohup train.py \
   --enable_undetermined_goal \
   --enable_undetermined_goal_v2 \
   --enable_undetermined_v2_exchange \
-  --undetermined_v2_exchange_accept_criterion cone_mutual_greedy_m \
-  --undetermined_v2_exchange_max_pairs_per_step 8 \
+  --undetermined_v2_exchange_accept_criterion fleet_m \
+  --undetermined_v2_exchange_max_pairs_per_step 1 \
   --robot_initial_spawn_mode cluster_disk \
   --robot_init_cluster_radius_mode comm_vis_adaptive \
   --undetermined_v2_type2_formation_efficiency \
