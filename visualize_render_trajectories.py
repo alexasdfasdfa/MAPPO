@@ -3,7 +3,11 @@
 Build one multi-agent trajectory GIF per episode from render coord logs.
 
 Reads:  <repo>/results/render/run{n}/coords/coords_agent*.txt,
-        run{n}/episode_meta.jsonl (pattern, goals; dynamic runs add goal_positions + target_ids_by_step)
+        run{n}/episode_meta.json or episode_meta.jsonl (pattern, goals; dynamic runs add goal_positions + target_ids_by_step)
+
+Optional ``--sl-type2-success``: recompute Laplacian S_L each step (same as eval ``sl_type2``); first step with
+``S_L >= --sl-threshold`` freezes all agents' displayed positions to that timestep (trajectory tail is flat).
+Requires ``episode_meta`` with ``agent_goals`` or ``goal_positions`` (n×2) matching agent count.
 Writes: <cwd>/fig/render/n/{ep_id}.gif
         Copies results/render/run{n}/run_flags.txt → <cwd>/fig/render/n/run_flags.txt when present (model / train run id).
         Dynamic: colors follow current target_id (shared palette over K slots); rings match that target.
@@ -12,6 +16,7 @@ Writes: <cwd>/fig/render/n/{ep_id}.gif
 Example:
   python visualize_render_trajectories.py 13
   python visualize_render_trajectories.py 13 --episode 3 --stride 4   # fewer frames, faster
+  python visualize_render_trajectories.py 70 --sl-type2-success --sl-threshold 0.97
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ import json
 import re
 import shutil
 from pathlib import Path
+from typing import Any
 
 import imageio.v2 as imageio
 import matplotlib
@@ -108,6 +114,131 @@ def load_episode_meta_jsonl(run_dir: Path) -> dict[int, dict]:
             except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                 continue
     return by_ep
+
+
+def _load_episode_meta_json(run_dir: Path) -> dict[int, dict]:
+    """Merge episode_meta.json (array or object) into episode -> record."""
+    p = run_dir / "episode_meta.json"
+    by_ep: dict[int, dict] = {}
+    if not p.is_file():
+        return by_ep
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return by_ep
+    rows: list[dict[str, Any]]
+    if isinstance(raw, list):
+        rows = [x for x in raw if isinstance(x, dict)]
+    elif isinstance(raw, dict):
+        rows = [raw]
+    else:
+        return by_ep
+    for o in rows:
+        try:
+            by_ep[int(o["episode"])] = o
+        except (KeyError, TypeError, ValueError):
+            continue
+    return by_ep
+
+
+def load_episode_meta_merged(run_dir: Path) -> dict[int, dict]:
+    """jsonl first, then json overwrites (aggregate file often preferred)."""
+    by_ep = load_episode_meta_jsonl(run_dir)
+    by_ep.update(_load_episode_meta_json(run_dir))
+    return by_ep
+
+
+def _scaled_laplacian_batch(xy: np.ndarray) -> np.ndarray | None:
+    """
+    Symmetric normalized graph Laplacian (same as EnvCore / summarize_render_results).
+    xy: (T, n, 2) or (n, 2). Returns (T, n, n) or (1, n, n); None if n < 2.
+    """
+    if xy.ndim == 2:
+        xy = xy[np.newaxis, ...]
+    _t, n, _ = xy.shape
+    if n < 2:
+        return None
+    diff = xy[:, :, np.newaxis, :] - xy[:, np.newaxis, :, :]
+    w = np.sum(diff * diff, axis=-1)
+    row_sums = np.sum(w, axis=2)
+    eps = 1e-8
+    inv_sqrt = np.power(np.where(row_sums > 0, row_sums, eps), -0.5)
+    diag_l = row_sums[:, :, np.newaxis] * np.eye(n, dtype=np.float64)
+    l_mat = diag_l - w
+    inv_i = inv_sqrt[:, :, np.newaxis]
+    inv_j = inv_sqrt[:, np.newaxis, :]
+    return inv_i * l_mat * inv_j
+
+
+def _scaled_laplacian_from_positions(xy: np.ndarray) -> np.ndarray | None:
+    """L_hat from single configuration xy: (n, 2)."""
+    if xy.ndim != 2 or xy.shape[1] != 2:
+        return None
+    b = _scaled_laplacian_batch(xy)
+    if b is None:
+        return None
+    return b[0]
+
+
+def laplacian_S_L_batch(L_hat: np.ndarray, L_des: np.ndarray) -> np.ndarray:
+    """S_L = 1 - ||L_hat - L_des||_F / ||L_des||_F per row of L_hat (T, n, n)."""
+    diff = L_hat - L_des
+    nf = np.sqrt(np.sum(diff * diff, axis=(1, 2)))
+    den = float(np.linalg.norm(L_des, ord="fro"))
+    if den < 1e-14:
+        return np.full(L_hat.shape[0], np.nan, dtype=np.float64)
+    return 1.0 - nf / den
+
+
+def _targets_xy_from_meta(rec: dict[str, Any], n_agents: int) -> np.ndarray | None:
+    """Goal (gx, gy) per robot row for L_des: prefer agent_goals; else goal_positions if n×2."""
+    ag = rec.get("agent_goals")
+    if isinstance(ag, list) and len(ag) == n_agents:
+        g = np.asarray(ag, dtype=np.float64)
+        if g.ndim == 2 and g.shape[1] == 2:
+            return g
+    gp = rec.get("goal_positions")
+    if gp is not None:
+        g = np.asarray(gp, dtype=np.float64)
+        if g.ndim == 2 and g.shape[1] == 2 and g.shape[0] == n_agents:
+            return g
+    return None
+
+
+def sl_type2_freeze_trajectory(
+    traj: np.ndarray,
+    ep_meta: dict[str, Any] | None,
+    *,
+    sl_threshold: float,
+) -> tuple[np.ndarray, int | None]:
+    """
+    If meta provides fixed goal layout, compute S_L(t) from traj vs desired Laplacian (summarize_render_results
+    sl_type2). Return traj where for all t >= t_first_success, positions equal traj[t_first_success] (frozen).
+    t_first_success is 0-based step index, or None if never crosses threshold / missing meta / n_agents < 2.
+    """
+    if ep_meta is None:
+        return traj, None
+    _t, n_ag, _ = traj.shape
+    if n_ag < 2:
+        return traj, None
+    tgt = _targets_xy_from_meta(ep_meta, n_ag)
+    if tgt is None:
+        return traj, None
+    L_des = _scaled_laplacian_from_positions(tgt)
+    if L_des is None:
+        return traj, None
+    l_hat_all = _scaled_laplacian_batch(traj.astype(np.float64))
+    if l_hat_all is None:
+        return traj, None
+    sl_vec = laplacian_S_L_batch(l_hat_all, L_des)
+    ok = np.isfinite(sl_vec) & (sl_vec >= float(sl_threshold))
+    if not np.any(ok):
+        return traj, None
+    t_first = int(np.argmax(ok))
+    out = np.array(traj, dtype=np.float64, copy=True)
+    frozen = out[t_first].copy()
+    out[t_first + 1 :] = frozen
+    return out, t_first
 
 
 def _parse_episode_line(line: str) -> tuple[int, np.ndarray] | None:
@@ -233,12 +364,15 @@ def render_all_agents_gif(
     goal_positions: np.ndarray | None = None,
     target_ids_by_step: np.ndarray | None = None,
     static_goals: list | None = None,
+    *,
+    sl_type2_caption: str | None = None,
 ) -> None:
     """
     traj: (T, A, 2).
     target_colors: (K, 4) RGBA — color for target slot id in [0, K).
     Dynamic: each frame agent i uses target_colors[target_ids_by_step[t, i] % K]; ring follows same tid.
     Static: ring at static_goals[k] uses target_colors[k]; agent i uses target_colors[i % K].
+    sl_type2_caption: optional extra text appended to the figure suptitle (sl_type2 freeze summary).
     """
     T, A, _ = traj.shape
     indices = list(range(0, T, max(stride, 1)))
@@ -260,8 +394,9 @@ def render_all_agents_gif(
     pat = label_src.get("pattern", "?")
     rlen = label_src.get("episode_length", T)
     tpl_n = label_src.get("pattern_template_len", "?")
+    _sl = f"  |  {sl_type2_caption}" if sl_type2_caption else ""
     fig.suptitle(
-        f"pattern={pat}  |  rollout_length={rlen}  |  template_pts={tpl_n}",
+        f"pattern={pat}  |  rollout_length={rlen}  |  template_pts={tpl_n}{_sl}",
         fontsize=10,
         y=0.98,
     )
@@ -398,6 +533,19 @@ def main() -> None:
         default=None,
         help="Override results root (default: <repo>/results/render).",
     )
+    parser.add_argument(
+        "--sl-type2-success",
+        action="store_true",
+        default=False,
+        help="Treat sl_type2 (S_L vs meta goal Laplacian) as formation success: freeze displayed coords after "
+        "first step with S_L >= --sl-threshold (needs episode_meta.json(l) goals).",
+    )
+    parser.add_argument(
+        "--sl-threshold",
+        type=float,
+        default=0.97,
+        help="S_L threshold for --sl-type2-success (same role as undetermined_v2_sl_success_threshold in training).",
+    )
     args = parser.parse_args()
 
     root = Path(args.data_root) if args.data_root else _repo_root() / "results" / "render"
@@ -410,7 +558,7 @@ def main() -> None:
         raise SystemExit("No merged episode data in coords files.")
 
     run_dir = coords_dir.parent
-    meta_by_ep = load_episode_meta_jsonl(run_dir)
+    meta_by_ep = load_episode_meta_merged(run_dir)
     header_fallback = _parse_coords_file_headers(coords_dir)
 
     if args.episode is not None:
@@ -469,6 +617,25 @@ def main() -> None:
             target_colors = target_slot_colors(K)
             static_goals = None
 
+        sl_caption: str | None = None
+        if args.sl_type2_success:
+            traj_vis, t_sl = sl_type2_freeze_trajectory(
+                traj,
+                ep_meta,
+                sl_threshold=float(args.sl_threshold),
+            )
+            traj = traj_vis
+            thr = float(args.sl_threshold)
+            if t_sl is not None:
+                sl_caption = f"S_L≥{thr} @ step {t_sl + 1} (1-based); coords frozen after"
+                print(f"episode {ep_id}: sl_type2 first hit step {t_sl + 1} (S_L>={thr}), tail coords frozen")
+            else:
+                sl_caption = f"S_L≥{thr} never; raw trajectory"
+                print(
+                    f"episode {ep_id}: sl_type2 (--sl-threshold {thr}) never satisfied or no meta goals; "
+                    "GIF uses raw coords"
+                )
+
         extra_xy = np.vstack(bounds_extras) if bounds_extras else None
         bounds = _axis_bounds(traj, extra_xy=extra_xy)
         out_path = out_dir / f"{ep_id}.gif"
@@ -488,6 +655,7 @@ def main() -> None:
             goal_positions=goal_positions,
             target_ids_by_step=target_ids_by_step,
             static_goals=static_goals if not use_dynamic else None,
+            sl_type2_caption=sl_caption,
         )
         print(f"Wrote {out_path} ({A} agents, {T} steps)")
 
