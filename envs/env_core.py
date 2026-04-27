@@ -1277,7 +1277,12 @@ class EnvCore(object):
 
     def _undetermined_v2_exchange_heuristic(self):
         """
-        Entry point: dispatch to rule-based (with data collection) or neural exchange.
+        Entry point for task exchange.
+
+        Two phases:
+        1. Before network is trained: rule-based exchange + data collection
+        2. After network meets accuracy threshold: neural exchange for actual
+           decisions, rule still runs for continued data collection.
         """
         if not getattr(self, "undetermined_v2_exchange", False):
             return
@@ -1285,22 +1290,33 @@ class EnvCore(object):
             return
 
         if self.use_exchange_network and self.exchange_network is not None:
+            # Phase 2: neural makes decisions, rule collects data for re-training
+            self._undetermined_v2_exchange_rule_with_collection(data_only=True)
             self._undetermined_v2_exchange_neural()
         else:
-            self._undetermined_v2_exchange_rule_with_collection()
+            # Phase 1: rule-based exchange + data collection
+            self._undetermined_v2_exchange_rule_with_collection(data_only=False)
 
-    def _undetermined_v2_exchange_rule_with_collection(self):
+    def _undetermined_v2_exchange_rule_with_collection(self, data_only: bool = False):
         """
-        Rule-based exchange (original logic) with data collection for behavior cloning.
-        Records all candidate pairs and their swap decisions to exchange_data_collector.
+        Rule-based exchange with data collection.
+
+        :param data_only: When True, only collects data (no swaps executed, no
+            reward shaping updated). Used when neural network is active.
         """
-        self.undetermined_v2_exchange_agent_mask.fill(False)
-        self.undetermined_v2_exchange_step_M_gain = 0.0
-        self.undetermined_v2_exchange_step_S_gain = 0.0
+        # Skip reward shaping update if data_only
+        if not data_only:
+            self.undetermined_v2_exchange_agent_mask.fill(False)
+            self.undetermined_v2_exchange_step_M_gain = 0.0
+            self.undetermined_v2_exchange_step_S_gain = 0.0
         K = int(self.num_goal_targets)
         if K < 2:
             return
+        # Force fleet_m criterion for data collection (cone_mutual_greedy_m has no data path)
         crit = str(getattr(self.args, "undetermined_v2_exchange_accept_criterion", "fleet_m"))
+        collector = getattr(self, "exchange_data_collector", None)
+        if collector is not None and crit == "cone_mutual_greedy_m":
+            crit = "fleet_m"
         if crit == "cone_mutual_greedy_m":
             self._undetermined_v2_exchange_cone_mutual_greedy_m()
             return
@@ -1371,24 +1387,25 @@ class EnvCore(object):
         used = set()
         n_swaps = 0
         swapped_pairs = set()
-        for _gain, i, j in candidates:
-            if i in used or j in used:
-                continue
-            ri, rj = self.robots[i], self.robots[j]
-            ti = int(ri.target_id) % K
-            tj = int(rj.target_id) % K
-            ri.target_id = tj
-            rj.target_id = ti
-            ri.undetermined_target_pending = False
-            rj.undetermined_target_pending = False
-            self.undetermined_v2_exchange_agent_mask[i] = True
-            self.undetermined_v2_exchange_agent_mask[j] = True
-            used.add(i)
-            used.add(j)
-            swapped_pairs.add((i, j))
-            n_swaps += 1
-            if n_swaps >= max_pairs:
-                break
+        if not data_only:
+            for _gain, i, j in candidates:
+                if i in used or j in used:
+                    continue
+                ri, rj = self.robots[i], self.robots[j]
+                ti = int(ri.target_id) % K
+                tj = int(rj.target_id) % K
+                ri.target_id = tj
+                rj.target_id = ti
+                ri.undetermined_target_pending = False
+                rj.undetermined_target_pending = False
+                self.undetermined_v2_exchange_agent_mask[i] = True
+                self.undetermined_v2_exchange_agent_mask[j] = True
+                used.add(i)
+                used.add(j)
+                swapped_pairs.add((i, j))
+                n_swaps += 1
+                if n_swaps >= max_pairs:
+                    break
 
         # Record data to collector
         collector = getattr(self, "exchange_data_collector", None)
@@ -1425,7 +1442,7 @@ class EnvCore(object):
             collector.flush_to_file(self._exchange_data_step_counter)
             self._exchange_data_step_counter += 1
 
-        if n_swaps > 0:
+        if n_swaps > 0 and not data_only:
             S_before = float(sum(cur_dist))
             new_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
             M_after = max(new_dist) if new_dist else 0.0
@@ -1438,9 +1455,8 @@ class EnvCore(object):
 
     def _undetermined_v2_exchange_neural(self):
         """
-        Neural exchange: uses trained ExchangeNetwork to predict swap decisions.
-        Preserves distance + pending filtering; uses mutual agreement (both pairs > 0.5).
-        Greedy selection of disjoint pairs sorted by swap probability.
+        Neural exchange: uses trained ExchangeNetwork to decide swaps.
+        Same candidate filtering as rule; executes swaps + reward shaping.
         """
         self.undetermined_v2_exchange_agent_mask.fill(False)
         self.undetermined_v2_exchange_step_M_gain = 0.0
@@ -1452,6 +1468,7 @@ class EnvCore(object):
         R_ex = float(self.undetermined_v2_exchange_radius)
         ignore_pending = bool(getattr(self.args, "undetermined_v2_exchange_ignore_pending", False))
         swap_threshold = float(getattr(self.args, "exchange_swap_threshold", 0.5))
+        max_pairs = max(1, int(getattr(self.args, "undetermined_v2_exchange_max_pairs_per_step", 1)))
 
         def dist_to_assigned_goal(idx: int) -> float:
             r = self.robots[idx]
@@ -1464,7 +1481,6 @@ class EnvCore(object):
         cur_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
         M_fleet = max(cur_dist) if cur_dist else 0.0
 
-        # Build candidate list
         candidate_pairs = []
         for i in range(self.robot_num):
             ri = self.robots[i]
@@ -1489,7 +1505,6 @@ class EnvCore(object):
         if not candidate_pairs:
             return
 
-        # Build features and predict swap probabilities
         from envs.utils.exchange_network import ExchangeNetwork
         features_list = []
         pair_index_map = {}
@@ -1501,7 +1516,6 @@ class EnvCore(object):
             gxi, gyi = self.goal_positions[ti]
             gxj, gyj = self.goal_positions[tj]
 
-            # Build 9-dim observation vector: gx-px, gy-py, v, theta, for_feature, vx_for, vy_for, px, py
             obs_i = np.array([
                 gxi - ri.px, gyi - ri.py, ri.v, ri.theta, 1.0,
                 ri.vx_formation, ri.vy_formation, ri.px, ri.py,
@@ -1521,14 +1535,12 @@ class EnvCore(object):
         features_np = np.stack(features_list, axis=0)
         probs = self.exchange_network.predict_swap_prob(features_np)
 
-        # Filter by threshold, build mutual agreement check
         swap_candidates = []
         for idx, prob in enumerate(probs):
             i, j = pair_index_map[idx]
             if prob >= swap_threshold:
                 swap_candidates.append((prob, i, j))
 
-        # Sort by probability descending, greedy disjoint selection
         swap_candidates.sort(key=lambda t: t[0], reverse=True)
         used = set()
         n_swaps = 0
@@ -1547,125 +1559,9 @@ class EnvCore(object):
             used.add(i)
             used.add(j)
             n_swaps += 1
-            # Allow only one pair per step by default (matching default max_pairs=1)
-            max_pairs = max(1, int(getattr(self.args, "undetermined_v2_exchange_max_pairs_per_step", 1)))
             if n_swaps >= max_pairs:
                 break
 
-        if n_swaps > 0:
-            S_before = float(sum(cur_dist))
-            new_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
-            M_after = max(new_dist) if new_dist else 0.0
-            S_after = float(sum(new_dist))
-            self.undetermined_v2_exchange_step_M_gain = float(M_fleet - M_after)
-            self.undetermined_v2_exchange_step_S_gain = float(S_before - S_after)
-            self._undetermined_sync_all_goals()
-            self._undetermined_auction_duplicate_targets()
-            self._compute_undetermined_hungarian_shaping()
-
-    def _undetermined_v2_exchange_heuristic(self):
-        """
-        Optional v2 mode: swap discrete targets for two nearby agents (within exchange radius) when a
-        criterion passes (see ``--undetermined_v2_exchange_accept_criterion``):
-
-        - fleet_m: fleet bottleneck M = max_k d(robot_k, goal[target_k]) drops by more than min_gain.
-        - pair_max: only the pair (i,j): max(d(i,goal_i),d(j,goal_j)) - max(d(i,goal_j),d(j,goal_i)) > min_gain.
-        - cone_mutual_greedy_m: velocity cones + strict mutual improvement; greedy disjoint swaps minimizing M.
-
-        Greedy disjoint pairs ordered by largest gain (fleet or pair, matching the criterion).
-        """
-        if not getattr(self, "undetermined_v2_exchange", False):
-            return
-        if self.goal_positions is None:
-            return
-        self.undetermined_v2_exchange_agent_mask.fill(False)
-        self.undetermined_v2_exchange_step_M_gain = 0.0
-        self.undetermined_v2_exchange_step_S_gain = 0.0
-        K = int(self.num_goal_targets)
-        if K < 2:
-            return
-        crit = str(getattr(self.args, "undetermined_v2_exchange_accept_criterion", "fleet_m"))
-        if crit == "cone_mutual_greedy_m":
-            self._undetermined_v2_exchange_cone_mutual_greedy_m()
-            return
-        R_ex = float(self.undetermined_v2_exchange_radius)
-        min_gain = float(getattr(self.args, "undetermined_v2_exchange_min_gain", 0.05))
-        max_pairs = max(1, int(getattr(self.args, "undetermined_v2_exchange_max_pairs_per_step", 1)))
-        ignore_pending = bool(getattr(self.args, "undetermined_v2_exchange_ignore_pending", False))
-
-        def dist_to_assigned_goal(idx: int) -> float:
-            r = self.robots[idx]
-            if r.collision or r.success:
-                return 0.0
-            tid = int(r.target_id) % K
-            gx, gy = self.goal_positions[tid]
-            return cal_distance(r.px, r.py, gx, gy)
-
-        cur_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
-        M_fleet = max(cur_dist) if cur_dist else 0.0
-
-        candidates = []
-        for i in range(self.robot_num):
-            ri = self.robots[i]
-            if ri.collision or ri.success:
-                continue
-            if not ignore_pending and bool(getattr(ri, "undetermined_target_pending", False)):
-                continue
-            for j in range(i + 1, self.robot_num):
-                rj = self.robots[j]
-                if rj.collision or rj.success:
-                    continue
-                if not ignore_pending and bool(getattr(rj, "undetermined_target_pending", False)):
-                    continue
-                if cal_distance(ri.px, ri.py, rj.px, rj.py) > R_ex + 1e-9:
-                    continue
-                ti = int(ri.target_id) % K
-                tj = int(rj.target_id) % K
-                if ti == tj:
-                    continue
-                gxi, gyi = self.goal_positions[ti]
-                gxj, gyj = self.goal_positions[tj]
-                d_i_after = cal_distance(ri.px, ri.py, gxj, gyj)
-                d_j_after = cal_distance(rj.px, rj.py, gxi, gyi)
-                others = 0.0
-                for k in range(self.robot_num):
-                    if k == i or k == j:
-                        continue
-                    others = max(others, cur_dist[k])
-                M_after = max(others, d_i_after, d_j_after)
-                gain_fleet = M_fleet - M_after
-                d1 = float(cur_dist[i])
-                d2 = float(cur_dist[j])
-                gain_pair = max(d1, d2) - max(d_i_after, d_j_after)
-                if crit == "pair_max":
-                    sort_gain = gain_pair
-                    accept = gain_pair > min_gain + 1e-9
-                else:
-                    sort_gain = gain_fleet
-                    accept = gain_fleet > min_gain + 1e-9
-                if accept:
-                    candidates.append((sort_gain, i, j))
-
-        candidates.sort(key=lambda t: t[0], reverse=True)
-        used = set()
-        n_swaps = 0
-        for _gain, i, j in candidates:
-            if i in used or j in used:
-                continue
-            ri, rj = self.robots[i], self.robots[j]
-            ti = int(ri.target_id) % K
-            tj = int(rj.target_id) % K
-            ri.target_id = tj
-            rj.target_id = ti
-            ri.undetermined_target_pending = False
-            rj.undetermined_target_pending = False
-            self.undetermined_v2_exchange_agent_mask[i] = True
-            self.undetermined_v2_exchange_agent_mask[j] = True
-            used.add(i)
-            used.add(j)
-            n_swaps += 1
-            if n_swaps >= max_pairs:
-                break
         if n_swaps > 0:
             S_before = float(sum(cur_dist))
             new_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]

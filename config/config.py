@@ -206,8 +206,8 @@ def get_config():
     parser.add_argument(
         "--exchange_train_interval",
         type=int,
-        default=500,
-        help="Train exchange network every N env steps.",
+        default=20000,
+        help="Train exchange network every N total env steps (default 20000: ~400 rounds over 8M steps).",
     )
     parser.add_argument(
         "--exchange_accuracy_threshold",
