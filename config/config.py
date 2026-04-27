@@ -190,6 +190,55 @@ def get_config():
         default=8.0,
         help="Same role as undetermined_v2_hungarian_team_divisor: scales exchange shaping / swap bonus.",
     )
+    # Exchange learning (behavior cloning to replace rule-based exchange)
+    parser.add_argument(
+        "--enable_exchange_learning",
+        action="store_true",
+        default=False,
+        help="Enable exchange learning: collect data from rule-based exchange, train a neural network to mimic it.",
+    )
+    parser.add_argument(
+        "--exchange_data_dir",
+        type=str,
+        default="./exchange_data",
+        help="Directory for exchange training data and model checkpoints.",
+    )
+    parser.add_argument(
+        "--exchange_train_interval",
+        type=int,
+        default=500,
+        help="Train exchange network every N env steps.",
+    )
+    parser.add_argument(
+        "--exchange_accuracy_threshold",
+        type=float,
+        default=0.90,
+        help="Validation accuracy threshold to switch from rule-based to neural exchange.",
+    )
+    parser.add_argument(
+        "--exchange_lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for exchange network training.",
+    )
+    parser.add_argument(
+        "--exchange_train_epochs",
+        type=int,
+        default=50,
+        help="Number of training epochs per exchange network training round.",
+    )
+    parser.add_argument(
+        "--enable_exchange_network",
+        action="store_true",
+        default=False,
+        help="Use trained exchange network instead of rule-based exchange. Requires exchange model in exchange_data_dir.",
+    )
+    parser.add_argument(
+        "--exchange_swap_threshold",
+        type=float,
+        default=0.5,
+        help="Probability threshold for neural exchange: swap if predicted prob >= threshold.",
+    )
     parser.add_argument(
         "--enable_undetermined_goal_v3",
         action="store_true",

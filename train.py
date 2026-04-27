@@ -457,6 +457,24 @@ def main(args):
     torch.cuda.manual_seed_all(all_args.seed*200)
     np.random.seed(all_args.seed*200)
 
+    # Exchange learning: create data collector that will be passed into envs
+    # Only rank 0 env collects data (SubprocVecEnv subprocesses can't share state)
+    if getattr(all_args, "enable_exchange_learning", False):
+        from envs.utils.exchange_network import ExchangeDataCollector
+        # Only create collector for single-thread or rank 0
+        if all_args.n_rollout_threads == 1:
+            all_args.exchange_data_collector = ExchangeDataCollector(
+                data_dir=str(getattr(all_args, "exchange_data_dir", "./exchange_data"))
+            )
+        else:
+            all_args.exchange_data_collector = None
+        print(
+            f"[train] exchange learning enabled: data_dir={all_args.exchange_data_dir}, "
+            f"train_interval={all_args.exchange_train_interval}, "
+            f"accuracy_threshold={all_args.exchange_accuracy_threshold}"
+            f"{' (rank 0 only, multi-thread)' if all_args.n_rollout_threads > 1 else ''}"
+        )
+
     # env init
     envs = make_train_env(all_args)
     eval_envs = make_eval_env(all_args) if all_args.use_eval else None

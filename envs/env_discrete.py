@@ -264,7 +264,15 @@ class DiscreteActionEnv(gym.Env):
 
         robot.px = robot.px + self.time_step * robot.v * np.cos(robot.theta)
         robot.py = robot.py + self.time_step * robot.v * np.sin(robot.theta)
-    
+
+    def set_exchange_network(self, network, device=None):
+        """Inject a trained ExchangeNetwork into the underlying env_core."""
+        self.env.exchange_network = network
+        if device is not None:
+            self.env.exchange_device = device
+        network.to(device if device else self.env.exchange_device)
+        network.eval()
+
     def render(self, mode='vedio', visualize = False):
         from matplotlib import animation
         import matplotlib.pyplot as plt

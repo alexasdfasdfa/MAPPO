@@ -500,8 +500,64 @@ class EnvRunner(Runner):
                 # eval
                 if episode % self.eval_interval == 0 and self.use_eval:
                     self.eval(total_num_steps)
+
+                # Train exchange network periodically
+                if getattr(self.all_args, "enable_exchange_learning", False):
+                    self._maybe_train_exchange_network(total_num_steps, episode)
         finally:
             self._close_reward_terms_log()
+            self._close_exchange_data_log()
+
+    def _maybe_train_exchange_network(self, total_num_steps, episode):
+        """Train exchange network every exchange_train_interval steps if enough data collected."""
+        interval = int(getattr(self.all_args, "exchange_train_interval", 500))
+        if total_num_steps % interval != 0:
+            return
+
+        data_dir = str(getattr(self.all_args, "exchange_data_dir", "./exchange_data"))
+        if not Path(data_dir).exists():
+            return
+
+        # Count available JSONL samples
+        jsonl_files = list(Path(data_dir).glob("step_*.jsonl"))
+        if not jsonl_files:
+            return
+
+        from envs.utils.exchange_network import train_exchange_network, ExchangeNetwork
+        model_save_path = str(Path(data_dir) / "exchange_net.pt")
+
+        result = train_exchange_network(
+            data_dir=data_dir,
+            model_save_path=model_save_path,
+            epochs=int(getattr(self.all_args, "exchange_train_epochs", 50)),
+            batch_size=256,
+            lr=float(getattr(self.all_args, "exchange_lr", 1e-3)),
+            device=self.device,
+            val_split=0.2,
+        )
+
+        print(
+            f"[exchange_train] step={total_num_steps} samples={result['num_samples']} "
+            f"best_val_acc={result['best_val_acc']:.4f} final_loss={result['final_loss']:.4f}"
+        )
+
+        # If accuracy threshold met, load network into env
+        threshold = float(getattr(self.all_args, "exchange_accuracy_threshold", 0.90))
+        if result["best_val_acc"] >= threshold and result["num_samples"] >= 32:
+            if hasattr(self.envs, "set_exchange_network"):
+                net = ExchangeNetwork()
+                net.load(model_save_path, self.device)
+                self.envs.set_exchange_network(net, self.device)
+                print(
+                    f"[exchange_train] accuracy {result['best_val_acc']:.4f} >= {threshold:.2f}, "
+                    f"switched to neural exchange at episode {episode}"
+                )
+
+    def _close_exchange_data_log(self):
+        """Flush any remaining exchange data on shutdown."""
+        collector = getattr(self.all_args, "exchange_data_collector", None)
+        if collector is not None and collector.sample_count > 0:
+            collector.flush_to_file(9999999)
 
     def warmup(self):
         # reset env

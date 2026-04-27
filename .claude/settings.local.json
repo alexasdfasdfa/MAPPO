@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile envs/utils/exchange_network.py)",
+      "Bash(python -m py_compile envs/env_core.py)",
+      "Bash(python -m py_compile envs/env_discrete.py)",
+      "Bash(python -m py_compile config/config.py)",
+      "Bash(python -m py_compile train.py)",
+      "Bash(python -m py_compile runner/shared/env_runner.py)"
+    ]
+  }
+}
