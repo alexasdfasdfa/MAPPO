@@ -420,6 +420,7 @@ def main(args):
     _asm = getattr(all_args, "agent_state_mode", "all")
     _dyn = bool(getattr(all_args, "enable_dynamic_goal_assignment", False))
     _und = bool(getattr(all_args, "enable_undetermined_goal", False))
+    _xchg = bool(getattr(all_args, "enable_undetermined_v2_exchange", False))
     _ir = bool(getattr(all_args, "randomize_robot_initial_positions", False))
     _notes = (
         f"agent_state_mode: {_asm}\n"
@@ -429,6 +430,7 @@ def main(args):
         f"initial_randomize: {_ir}\n"
         f"robot_initial_spawn_mode: {str(getattr(all_args, 'robot_initial_spawn_mode', 'random_box'))}\n"
         f"robot_init_cluster_radius_mode: {str(getattr(all_args, 'robot_init_cluster_radius_mode', 'comm'))}\n"
+        f"target_exchange_enabled: {_xchg}\n"
         f"undetermined_v2_exchange_accept_criterion: "
         f"{str(getattr(all_args, 'undetermined_v2_exchange_accept_criterion', 'fleet_m'))}\n"
         f"num_agents: {int(all_args.num_agents)}\n"
