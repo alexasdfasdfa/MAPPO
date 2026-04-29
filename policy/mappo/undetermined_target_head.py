@@ -217,3 +217,298 @@ class UndeterminedTargetHeadV3Attention(nn.Module):
         logits = attn_logits + delta
         logits = logits.masked_fill(invalid, -1e4)
         return logits
+
+
+class _CompatConsensusModule(nn.Module):
+    """Name-compatible block for undet_v3_target_latent_global_rank checkpoints."""
+
+    def __init__(self, *, p_max: int, d_h: int):
+        super().__init__()
+        self.p_max = int(p_max)
+        in_dim = 2 * int(p_max)
+        self.enc = nn.Sequential(
+            nn.Linear(in_dim, d_h),
+            nn.ReLU(),
+            nn.Linear(d_h, d_h),
+            nn.ReLU(),
+        )
+        self.dec = nn.Sequential(
+            nn.Linear(d_h, d_h),
+            nn.ReLU(),
+            nn.Linear(d_h, int(p_max) * 2),
+        )
+
+    def forward(self, neighbor_rel: torch.Tensor, neighbor_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # neighbor_rel: (B, n=1, P, 2)
+        B, n, P, _ = neighbor_rel.shape
+        flat = neighbor_rel.reshape(B, n, P * 2)
+        h = self.enc(flat)
+        pred = self.dec(h).reshape(B, n, P, 2)
+        return h, pred
+
+
+class UndeterminedTargetHeadV3GlobalRankCompat(nn.Module):
+    """
+    MAPPO v3 head aligned to undet_v3_target_latent_global_rank checkpoint names:
+    - consensus.*
+    - consensus_global_goal_head.*
+    - consensus_pred_goal_dist.*
+    - consensus_pred_hun_disp.*
+
+    This is a lightweight adapter over MAPPO robot_obs that preserves key structure
+    so pretrained selector tensors can be loaded directly.
+    """
+
+    def __init__(self, args, m_slots: int):
+        super().__init__()
+        self.m = max(1, int(m_slots))
+        self.d_h = int(getattr(args, "undet_v3_latent_d_h", 64))
+        self.p_max = int(getattr(args, "undet_v3_latent_p_max_neighbors", 12))
+        self.k_goals = self.m
+        self.geo_in_dim = self.d_h + 2
+        self.obs_goal_radius = float(getattr(args, "undetermined_obs_goal_radius", 5.0))
+
+        self.consensus = _CompatConsensusModule(p_max=self.p_max, d_h=self.d_h)
+        self.consensus_global_goal_head = nn.Linear(self.d_h, self.k_goals)
+        mid = max(int(getattr(args, "undet_v3_latent_geo_head_hidden", 128)), self.d_h)
+        self.consensus_pred_goal_dist = nn.Sequential(
+            nn.Linear(self.geo_in_dim, mid),
+            nn.ReLU(),
+            nn.Linear(mid, mid),
+            nn.ReLU(),
+            nn.Linear(mid, self.k_goals),
+        )
+        self.consensus_pred_hun_disp = nn.Sequential(
+            nn.Linear(self.geo_in_dim, mid),
+            nn.ReLU(),
+            nn.Linear(mid, mid),
+            nn.ReLU(),
+            nn.Linear(mid, 2),
+        )
+
+    def forward(self, robot_obs: torch.Tensor) -> torch.Tensor:
+        """
+        robot_obs layout (v3 hybrid): [7 + 5*M + 1 + (v3 prev idx=1) + comm_tail + px,py]
+        We build a single-agent proxy neighbor_rel from slot dx/dy to run consensus stack.
+        """
+        B = robot_obs.shape[0]
+        M = self.m
+        g = robot_obs[:, 7 : 7 + 5 * M].reshape(B, M, 5)
+        invalid = g[:, :, 4] < -0.05
+        rel = g[:, :, :2] * self.obs_goal_radius  # recover approximate metric dx,dy
+
+        # Build P-neighbor tensor expected by consensus: (B,1,P,2), pad/truncate to p_max.
+        if M >= self.p_max:
+            rel_p = rel[:, : self.p_max, :]
+            mask_p = (~invalid[:, : self.p_max]).float()
+        else:
+            pad = rel.new_zeros(B, self.p_max - M, 2)
+            rel_p = torch.cat([rel, pad], dim=1)
+            pad_m = invalid.new_zeros(B, self.p_max - M)
+            mask_p = (~torch.cat([invalid, pad_m], dim=1)).float()
+        neighbor_rel = rel_p.unsqueeze(1)
+        neighbor_mask = mask_p.unsqueeze(1)
+
+        h, _pred_rel = self.consensus(neighbor_rel, neighbor_mask)  # (B,1,d_h)
+        m = neighbor_mask.unsqueeze(-1)
+        mean_rel = (m * neighbor_rel).sum(dim=-2) / m.sum(dim=-2).clamp(min=1e-6)  # (B,1,2)
+        stem = torch.cat([h, mean_rel], dim=-1)  # (B,1,d_h+2)
+
+        # Primary logits from compat global head; geo head adds a mild ranking prior.
+        logits_head = self.consensus_global_goal_head(h).squeeze(1)  # (B,M)
+        pred_goal_dist = self.consensus_pred_goal_dist(stem).squeeze(1)  # (B,M)
+        logits = logits_head - pred_goal_dist
+        logits = logits.masked_fill(invalid, -1e4)
+        return logits
+
+    def extract_p1_consensus(self, robot_obs: torch.Tensor) -> torch.Tensor:
+        B = robot_obs.shape[0]
+        M = self.m
+        g = robot_obs[:, 7 : 7 + 5 * M].reshape(B, M, 5)
+        invalid = g[:, :, 4] < -0.05
+        rel = g[:, :, :2] * self.obs_goal_radius
+        if M >= self.p_max:
+            rel_p = rel[:, : self.p_max, :]
+            mask_p = (~invalid[:, : self.p_max]).float()
+        else:
+            pad = rel.new_zeros(B, self.p_max - M, 2)
+            rel_p = torch.cat([rel, pad], dim=1)
+            pad_m = invalid.new_zeros(B, self.p_max - M)
+            mask_p = (~torch.cat([invalid, pad_m], dim=1)).float()
+        neighbor_rel = rel_p.unsqueeze(1)
+        neighbor_mask = mask_p.unsqueeze(1)
+        h, _ = self.consensus(neighbor_rel, neighbor_mask)
+        return h.squeeze(1)
+
+
+class _CompatRecommenderGlobalStack(nn.Module):
+    """Name-compatible recommender block for decoupled-rank checkpoints."""
+
+    def __init__(self, *, d_h: int, e_key: int = 64, e_query: int = 64, pair_feat_dim: int = 6, geo_query_dim: int = 16):
+        super().__init__()
+        self.d_h = int(d_h)
+        self.geo_query_dim = max(4, int(geo_query_dim))
+        self.e_key = int(e_key)
+        self.e_query = int(e_query)
+        self.pair_fd = int(pair_feat_dim)
+        self.scale = float(e_key) ** -0.5
+        self.target_in = nn.Sequential(nn.Linear(self.pair_fd + d_h, e_key), nn.ReLU(), nn.Linear(e_key, e_key))
+        self.dist_stat_compress = nn.Linear(4, self.geo_query_dim)
+        q_in = 2 + self.d_h + 2 + self.geo_query_dim
+        self.self_in = nn.Sequential(nn.Linear(q_in, e_query), nn.ReLU(), nn.Linear(e_query, e_query))
+        self.q_align = nn.Linear(e_query, e_key) if e_query != e_key else nn.Identity()
+        self.to_xy = nn.Sequential(nn.Linear(e_key, 32), nn.ReLU(), nn.Linear(32, 2))
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        neighbor_rel: torch.Tensor,
+        neighbor_mask: torch.Tensor,
+        all_goal_feats: torch.Tensor,
+        goal_xy: torch.Tensor,
+        agent_xy: torch.Tensor,
+        pred_goal_dist: torch.Tensor,
+        pred_hun_disp: torch.Tensor,
+        *,
+        tau_logits: float = 0.35,
+    ) -> dict[str, torch.Tensor]:
+        B, n, K, fd = all_goal_feats.shape
+        if fd != self.pair_fd:
+            raise ValueError(f"all_goal_feats last dim {fd} != expected {self.pair_fd}")
+
+        hb = h.unsqueeze(2).expand(B, n, K, -1)
+        pairs = torch.cat([all_goal_feats, hb], dim=-1)
+        e = self.target_in(pairs.reshape(B * n * K, -1)).reshape(B, n, K, -1)
+
+        m = neighbor_mask.unsqueeze(-1)
+        self_geo = (m * neighbor_rel).sum(dim=-2) / m.sum(dim=-2).clamp(min=1e-6)
+        d_mean = pred_goal_dist.mean(dim=-1, keepdim=True)
+        d_std = pred_goal_dist.std(dim=-1, keepdim=True).clamp_min(1e-6)
+        d_min = pred_goal_dist.min(dim=-1, keepdim=True).values
+        d_max = pred_goal_dist.max(dim=-1, keepdim=True).values
+        d_stat = torch.cat([d_mean, d_std, d_min, d_max], dim=-1)
+        d_q = torch.tanh(self.dist_stat_compress(d_stat))
+
+        qv = self.self_in(torch.cat([self_geo, h, pred_hun_disp, d_q], dim=-1))
+        q = self.q_align(qv).unsqueeze(2)
+        logits = (e * q).sum(dim=-1) * self.scale
+
+        t = max(float(tau_logits), 1e-6)
+        p = torch.softmax(logits / t, dim=-1)
+        g3 = goal_xy[:, None, :, :].expand(B, n, K, 2)
+        y_soft = (p.unsqueeze(-1) * g3).sum(dim=-2)
+        xy_hat = self.to_xy(e.reshape(B * n * K, -1)).reshape(B, n, K, 2)
+        return {"logits": logits, "e_key": e, "p": p, "y_soft": y_soft, "per_goal_xy_hat": xy_hat}
+
+
+class UndeterminedTargetHeadV3DecoupledRankCompat(nn.Module):
+    """
+    MAPPO v3 head aligned to undet_v3_target_latent_decoupled_rank checkpoint names:
+    - consensus.*
+    - consensus_pred_goal_dist_pair.*
+    - consensus_pred_hun_disp.*
+    - recommender.*
+    """
+
+    def __init__(self, args, m_slots: int):
+        super().__init__()
+        self.m = max(1, int(m_slots))
+        self.d_h = int(getattr(args, "undet_v3_latent_d_h", 64))
+        self.p_max = int(getattr(args, "undet_v3_latent_p_max_neighbors", 12))
+        self.k_goals = self.m
+        self.obs_goal_radius = float(getattr(args, "undetermined_obs_goal_radius", 5.0))
+        self.pair_feat_dim = 6
+        self.geo_in_dim = self.d_h + 2
+
+        self.consensus = _CompatConsensusModule(p_max=self.p_max, d_h=self.d_h)
+        mid = max(int(getattr(args, "undet_v3_latent_geo_head_hidden", 128)), self.d_h)
+        self.consensus_pred_goal_dist_pair = nn.Sequential(
+            nn.Linear(self.geo_in_dim + self.pair_feat_dim, mid),
+            nn.ReLU(),
+            nn.Linear(mid, mid),
+            nn.ReLU(),
+            nn.Linear(mid, 1),
+        )
+        self.consensus_pred_hun_disp = nn.Sequential(
+            nn.Linear(self.geo_in_dim, mid),
+            nn.ReLU(),
+            nn.Linear(mid, mid),
+            nn.ReLU(),
+            nn.Linear(mid, 2),
+        )
+        self.recommender = _CompatRecommenderGlobalStack(
+            d_h=self.d_h,
+            e_key=int(getattr(args, "undet_v3_decoupled_e_key", 64)),
+            e_query=int(getattr(args, "undet_v3_decoupled_e_query", 64)),
+            pair_feat_dim=self.pair_feat_dim,
+            geo_query_dim=int(getattr(args, "undet_v3_decoupled_geo_query_dim", 16)),
+        )
+        self.tau_logits = float(getattr(args, "undet_v3_decoupled_tau_logits", 0.35))
+
+    def forward(self, robot_obs: torch.Tensor) -> torch.Tensor:
+        B = robot_obs.shape[0]
+        M = self.m
+        g = robot_obs[:, 7 : 7 + 5 * M].reshape(B, M, 5)
+        invalid = g[:, :, 4] < -0.05
+        rel = g[:, :, :2] * self.obs_goal_radius
+
+        if M >= self.p_max:
+            rel_p = rel[:, : self.p_max, :]
+            mask_p = (~invalid[:, : self.p_max]).float()
+        else:
+            pad = rel.new_zeros(B, self.p_max - M, 2)
+            rel_p = torch.cat([rel, pad], dim=1)
+            pad_m = invalid.new_zeros(B, self.p_max - M)
+            mask_p = (~torch.cat([invalid, pad_m], dim=1)).float()
+
+        neighbor_rel = rel_p.unsqueeze(1)
+        neighbor_mask = mask_p.unsqueeze(1)
+        h, _ = self.consensus(neighbor_rel, neighbor_mask)
+        m = neighbor_mask.unsqueeze(-1)
+        mean_rel = (m * neighbor_rel).sum(dim=-2) / m.sum(dim=-2).clamp(min=1e-6)
+        stem = torch.cat([h, mean_rel], dim=-1)
+
+        raw_dx = rel[:, :, 0]
+        raw_dy = rel[:, :, 1]
+        dist = torch.sqrt(raw_dx.pow(2) + raw_dy.pow(2) + 1e-8)
+        pair = torch.stack([raw_dx, raw_dy, g[:, :, 2], g[:, :, 3], g[:, :, 4], dist], dim=-1).unsqueeze(1)
+        stem_b = stem.unsqueeze(2).expand(B, 1, M, self.geo_in_dim)
+        pair_geo = torch.cat([stem_b, pair], dim=-1)
+        pred_goal_dist = self.consensus_pred_goal_dist_pair(pair_geo.reshape(B * M, -1)).reshape(B, 1, M)
+        pred_hun_disp = self.consensus_pred_hun_disp(stem)
+
+        goal_xy = rel
+        agent_xy = robot_obs[:, -2:].unsqueeze(1)
+        out = self.recommender(
+            h,
+            neighbor_rel,
+            neighbor_mask,
+            pair,
+            goal_xy,
+            agent_xy,
+            pred_goal_dist,
+            pred_hun_disp,
+            tau_logits=self.tau_logits,
+        )
+        logits = out["logits"].squeeze(1)
+        logits = logits.masked_fill(invalid, -1e4)
+        return logits
+
+    def extract_p1_consensus(self, robot_obs: torch.Tensor) -> torch.Tensor:
+        B = robot_obs.shape[0]
+        M = self.m
+        g = robot_obs[:, 7 : 7 + 5 * M].reshape(B, M, 5)
+        invalid = g[:, :, 4] < -0.05
+        rel = g[:, :, :2] * self.obs_goal_radius
+        if M >= self.p_max:
+            rel_p = rel[:, : self.p_max, :]
+            mask_p = (~invalid[:, : self.p_max]).float()
+        else:
+            pad = rel.new_zeros(B, self.p_max - M, 2)
+            rel_p = torch.cat([rel, pad], dim=1)
+            pad_m = invalid.new_zeros(B, self.p_max - M)
+            mask_p = (~torch.cat([invalid, pad_m], dim=1)).float()
+        neighbor_rel = rel_p.unsqueeze(1)
+        neighbor_mask = mask_p.unsqueeze(1)
+        h, _ = self.consensus(neighbor_rel, neighbor_mask)
+        return h.squeeze(1)

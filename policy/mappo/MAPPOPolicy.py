@@ -7,19 +7,24 @@ from policy.utils.util import update_linear_schedule
 from policy.utils.util import get_shape_from_obs_space, compute_joint_share_obs_flat_dim
 
 
-def _undet_v2_motion_only_freeze_head(args) -> bool:
-    lat = getattr(args, "undet_v2_target_latent_model_dir", None)
-    if not lat or not str(lat).strip():
-        return False
-    if str(getattr(args, "undet_v2_latent_train_mode", "finetune_all")) != "motion_only":
-        return False
-    if not getattr(args, "enable_undetermined_goal_v2", False) and not getattr(
-        args, "enable_undetermined_goal_v3", False
-    ):
-        return False
-    if getattr(args, "use_attn_comm_actor", False):
-        return False
-    return True
+def _undet_motion_only_freeze_head(args) -> bool:
+    lat_v2 = getattr(args, "undet_v2_target_latent_model_dir", None)
+    lat_v3 = getattr(args, "undet_v3_target_latent_model_dir", None)
+    if lat_v2 and str(lat_v2).strip():
+        if str(getattr(args, "undet_v2_latent_train_mode", "finetune_all")) != "motion_only":
+            return False
+        if not getattr(args, "enable_undetermined_goal_v2", False):
+            return False
+        if getattr(args, "use_attn_comm_actor", False):
+            return False
+        return True
+    if lat_v3 and str(lat_v3).strip():
+        if str(getattr(args, "undet_v3_latent_train_mode", "finetune_all")) != "motion_only":
+            return False
+        if not getattr(args, "enable_undetermined_goal_v3", False):
+            return False
+        return True
+    return False
 
 
 def _cons_mac_ce_param_filter(name: str) -> bool:
@@ -75,7 +80,7 @@ class RMAPPOPolicy:
 
         ce_params = []
         pe_params = []
-        _freeze_uh = _undet_v2_motion_only_freeze_head(args)
+        _freeze_uh = _undet_motion_only_freeze_head(args)
         for name, p in self.actor.named_parameters():
             if not p.requires_grad:
                 continue
@@ -89,7 +94,7 @@ class RMAPPOPolicy:
 
         if _freeze_uh:
             print(
-                "[RMAPPOPolicy] undet_v2_latent_train_mode=motion_only: undetermined_head params frozen "
+                "[RMAPPOPolicy] undetermined latent train_mode=motion_only: undetermined_head params frozen "
                 "(not in actor optimizer)."
             )
 
@@ -293,3 +298,11 @@ class RMAPPOPolicy:
         scale = float(max(K - 1, 1))
         tid = (k_norm * scale).round().long().clamp(0, K - 1)
         return tid
+
+    @torch.no_grad()
+    def get_v3_exchange_choices(self, robot_obs, deterministic=False):
+        logits = self.actor.get_v3_exchange_logits(robot_obs)
+        if deterministic:
+            return torch.argmax(logits, dim=-1)
+        dist = torch.distributions.Categorical(logits=logits)
+        return dist.sample()

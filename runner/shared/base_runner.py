@@ -4,6 +4,7 @@ import torch
 from tensorboardX import SummaryWriter
 from policy.utils.shared_buffer import SharedReplayBuffer
 from policy.mappo.undet_v2_latent_ckpt import apply_undet_v2_target_latent_heads
+from policy.mappo.undet_v3_latent_ckpt import apply_undet_v3_target_latent_heads
 from runner.checkpoint_paths import (
     resolve_shared_actor_checkpoint_path,
     resolve_shared_critic_checkpoint_path,
@@ -81,6 +82,7 @@ class Runner(object):
             self.restore()
 
         apply_undet_v2_target_latent_heads(self.all_args, [self.policy.actor], self.device)
+        apply_undet_v3_target_latent_heads(self.all_args, [self.policy.actor], self.device)
 
         # algorithm
         self.trainer = TrainAlgo(self.all_args, self.policy, device = self.device)

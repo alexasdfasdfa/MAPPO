@@ -217,6 +217,9 @@ class DiscreteActionEnv(gym.Env):
                 r.undet_prev_tid_norm = float(int(r.target_id) % K) / den
         return self.env.refresh_observations_after_target_change()
 
+    def set_v3_exchange_choices(self, choices):
+        self.env.set_v3_exchange_choices(choices)
+
     def reset(self):
         obs = self.env.reset()
         return obs

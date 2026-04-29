@@ -78,6 +78,19 @@ def parser_args(args, parser):
         help="number of players (training overrides this to match --train_font_pattern_length)",
     )
     parser.add_argument("--random_act_prob", type=int, default=0, help="the probability of robot to choice random action")
+    parser.add_argument(
+        "--undet_v3_target_latent_model_dir",
+        type=str,
+        default="",
+        help="Optional pretrained selector checkpoint for undetermined v3 head loading.",
+    )
+    parser.add_argument(
+        "--undet_v3_latent_train_mode",
+        type=str,
+        default="finetune_all",
+        choices=["motion_only", "finetune_all"],
+        help="When using undet_v3_target_latent_model_dir: freeze selector head (motion_only) or finetune all.",
+    )
 
     all_args = parser.parse_known_args(args)[0]
     apply_architecture_mode_preset(all_args)
@@ -90,12 +103,8 @@ def parser_args(args, parser):
             "--architecture_mode attn_undetermined_goal requires --use_attn_comm_actor (ConsMAC-style comm encoder)."
         )
 
-    # Match swarm size to font-pattern length bucket (config --train_font_pattern_length).
-    _pat_len = int(getattr(all_args, "train_font_pattern_length", 10))
-    _prev_n = int(all_args.num_agents)
-    if _prev_n != _pat_len:
-        print(f"[train] num_agents {_prev_n} -> {_pat_len} (aligned to train_font_pattern_length)")
-    all_args.num_agents = _pat_len
+    # Keep explicit num_agents unless a latent checkpoint requires fixed agent count.
+    all_args.num_agents = int(getattr(all_args, "num_agents", 10))
 
     if getattr(all_args, "enable_undetermined_goal_v2", False) and not getattr(
         all_args, "enable_undetermined_goal", False
@@ -116,6 +125,7 @@ def parser_args(args, parser):
             raise ValueError("--enable_undetermined_v2_exchange is incompatible with --enable_undetermined_goal_v3")
 
     _lat_dir = getattr(all_args, "undet_v2_target_latent_model_dir", None)
+    _lat_v3_dir = getattr(all_args, "undet_v3_target_latent_model_dir", None)
     _pair_arch = str(getattr(all_args, "undet_v2_head_arch", "dot_product")) == "pair_mlp"
     if _pair_arch and getattr(all_args, "use_attn_comm_actor", False):
         raise ValueError("--undet_v2_head_arch pair_mlp is incompatible with --use_attn_comm_actor (pure v2 obs only).")
@@ -139,6 +149,41 @@ def parser_args(args, parser):
             raise ValueError(
                 "--undet_v2_latent_train_mode motion_only requires --undet_v2_target_latent_model_dir "
                 "(pretrained head path)"
+            )
+    if _lat_v3_dir and str(_lat_v3_dir).strip():
+        _lat_v3_s = str(_lat_v3_dir)
+        _head_arch = str(getattr(all_args, "undet_v3_head_arch", "global_rank_compat"))
+        if ("decoupled_rank" in _lat_v3_s or "decoupled_equal" in _lat_v3_s) and _head_arch == "global_rank_compat":
+            setattr(all_args, "undet_v3_head_arch", "decoupled_rank_compat")
+            print("[train] auto-set undet_v3_head_arch=decoupled_rank_compat from latent checkpoint path")
+        # Optional force-align for legacy runs; default keeps MAPPO #agents free to vary.
+        _ckpt_agents = int(getattr(all_args, "undet_v3_latent_dataset_num_agents", 10))
+        if bool(getattr(all_args, "undet_v3_latent_force_dataset_num_agents", False)):
+            if int(all_args.num_agents) != _ckpt_agents:
+                print(
+                    f"[train] num_agents {int(all_args.num_agents)} -> {_ckpt_agents} "
+                    f"(forced by --undet_v3_latent_force_dataset_num_agents)"
+                )
+                all_args.num_agents = _ckpt_agents
+        else:
+            print(
+                f"[train] keep num_agents={int(all_args.num_agents)} "
+                f"(v3 latent dataset_num_agents={_ckpt_agents}, no force)"
+            )
+        if not getattr(all_args, "enable_undetermined_goal", False):
+            raise ValueError("--undet_v3_target_latent_model_dir requires --enable_undetermined_goal")
+        if not getattr(all_args, "enable_undetermined_goal_v3", False):
+            raise ValueError("--undet_v3_target_latent_model_dir requires --enable_undetermined_goal_v3")
+        if not getattr(all_args, "use_attn_comm_actor", False):
+            raise ValueError("--undet_v3_target_latent_model_dir requires --use_attn_comm_actor")
+        if str(getattr(all_args, "architecture_mode", "default")) != "attn_undetermined_goal":
+            raise ValueError(
+                "--undet_v3_target_latent_model_dir requires --architecture_mode attn_undetermined_goal"
+            )
+        _tm3 = str(getattr(all_args, "undet_v3_latent_train_mode", "finetune_all"))
+        if _tm3 == "motion_only" and (not _lat_v3_dir or not str(_lat_v3_dir).strip()):
+            raise ValueError(
+                "--undet_v3_latent_train_mode motion_only requires --undet_v3_target_latent_model_dir"
             )
 
     if getattr(all_args, "enable_undetermined_goal", False):
@@ -254,12 +299,20 @@ def parser_args(args, parser):
             or getattr(all_args, "enable_undetermined_goal_v3", False)
         ):
             m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
-            all_args.robot_obs_dim = compute_undetermined_v2_attn_hybrid_robot_obs_dim(
-                m,
-                int(all_args.attn_comm_ally_slots),
-                int(all_args.attn_comm_human_slots),
-                int(getattr(all_args, "attn_comm_message_dim", 16)),
-            )
+            if getattr(all_args, "enable_undetermined_goal_v3", False):
+                all_args.robot_obs_dim = compute_undetermined_v3_robot_obs_dim(
+                    m,
+                    int(all_args.attn_comm_ally_slots),
+                    int(all_args.attn_comm_human_slots),
+                    int(getattr(all_args, "attn_comm_message_dim", 16)),
+                )
+            else:
+                all_args.robot_obs_dim = compute_undetermined_v2_attn_hybrid_robot_obs_dim(
+                    m,
+                    int(all_args.attn_comm_ally_slots),
+                    int(all_args.attn_comm_human_slots),
+                    int(getattr(all_args, "attn_comm_message_dim", 16)),
+                )
             _tl = compute_attn_comm_tail_dim(
                 int(all_args.attn_comm_ally_slots),
                 int(all_args.attn_comm_human_slots),
@@ -445,6 +498,10 @@ def main(args):
         _notes += f"undet_v2_target_latent_model_dir: {_lat_note}\n"
         _notes += f"undet_v2_latent_train_mode: {getattr(all_args, 'undet_v2_latent_train_mode', 'finetune_all')}\n"
         _notes += f"undet_v2_target_head_aux_coef: {float(getattr(all_args, 'undet_v2_target_head_aux_coef', 0.0))}\n"
+    _lat_v3_note = getattr(all_args, "undet_v3_target_latent_model_dir", None)
+    if _lat_v3_note and str(_lat_v3_note).strip():
+        _notes += f"undet_v3_target_latent_model_dir: {_lat_v3_note}\n"
+        _notes += f"undet_v3_latent_train_mode: {getattr(all_args, 'undet_v3_latent_train_mode', 'finetune_all')}\n"
     _notes += f"num_mini_batch: {int(all_args.num_mini_batch)}\n"
     with open(_notes_path, "w", encoding="utf-8") as _nf:
         _nf.write(_notes)

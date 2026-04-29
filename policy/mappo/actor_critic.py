@@ -15,6 +15,8 @@ from policy.mappo.undetermined_target_head import (
     UndeterminedTargetHeadV2,
     UndeterminedTargetHeadV2PairMLP,
     UndeterminedTargetHeadV3Attention,
+    UndeterminedTargetHeadV3DecoupledRankCompat,
+    UndeterminedTargetHeadV3GlobalRankCompat,
 )
 from policy.utils.util import get_shape_from_obs_space
 from policy.mappo.utils.util import transform
@@ -63,12 +65,19 @@ class R_Actor(nn.Module):
         self.enable_undetermined_v2 = bool(
             getattr(args, "enable_undetermined_goal_v2", False) or self.enable_undetermined_v3
         )
+        self.undetermined_m_slots = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
         if self.enable_undetermined_goal:
             if self.enable_undetermined_v2:
                 m = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
                 _arch = str(getattr(args, "undet_v2_head_arch", "dot_product"))
                 if self.enable_undetermined_v3:
-                    self.undetermined_head = UndeterminedTargetHeadV3Attention(args, m_slots=m)
+                    _v3_arch = str(getattr(args, "undet_v3_head_arch", "global_rank_compat"))
+                    if _v3_arch == "attention":
+                        self.undetermined_head = UndeterminedTargetHeadV3Attention(args, m_slots=m)
+                    elif _v3_arch == "decoupled_rank_compat":
+                        self.undetermined_head = UndeterminedTargetHeadV3DecoupledRankCompat(args, m_slots=m)
+                    else:
+                        self.undetermined_head = UndeterminedTargetHeadV3GlobalRankCompat(args, m_slots=m)
                 elif _arch == "pair_mlp":
                     self.undetermined_head = UndeterminedTargetHeadV2PairMLP(args, m_slots=m)
                 else:
@@ -77,6 +86,18 @@ class R_Actor(nn.Module):
                 self.undetermined_head = UndeterminedTargetHead(args, k_ag)
         else:
             self.undetermined_head = None
+        self.v3_p1_to_msg = None
+        self.v3_swap_head = None
+        self.v3_swap_p = max(1, int(getattr(args, "undetermined_v3_exchange_max_neighbors", 10)))
+        if self.use_attn_comm and self.enable_undetermined_v3 and self.undetermined_head is not None:
+            if hasattr(self.undetermined_head, "extract_p1_consensus"):
+                d_h = int(getattr(args, "undet_v3_latent_d_h", 64))
+                self.v3_p1_to_msg = nn.Linear(d_h, int(getattr(args, "attn_comm_message_dim", 16)))
+                self.v3_swap_head = nn.Sequential(
+                    nn.Linear(d_h, d_h),
+                    nn.ReLU(),
+                    nn.Linear(d_h, self.v3_swap_p + 1),
+                )
         self.slot_m_for_actor = min(
             max(int(getattr(args, "dynamic_target_slot_count", 1)), 1),
             k_ag,
@@ -179,6 +200,10 @@ class R_Actor(nn.Module):
             actor_features, comm_out, broadcast_msg, _, _, _ = self.attn_comm_encoder(
                 robot_obs, comm_rnn_states, masks
             )
+            if self.v3_p1_to_msg is not None:
+                with torch.no_grad():
+                    p1_h = self.undetermined_head.extract_p1_consensus(robot_obs)
+                broadcast_msg = torch.tanh(self.v3_p1_to_msg(p1_h))
         elif self.neighbor_branch is not None:
             ego = torch.cat(
                 (
@@ -306,6 +331,28 @@ class R_Actor(nn.Module):
         robot_obs = check(robot_obs).to(**self.tpdv)
         robot_obs = robot_obs[:, : self.robot_obs_shape]
         return self.undetermined_head(robot_obs)
+
+    def get_v3_exchange_logits(self, robot_obs):
+        if self.v3_swap_head is None or self.undetermined_head is None:
+            raise RuntimeError("get_v3_exchange_logits requires undetermined v3 with p1 consensus head")
+        ro = check(robot_obs).to(**self.tpdv)
+        ro = ro[:, : self.robot_obs_shape]
+        with torch.no_grad():
+            p1_h = self.undetermined_head.extract_p1_consensus(ro)
+        logits = self.v3_swap_head(p1_h)
+        # mask invalid neighbor slots from attn ally geometry tail (6 features per slot).
+        m = 1 if self.enable_undetermined_v3 else 0
+        m_slots = int(self.undetermined_m_slots)
+        core = 7 + 5 * m_slots + 1 + m
+        p = self.v3_swap_p
+        start = core
+        end = start + 6 * p
+        if ro.shape[1] >= end:
+            ally = ro[:, start:end].reshape(ro.shape[0], p, 6)
+            valid = ally[:, :, 2] > 1e-6
+            invalid = ~valid
+            logits[:, 1 : 1 + p] = logits[:, 1 : 1 + p].masked_fill(invalid, -1e4)
+        return logits
 
 
 class R_Critic(nn.Module):

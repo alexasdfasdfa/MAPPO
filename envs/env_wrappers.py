@@ -179,6 +179,9 @@ def worker(remote, parent_remote, env_fn_wrapper):
         elif cmd == 'apply_undetermined_targets':
             ob = env.apply_undetermined_targets(data)
             remote.send(ob)
+        elif cmd == 'set_v3_exchange_choices':
+            env.set_v3_exchange_choices(data)
+            remote.send(None)
         else:
             raise NotImplementedError
 
@@ -254,6 +257,13 @@ class SubprocVecEnv(ShareVecEnv):   #多线程环境，一般用于训练
         obs = [remote.recv() for remote in self.remotes]
         return np.stack(obs)
 
+    def set_v3_exchange_choices(self, choices):
+        c = np.asarray(choices, dtype=np.int64)
+        for remote, row in zip(self.remotes, c):
+            remote.send(('set_v3_exchange_choices', row))
+        for remote in self.remotes:
+            remote.recv()
+
 class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测试
     def __init__(self, env_fns, args):
         self.envs = [fn() for fn in env_fns]
@@ -314,6 +324,14 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
             return np.array([obs])
         obs_list = [self.envs[i].apply_undetermined_targets(t[i]) for i in range(len(self.envs))]
         return np.stack(obs_list)
+
+    def set_v3_exchange_choices(self, choices):
+        c = np.asarray(choices, dtype=np.int64)
+        if c.ndim == 1:
+            self.envs[0].set_v3_exchange_choices(c)
+            return
+        for i, env in enumerate(self.envs):
+            env.set_v3_exchange_choices(c[i])
 
     def render(self, mode="vedio", visualize=False):
         episode_success = self.envs[0].render(mode=mode,visualize=visualize)

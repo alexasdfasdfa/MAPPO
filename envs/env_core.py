@@ -2,6 +2,7 @@ import logging
 import math
 import numpy as np
 import rvo2
+from functools import lru_cache
 from numpy.linalg import norm
 from envs.utils.human import Human
 from envs.utils.info import *
@@ -231,6 +232,17 @@ class EnvCore(object):
         self.undetermined_v2_exchange_step_M_gain = 0.0
         self.undetermined_v2_exchange_step_S_gain = 0.0
         self.undetermined_v2_exchange_agent_mask = np.zeros(self.robot_num, dtype=np.bool_)
+        self.undetermined_v3_exchange = bool(getattr(args, "enable_undetermined_v3_exchange", False))
+        self.undetermined_v3_exchange_max_neighbors = max(
+            1, int(getattr(args, "undetermined_v3_exchange_max_neighbors", 10))
+        )
+        self.undetermined_v3_exchange_require_m_gain = bool(
+            getattr(args, "undetermined_v3_exchange_require_m_gain", True)
+        )
+        self.undetermined_v3_exchange_min_m_gain = float(
+            getattr(args, "undetermined_v3_exchange_min_m_gain", 0.0)
+        )
+        self.v3_exchange_choice = np.zeros(self.robot_num, dtype=np.int64)
         self.dynamic_goal_assignment = bool(getattr(args, "enable_dynamic_goal_assignment", False))
         if self.undetermined_goal_assignment:
             self.dynamic_goal_assignment = False
@@ -287,6 +299,7 @@ class EnvCore(object):
         self.dynamic_episode_had_collision = False
         self.dynamic_team_dist_sum_prev = None
         self.dynamic_team_dist_sum_this_step = 0.0
+        self.undetermined_v3_table_conflict_resolved = False
 
     def _select_font_pattern_targets(self):
         """Delegate to module-level selector (shared with render.py)."""
@@ -665,6 +678,81 @@ class EnvCore(object):
         if not ds:
             return 0.0, 0.0
         return float(max(ds)), float(sum(ds))
+
+    def set_v3_exchange_choices(self, choices) -> None:
+        c = np.asarray(choices, dtype=np.int64).reshape(-1)
+        if c.shape[0] != self.robot_num:
+            return
+        self.v3_exchange_choice = c.copy()
+
+    def _undetermined_v3_exchange_mutual_select(self) -> None:
+        if not bool(getattr(self, "undetermined_goal_v3", False)):
+            return
+        if not bool(getattr(self, "undetermined_v3_exchange", False)):
+            return
+        if self.goal_positions is None:
+            return
+        K = int(self.num_goal_targets)
+        if K < 2:
+            return
+        Rc = float(self.undetermined_comm_radius)
+        pmax = int(self.undetermined_v3_exchange_max_neighbors)
+        choices = np.asarray(getattr(self, "v3_exchange_choice", np.zeros(self.robot_num)), dtype=np.int64)
+        if choices.shape[0] != self.robot_num:
+            choices = np.zeros(self.robot_num, dtype=np.int64)
+
+        tids0 = [int(r.target_id) % K for r in self.robots]
+        M0, _S0 = self._fleet_M_S_for_tids(tids0)
+        desired = {}
+        for i, ri in enumerate(self.robots):
+            if ri.collision or ri.success:
+                continue
+            c = int(choices[i])
+            if c <= 0:
+                continue
+            nbr = []
+            for j, rj in enumerate(self.robots):
+                if i == j or rj.collision or rj.success:
+                    continue
+                d = cal_distance(ri.px, ri.py, rj.px, rj.py)
+                if d <= Rc + 1e-9:
+                    nbr.append((d, j))
+            nbr.sort(key=lambda x: x[0])
+            if len(nbr) > pmax:
+                nbr = nbr[:pmax]
+            if c > len(nbr):
+                continue
+            desired[i] = int(nbr[c - 1][1])
+
+        used = set()
+        changed = False
+        for i in sorted(desired.keys()):
+            if i in used:
+                continue
+            j = int(desired[i])
+            if j in used:
+                continue
+            if desired.get(j, -1) != i:
+                continue
+            ti = int(self.robots[i].target_id) % K
+            tj = int(self.robots[j].target_id) % K
+            if ti == tj:
+                continue
+            t2 = list(tids0)
+            t2[i], t2[j] = t2[j], t2[i]
+            M1, _S1 = self._fleet_M_S_for_tids(t2)
+            if self.undetermined_v3_exchange_require_m_gain:
+                if (M0 - M1) < (self.undetermined_v3_exchange_min_m_gain - 1e-9):
+                    continue
+            self.robots[i].target_id = tj
+            self.robots[j].target_id = ti
+            self.robots[i].undetermined_target_pending = False
+            self.robots[j].undetermined_target_pending = False
+            used.add(i)
+            used.add(j)
+            changed = True
+        if changed:
+            self._undetermined_sync_all_goals()
 
     def _undetermined_v2_exchange_cone_mutual_greedy_m(self) -> None:
         """
@@ -1162,6 +1250,166 @@ class EnvCore(object):
             for lose in sorted(idxs)[1:]:
                 self.robots[lose].undetermined_target_pending = True
 
+    def _undetermined_v3_global_dedup_once_solve(self):
+        """
+        v3 dedup under a homogeneous full-table snapshot:
+        - Only conflict agents (duplicate target_id) are re-assigned.
+        - Solve conflicts once with deterministic global matching.
+        - Agent qualification uses each agent's initial position to ensure stable ordering.
+        """
+        if not bool(getattr(self, "undetermined_goal_v3", False)):
+            return
+        if not bool(getattr(self.args, "undetermined_v3_global_dedup_enable", True)):
+            return
+
+        K = int(self.num_goal_targets)
+        active = []
+        for i, ri in enumerate(self.robots):
+            if ri.collision or ri.success:
+                continue
+            active.append(i)
+        if len(active) <= 1:
+            return
+
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        for i in active:
+            tid = int(self.robots[i].target_id) % K
+            groups[tid].append(i)
+
+        conflict_agents = sorted([i for _tid, idxs in groups.items() if len(idxs) > 1 for i in idxs])
+        if len(conflict_agents) <= 1:
+            return
+
+        conflict_set = set(conflict_agents)
+        locked_targets = set()
+        for i in active:
+            if i in conflict_set:
+                continue
+            locked_targets.add(int(self.robots[i].target_id) % K)
+
+        duplicated_targets = sorted([tid for tid, idxs in groups.items() if len(idxs) > 1])
+        if bool(getattr(self.args, "undetermined_v3_global_dedup_allow_unclaimed_only", True)):
+            candidate_targets = sorted(set(duplicated_targets + [k for k in range(K) if k not in locked_targets]))
+        else:
+            candidate_targets = list(range(K))
+
+        if len(candidate_targets) < len(conflict_agents):
+            # Should be rare; keep deterministic fallback.
+            candidate_targets = list(range(K))
+
+        n = len(conflict_agents)
+        m = len(candidate_targets)
+        if m < n:
+            # Not enough columns for injective assignment; keep legacy pending behavior.
+            self._undetermined_auction_duplicate_targets()
+            return
+
+        score = np.zeros((n, m), dtype=np.float64)
+        for a_idx, ridx in enumerate(conflict_agents):
+            r = self.robots[ridx]
+            ix = float(r.undetermined_init_px) if r.undetermined_init_px is not None else float(r.px)
+            iy = float(r.undetermined_init_py) if r.undetermined_init_py is not None else float(r.py)
+            for t_idx, tid in enumerate(candidate_targets):
+                gx, gy = self.goal_positions[int(tid)]
+                # Higher score = stronger qualification.
+                base = -float(cal_distance(ix, iy, gx, gy))
+                # Deterministic tiny tie-break: prefer lower target_id then lower agent_id.
+                tie = 1e-6 * float(K - int(tid)) + 1e-9 * float(self.robot_num - int(ridx))
+                score[a_idx, t_idx] = base + tie
+
+        @lru_cache(maxsize=None)
+        def _solve_dp(i: int, used_mask: int):
+            if i >= n:
+                return 0.0, ()
+            best_val = -1e100
+            best_choice = None
+            for c in range(m):
+                if (used_mask >> c) & 1:
+                    continue
+                nxt_val, nxt_choice = _solve_dp(i + 1, used_mask | (1 << c))
+                cur_val = float(score[i, c]) + float(nxt_val)
+                cur_choice = (c,) + tuple(nxt_choice)
+                if (
+                    cur_val > best_val + 1e-12
+                    or (abs(cur_val - best_val) <= 1e-12 and (best_choice is None or cur_choice < best_choice))
+                ):
+                    best_val = cur_val
+                    best_choice = cur_choice
+            if best_choice is None:
+                return -1e100, ()
+            return best_val, best_choice
+
+        _best, choice = _solve_dp(0, 0)
+        if len(choice) != n:
+            self._undetermined_auction_duplicate_targets()
+            return
+
+        for ridx in conflict_agents:
+            self.robots[ridx].undetermined_target_pending = False
+        for a_idx, ridx in enumerate(conflict_agents):
+            new_tid = int(candidate_targets[int(choice[a_idx])]) % K
+            self.robots[ridx].target_id = new_tid
+
+    def _undetermined_v3_table_sync_step(self) -> None:
+        """Local all-table exchange under comm radius; once complete, run one-shot dedup exactly once."""
+        if not bool(getattr(self, "undetermined_goal_v3", False)):
+            return
+        n = int(self.robot_num)
+        if n <= 1:
+            return
+        rc = float(self.undetermined_comm_radius)
+        pmax = int(getattr(self.args, "undet_v3_latent_p_max_neighbors", 10))
+        pmax = max(0, pmax)
+        old_k = []
+        old_t = []
+        old_xy = []
+        for r in self.robots:
+            old_k.append(np.asarray(getattr(r, "undet_table_known", np.zeros(n, dtype=np.bool_)), dtype=np.bool_))
+            old_t.append(np.asarray(getattr(r, "undet_table_target", -np.ones(n, dtype=np.int64)), dtype=np.int64))
+            old_xy.append(
+                np.asarray(getattr(r, "undet_table_init_xy", np.zeros((n, 2), dtype=np.float32)), dtype=np.float32)
+            )
+        for i, ri in enumerate(self.robots):
+            if ri.collision or ri.success:
+                continue
+            nbr = []
+            for j, rj in enumerate(self.robots):
+                if i == j or rj.collision or rj.success:
+                    continue
+                dij = cal_distance(ri.px, ri.py, rj.px, rj.py)
+                if dij <= rc + 1e-9:
+                    nbr.append((dij, j))
+            nbr.sort(key=lambda x: x[0])
+            if pmax > 0 and len(nbr) > pmax:
+                nbr = nbr[:pmax]
+            k_i = old_k[i].copy()
+            t_i = old_t[i].copy()
+            xy_i = old_xy[i].copy()
+            for _dij, j in nbr:
+                k_j, t_j, xy_j = old_k[j], old_t[j], old_xy[j]
+                take = np.logical_and(k_j, np.logical_not(k_i))
+                if np.any(take):
+                    t_i[take] = t_j[take]
+                    xy_i[take, :] = xy_j[take, :]
+                    k_i[take] = True
+            ri.undet_table_known = k_i
+            ri.undet_table_target = t_i
+            ri.undet_table_init_xy = xy_i
+            ri.undet_table_complete = bool(np.all(k_i))
+        if self.undetermined_v3_table_conflict_resolved:
+            return
+        active = [r for r in self.robots if not (r.collision or r.success)]
+        if not active:
+            return
+        if not all(bool(getattr(r, "undet_table_complete", False)) for r in active):
+            return
+        self._undetermined_v3_global_dedup_once_solve()
+        self._undetermined_sync_all_goals()
+        self._compute_undetermined_hungarian_shaping()
+        self.undetermined_v3_table_conflict_resolved = True
+
     def _compute_undetermined_hungarian_shaping(self):
         K = int(self.num_goal_targets)
         pos = np.array([[r.px, r.py] for r in self.robots], dtype=np.float64)
@@ -1191,8 +1439,14 @@ class EnvCore(object):
         for i, r in enumerate(self.robots):
             r.target_id = int(t[i]) % K
             r.undetermined_target_pending = False
+            if bool(getattr(self, "undetermined_goal_v3", False)):
+                if isinstance(getattr(r, "undet_table_known", None), np.ndarray) and len(r.undet_table_known) == self.robot_num:
+                    r.undet_table_known[i] = True
+                if isinstance(getattr(r, "undet_table_target", None), np.ndarray) and len(r.undet_table_target) == self.robot_num:
+                    r.undet_table_target[i] = int(r.target_id)
+        if not bool(getattr(self, "undetermined_goal_v3", False)):
+            self._undetermined_auction_duplicate_targets()
         self._undetermined_sync_all_goals()
-        self._undetermined_auction_duplicate_targets()
         self._compute_undetermined_hungarian_shaping()
 
     def refresh_observations_after_target_change(self):
@@ -1215,6 +1469,8 @@ class EnvCore(object):
 
     def _undetermined_refresh_pending_from_observation(self):
         """Within obs radius r of current target: if claimed by another agent, request re-selection."""
+        if bool(getattr(self, "undetermined_goal_v3", False)):
+            return
         if self.claimed_by is None:
             return
         K = int(self.num_goal_targets)
@@ -1232,6 +1488,8 @@ class EnvCore(object):
 
     def _undetermined_comm_conflict_auction(self):
         """Same target as another agent within comm radius: lowest index keeps target; others pending."""
+        if bool(getattr(self, "undetermined_goal_v3", False)):
+            return
         K = int(self.num_goal_targets)
         Rc = float(self.undetermined_comm_radius)
         from collections import defaultdict
@@ -1598,6 +1856,8 @@ class EnvCore(object):
                 self.undetermined_v2_exchange_step_M_gain = 0.0
                 self.undetermined_v2_exchange_step_S_gain = 0.0
                 self.undetermined_v2_exchange_agent_mask = np.zeros(self.robot_num, dtype=np.bool_)
+                self.v3_exchange_choice = np.zeros(self.robot_num, dtype=np.int64)
+                self.undetermined_v3_table_conflict_resolved = False
             else:
                 K = len(rel_targets)
 
@@ -1630,8 +1890,18 @@ class EnvCore(object):
                     robot.target_switched_this_step = False
                     robot.prev_px = float(px_i)
                     robot.prev_py = float(py_i)
+                    robot.undetermined_init_px = float(px_i)
+                    robot.undetermined_init_py = float(py_i)
                     robot.for_std = [gxi - self.goal_centroid_xy[0], gyi - self.goal_centroid_xy[1]]
                     robot.undetermined_target_pending = True
+                    robot.undet_table_known = np.zeros(self.robot_num, dtype=np.bool_)
+                    robot.undet_table_target = -np.ones(self.robot_num, dtype=np.int64)
+                    robot.undet_table_init_xy = np.zeros((self.robot_num, 2), dtype=np.float32)
+                    robot.undet_table_known[i] = True
+                    robot.undet_table_target[i] = int(tid)
+                    robot.undet_table_init_xy[i, 0] = float(px_i)
+                    robot.undet_table_init_xy[i, 1] = float(py_i)
+                    robot.undet_table_complete = False
                 else:
                     robot.set(px_i, py_i, gx, gy, 0, 0, np.pi / 2)
                     robot.gx = gx + rel_targets[i][0]
@@ -1812,6 +2082,8 @@ class EnvCore(object):
             self._undetermined_refresh_pending_from_observation()
             self._undetermined_comm_conflict_auction()
             self._undetermined_v2_exchange_heuristic()
+            self._undetermined_v3_exchange_mutual_select()
+            self._undetermined_v3_table_sync_step()
 
         assert W[-1][-2] != 0,'W compute error!'
 
