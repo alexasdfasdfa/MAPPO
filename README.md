@@ -76,3 +76,9 @@ Optional laplacian-type summary:
 python scripts/summarize_render_results.py --mode laplacian_type2 \
   --laplacian-threshold 0.97 --laplacian-sim-metric cosine01 --sl-threshold 0.97 --csv data.csv
 ```
+
+### 2 New Components
+
+- `undet_v3_target_latent` pretraining: this module is an offline target-selector pretraining stage. It learns only which target to choose (slot-level logits from relative neighborhood features), and does not train motion control. The pretrained selector head is then loaded into MAPPO actor target-selection branch; with motion_only, the selector can be frozen while training only motion policy.
+
+- Target exchange: exchange is an environment-side heuristic during rollout/training, where nearby agents may swap target_id assignments to reduce team-level assignment cost (e.g., bottleneck/max-distance style objective). It is not part of the offline selector network itself; it is a runtime coordination mechanism on top of target assignment.
