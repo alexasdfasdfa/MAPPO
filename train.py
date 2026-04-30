@@ -95,6 +95,8 @@ def parser_args(args, parser):
     all_args = parser.parse_known_args(args)[0]
     apply_architecture_mode_preset(all_args)
     resolve_dynamic_target_reasoning_args(all_args)
+    _v3_disable_tail = bool(getattr(all_args, "undetermined_v3_disable_attn_tail_for_motion", False))
+    _v3_disable_prev = bool(getattr(all_args, "undetermined_v3_disable_prev_target_for_motion", False))
 
     if str(getattr(all_args, "architecture_mode", "default")) == "attn_undetermined_goal" and not getattr(
         all_args, "use_attn_comm_actor", False
@@ -174,9 +176,9 @@ def parser_args(args, parser):
             raise ValueError("--undet_v3_target_latent_model_dir requires --enable_undetermined_goal")
         if not getattr(all_args, "enable_undetermined_goal_v3", False):
             raise ValueError("--undet_v3_target_latent_model_dir requires --enable_undetermined_goal_v3")
-        if not getattr(all_args, "use_attn_comm_actor", False):
+        if (not _v3_disable_tail) and (not getattr(all_args, "use_attn_comm_actor", False)):
             raise ValueError("--undet_v3_target_latent_model_dir requires --use_attn_comm_actor")
-        if str(getattr(all_args, "architecture_mode", "default")) != "attn_undetermined_goal":
+        if (not _v3_disable_tail) and (str(getattr(all_args, "architecture_mode", "default")) != "attn_undetermined_goal"):
             raise ValueError(
                 "--undet_v3_target_latent_model_dir requires --architecture_mode attn_undetermined_goal"
             )
@@ -190,9 +192,9 @@ def parser_args(args, parser):
         all_args.enable_dynamic_goal_assignment = False
         k = int(all_args.num_agents)
         if getattr(all_args, "enable_undetermined_goal_v3", False):
-            if not getattr(all_args, "use_attn_comm_actor", False):
+            if (not _v3_disable_tail) and (not getattr(all_args, "use_attn_comm_actor", False)):
                 raise ValueError("--enable_undetermined_goal_v3 requires --use_attn_comm_actor")
-            if str(getattr(all_args, "architecture_mode", "default")) != "attn_undetermined_goal":
+            if (not _v3_disable_tail) and (str(getattr(all_args, "architecture_mode", "default")) != "attn_undetermined_goal"):
                 raise ValueError(
                     "--enable_undetermined_goal_v3 requires --architecture_mode attn_undetermined_goal"
                 )
@@ -205,13 +207,36 @@ def parser_args(args, parser):
             all_args.attn_comm_human_slots = h_v3
             m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
             md = int(getattr(all_args, "attn_comm_message_dim", 16))
-            all_args.robot_obs_dim = compute_undetermined_v3_robot_obs_dim(m, p_v3, h_v3, md)
+            all_args.robot_obs_dim = compute_undetermined_v3_robot_obs_dim(
+                m,
+                p_v3,
+                h_v3,
+                md,
+                include_attn_tail=(not _v3_disable_tail),
+                include_prev_target=(not _v3_disable_prev),
+            )
             apply_undetermined_v2_reward_floors(all_args)
             print(
-                f"[train] undetermined goal v3: robot_obs_dim={all_args.robot_obs_dim} (+2 px,py; +1 prev_tid_norm), K={k}, "
+                f"[train] undetermined goal v3: robot_obs_dim={all_args.robot_obs_dim} (+2 px,py), "
                 f"M={m}, comm_ally_slots={p_v3}, comm_human_slots={h_v3} (agent-count decoupled), "
                 f"hungarian_div={getattr(all_args, 'undetermined_v2_hungarian_team_divisor', 8.0)}, "
                 f"v3_target_kl_coef={float(getattr(all_args, 'undetermined_v3_target_kl_coef', 0.0))}"
+            )
+            print(
+                "[train] v3 reward shaping: "
+                f"enable={bool(getattr(all_args, 'undetermined_v3_reward_enable', True))}, "
+                f"m_drop={float(getattr(all_args, 'undetermined_v3_reward_m_drop_scale', 0.0))}, "
+                f"s_drop={float(getattr(all_args, 'undetermined_v3_reward_s_drop_scale', 0.0))}, "
+                f"travel_pen={float(getattr(all_args, 'undetermined_v3_reward_travel_penalty_scale', 0.0))}, "
+                f"selector(unique/pending/dup/progress)="
+                f"{float(getattr(all_args, 'undetermined_v3_selector_unique_bonus_scale', 0.0))}/"
+                f"{float(getattr(all_args, 'undetermined_v3_selector_pending_penalty_scale', 0.0))}/"
+                f"{float(getattr(all_args, 'undetermined_v3_selector_duplicate_penalty_scale', 0.0))}/"
+                f"{float(getattr(all_args, 'undetermined_v3_selector_progress_bonus_scale', 0.0))}"
+            )
+            print(
+                f"[train] v3 motion obs toggles: disable_attn_tail={_v3_disable_tail}, "
+                f"disable_prev_target={_v3_disable_prev}"
             )
             print(
                 f"[train] undetermined v3 uses v2-style S_L reward: dense_scale={float(getattr(all_args, 'undetermined_v2_sl_dense_scale', 0.0))}, "
@@ -305,6 +330,8 @@ def parser_args(args, parser):
                     int(all_args.attn_comm_ally_slots),
                     int(all_args.attn_comm_human_slots),
                     int(getattr(all_args, "attn_comm_message_dim", 16)),
+                    include_attn_tail=(not _v3_disable_tail),
+                    include_prev_target=(not _v3_disable_prev),
                 )
             else:
                 all_args.robot_obs_dim = compute_undetermined_v2_attn_hybrid_robot_obs_dim(
@@ -420,17 +447,23 @@ def main(args):
     _asm = getattr(all_args, "agent_state_mode", "all")
     _dyn = bool(getattr(all_args, "enable_dynamic_goal_assignment", False))
     _und = bool(getattr(all_args, "enable_undetermined_goal", False))
-    _xchg = bool(getattr(all_args, "enable_undetermined_v2_exchange", False))
+    _xchg_v2 = bool(getattr(all_args, "enable_undetermined_v2_exchange", False))
+    _xchg_v3 = bool(getattr(all_args, "enable_undetermined_v3_exchange", False))
+    _xchg = _xchg_v2 or _xchg_v3
     _ir = bool(getattr(all_args, "randomize_robot_initial_positions", False))
     _notes = (
         f"agent_state_mode: {_asm}\n"
         f"architecture_mode: {str(getattr(all_args, 'architecture_mode', 'default'))}\n"
         f"dynamic_target: {_dyn}\n"
         f"undetermined_goal: {_und}\n"
+        f"undetermined_v3_disable_attn_tail_for_motion: {bool(getattr(all_args, 'undetermined_v3_disable_attn_tail_for_motion', False))}\n"
+        f"undetermined_v3_disable_prev_target_for_motion: {bool(getattr(all_args, 'undetermined_v3_disable_prev_target_for_motion', False))}\n"
         f"initial_randomize: {_ir}\n"
         f"robot_initial_spawn_mode: {str(getattr(all_args, 'robot_initial_spawn_mode', 'random_box'))}\n"
         f"robot_init_cluster_radius_mode: {str(getattr(all_args, 'robot_init_cluster_radius_mode', 'comm'))}\n"
         f"target_exchange_enabled: {_xchg}\n"
+        f"target_exchange_v2_enabled: {_xchg_v2}\n"
+        f"target_exchange_v3_enabled: {_xchg_v3}\n"
         f"undetermined_v2_exchange_accept_criterion: "
         f"{str(getattr(all_args, 'undetermined_v2_exchange_accept_criterion', 'fleet_m'))}\n"
         f"num_agents: {int(all_args.num_agents)}\n"

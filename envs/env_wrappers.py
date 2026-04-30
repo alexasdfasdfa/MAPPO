@@ -182,6 +182,9 @@ def worker(remote, parent_remote, env_fn_wrapper):
         elif cmd == 'set_v3_exchange_choices':
             env.set_v3_exchange_choices(data)
             remote.send(None)
+        elif cmd == 'set_training_progress':
+            env.set_training_progress(data)
+            remote.send(None)
         else:
             raise NotImplementedError
 
@@ -264,6 +267,13 @@ class SubprocVecEnv(ShareVecEnv):   #多线程环境，一般用于训练
         for remote in self.remotes:
             remote.recv()
 
+    def set_training_progress(self, progress):
+        p = float(progress)
+        for remote in self.remotes:
+            remote.send(('set_training_progress', p))
+        for remote in self.remotes:
+            remote.recv()
+
 class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测试
     def __init__(self, env_fns, args):
         self.envs = [fn() for fn in env_fns]
@@ -332,6 +342,11 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
             return
         for i, env in enumerate(self.envs):
             env.set_v3_exchange_choices(c[i])
+
+    def set_training_progress(self, progress):
+        p = float(progress)
+        for env in self.envs:
+            env.set_training_progress(p)
 
     def render(self, mode="vedio", visualize=False):
         episode_success = self.envs[0].render(mode=mode,visualize=visualize)

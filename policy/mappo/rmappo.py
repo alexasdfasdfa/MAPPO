@@ -65,6 +65,14 @@ class RMAPPO():
             self.value_normalizer = ValueNorm(1, device=self.device)
         else:
             self.value_normalizer = None
+        self._train_progress = 0.0
+
+    def set_training_progress(self, progress: float) -> None:
+        try:
+            p = float(progress)
+        except (TypeError, ValueError):
+            p = 0.0
+        self._train_progress = min(1.0, max(0.0, p))
 
     def cal_value_loss(self, values, value_preds_batch, return_batch, active_masks_batch):
         """
@@ -232,9 +240,16 @@ class RMAPPO():
             loss_actor = loss_actor + undet_head_aux
 
         undet_v3_kl = None
+        _kl_coef = float(self._undet_v3_kl_coef)
+        if bool(getattr(self._args, "undetermined_v3_curriculum_enable", True)):
+            ratio = float(getattr(self._args, "undetermined_v3_curriculum_motion_phase_ratio", 0.45))
+            if self._train_progress < ratio:
+                _kl_coef *= float(getattr(self._args, "undetermined_v3_curriculum_selector_kl_scale_early", 0.25))
+            else:
+                _kl_coef *= float(getattr(self._args, "undetermined_v3_curriculum_selector_kl_scale_late", 1.50))
         if (
             update_actor
-            and self._undet_v3_kl_coef > 1e-12
+            and _kl_coef > 1e-12
             and old_undet_target_logits_batch is not None
             and getattr(self._args, "enable_undetermined_goal_v3", False)
         ):
@@ -250,7 +265,7 @@ class RMAPPO():
                     undet_v3_kl = (kl * active_masks_batch).sum() / active_masks_batch.sum()
                 else:
                     undet_v3_kl = kl.mean()
-                loss_actor = loss_actor + self._undet_v3_kl_coef * undet_v3_kl
+                loss_actor = loss_actor + _kl_coef * undet_v3_kl
 
         l_ce_side = None
         if getattr(self.policy, "ce_optimizer", None) is not None:

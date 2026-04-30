@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 
 
@@ -283,6 +285,34 @@ def get_config():
     parser.add_argument("--dcf_dist",type=float,default=0.2,help='discomfort distance of robot and human')
     parser.add_argument("--base_v",type=float,default=0.25,help='When use discrete envirnment,the base velosity in action space')
     parser.add_argument("--robot_initial_spawn_mode", type=str, default="random_box")
+    parser.add_argument("--robot_init_x_min", type=float, default=-4.0)
+    parser.add_argument("--robot_init_x_max", type=float, default=4.0)
+    parser.add_argument("--robot_init_y_min", type=float, default=-4.0)
+    parser.add_argument("--robot_init_y_max", type=float, default=4.0)
+    parser.add_argument(
+        "--robot_init_min_separation_margin",
+        type=float,
+        default=0.15,
+        help="Extra margin added to 2*robot_radius when sampling random starts.",
+    )
+    parser.add_argument(
+        "--robot_init_cluster_radius_mode",
+        type=str,
+        default="comm",
+        choices=["comm", "comm_vis_adaptive"],
+    )
+    parser.add_argument(
+        "--robot_init_cluster_comm_radius",
+        type=float,
+        default=0.0,
+        help="Override cluster_comm reference radius (>0 enables override).",
+    )
+    parser.add_argument(
+        "--randomize_robot_initial_positions",
+        action="store_true",
+        default=False,
+        help="Randomize robot initial positions at reset.",
+    )
     parser.add_argument("--randomize_attributes",type=bool,default=False,help='Randomize humans radius and preferred speed')
     parser.add_argument("--human_action",type=str,default='square_crossing',
                         help='human(dynamic obstacle) act trajectory,include square_crossing,circle_crossing,mixed')
@@ -323,6 +353,18 @@ def get_config():
     parser.add_argument("--undet_v3_decoupled_tau_logits", type=float, default=0.35)
     parser.add_argument("--undetermined_v3_comm_ally_slots", type=int, default=6)
     parser.add_argument("--undetermined_v3_comm_human_slots", type=int, default=4)
+    parser.add_argument(
+        "--undetermined_v3_disable_attn_tail_for_motion",
+        action="store_true",
+        default=False,
+        help="v3: disable AttnComm tail in motion-model robot observations.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_disable_prev_target_for_motion",
+        action="store_true",
+        default=False,
+        help="v3: disable previous-target scalar in motion-model robot observations.",
+    )
     parser.add_argument("--enable_undetermined_v3_exchange", action="store_true", default=False)
     parser.add_argument("--undetermined_v3_exchange_max_neighbors", type=int, default=10)
     parser.add_argument("--undetermined_v3_exchange_min_m_gain", type=float, default=0.0)
@@ -367,6 +409,96 @@ def get_config():
         action="store_true",
         default=False,
         help="Force MAPPO num_agents to undet_v3_latent_dataset_num_agents when using a v3 latent checkpoint.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_reward_enable",
+        action="store_true",
+        default=True,
+        help="Enable extra v3 team reward shaping for bottleneck/path compression and selector finetune.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_reward_m_drop_scale",
+        type=float,
+        default=0.60,
+        help="Weight for reducing fleet bottleneck distance (max dist2goal).",
+    )
+    parser.add_argument(
+        "--undetermined_v3_reward_s_drop_scale",
+        type=float,
+        default=0.15,
+        help="Weight for reducing fleet total remaining distance (sum dist2goal).",
+    )
+    parser.add_argument(
+        "--undetermined_v3_reward_travel_penalty_scale",
+        type=float,
+        default=0.02,
+        help="Penalty on per-step travel length to encourage shorter total paths.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_selector_pending_penalty_scale",
+        type=float,
+        default=0.20,
+        help="Penalty on pending-target ratio for selector finetuning.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_selector_duplicate_penalty_scale",
+        type=float,
+        default=0.20,
+        help="Penalty on duplicate-target ratio for selector finetuning.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_selector_unique_bonus_scale",
+        type=float,
+        default=0.10,
+        help="Bonus on unique-target coverage ratio for selector finetuning.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_selector_progress_bonus_scale",
+        type=float,
+        default=0.20,
+        help="Bonus coupling selector quality with fleet progress (M/S drop).",
+    )
+    parser.add_argument(
+        "--undetermined_v3_curriculum_enable",
+        action="store_true",
+        default=True,
+        help="Enable two-phase curriculum: early motion shaping boost, later selector finetune boost.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_curriculum_motion_phase_ratio",
+        type=float,
+        default=0.45,
+        help="Fraction of total training used as motion-first phase.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_curriculum_motion_reward_boost",
+        type=float,
+        default=1.6,
+        help="Early-phase multiplier for motion-related reward terms.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_curriculum_selector_reward_scale_early",
+        type=float,
+        default=0.35,
+        help="Early-phase scale on selector reward terms.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_curriculum_selector_reward_scale_late",
+        type=float,
+        default=1.35,
+        help="Late-phase scale on selector reward terms.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_curriculum_selector_kl_scale_early",
+        type=float,
+        default=0.25,
+        help="Early-phase scale on v3 selector KL coefficient.",
+    )
+    parser.add_argument(
+        "--undetermined_v3_curriculum_selector_kl_scale_late",
+        type=float,
+        default=1.50,
+        help="Late-phase scale on v3 selector KL coefficient.",
     )
     parser.add_argument("--attn_comm_ally_slots", type=int, default=6)
     parser.add_argument("--attn_comm_human_slots", type=int, default=4)
@@ -448,6 +580,73 @@ def compute_dynamic_robot_obs_dim_legacy_full_k(k: int) -> int:
     return 7 + max(int(k), 1) * 4
 
 
+def infer_dynamic_pack_from_actor_feat_dim(
+    actor_feat_dim: int,
+    k: int,
+    *,
+    preferred_slot_m: int | None = None,
+) -> tuple[str | None, int | None, int | None, int | None]:
+    """
+    Infer dynamic-goal observation packing mode from actor feature dim.
+
+    Returns:
+        (pack, m_slot, p_nbr, robot_obs_dim)
+      - pack:
+          - "legacy": full-K legacy packing (7 + 4*K)
+          - "slots":  slot packing (7 + 4*M)
+          - "slots_attn": slot packing + neighbor tail (7 + 4*M + 2*P)
+          - None: unknown layout
+      - m_slot: inferred slot count M (or None)
+      - p_nbr: inferred neighbor count P for slots_attn (or None)
+      - robot_obs_dim: inferred robot_obs_dim (or None)
+    """
+    d = int(actor_feat_dim)
+    k = max(1, int(k))
+    if d <= 2:
+        return (None, None, None, None)
+
+    # Actor consumes robot_obs plus appended (px, py), so remove 2.
+    robot_obs_dim = d - 2
+
+    # 1) Legacy full-K layout: 7 + 4*K
+    legacy_dim = compute_dynamic_robot_obs_dim_legacy_full_k(k)
+    if robot_obs_dim == legacy_dim:
+        return ("legacy", k, None, robot_obs_dim)
+
+    # 2) Slots-only layout: 7 + 4*M
+    rem_slots = robot_obs_dim - 7
+    if rem_slots >= 4 and rem_slots % 4 == 0:
+        m_slot = rem_slots // 4
+        if 1 <= m_slot <= k:
+            if preferred_slot_m is None or m_slot == int(preferred_slot_m):
+                return ("slots", int(m_slot), None, robot_obs_dim)
+
+    # 3) Slots + neighbor-attn layout: 7 + 4*M + 2*P
+    # Prefer candidate closest to preferred_slot_m when provided.
+    candidates: list[tuple[int, int]] = []
+    max_m = min(k, max(1, rem_slots // 4))
+    for m_slot in range(1, max_m + 1):
+        rem = rem_slots - 4 * m_slot
+        if rem < 0:
+            continue
+        if rem % 2 != 0:
+            continue
+        p_nbr = rem // 2
+        if p_nbr >= 1:
+            candidates.append((m_slot, p_nbr))
+
+    if candidates:
+        if preferred_slot_m is not None:
+            pref = int(preferred_slot_m)
+            candidates.sort(key=lambda t: (abs(t[0] - pref), t[1]))
+        else:
+            candidates.sort(key=lambda t: (t[1], t[0]))
+        m_slot, p_nbr = candidates[0]
+        return ("slots_attn", int(m_slot), int(p_nbr), robot_obs_dim)
+
+    return (None, None, None, None)
+
+
 def compute_undetermined_robot_obs_dim(k: int) -> int:
     return 7 + max(int(k), 1) * 3
 
@@ -466,10 +665,18 @@ def compute_undetermined_v2_attn_hybrid_robot_obs_dim(
 
 
 def compute_undetermined_v3_robot_obs_dim(
-    m_slots: int, ally_slots: int, human_slots: int, message_dim: int = 16
+    m_slots: int,
+    ally_slots: int,
+    human_slots: int,
+    message_dim: int = 16,
+    *,
+    include_attn_tail: bool = True,
+    include_prev_target: bool = True,
 ) -> int:
-    # v3 = v2 hybrid core + one extra scalar (prev applied target id norm).
-    return compute_undetermined_v2_attn_hybrid_robot_obs_dim(m_slots, ally_slots, human_slots, message_dim) + 1
+    base = compute_undetermined_v2_robot_obs_dim(m_slots)
+    tail = compute_attn_comm_tail_dim(ally_slots, human_slots, message_dim) if bool(include_attn_tail) else 0
+    prev = 1 if bool(include_prev_target) else 0
+    return base + tail + prev
 
 
 def apply_undetermined_reward_floors(args) -> None:

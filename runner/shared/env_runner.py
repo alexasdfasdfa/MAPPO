@@ -30,6 +30,18 @@ class EnvRunner(Runner):
         episodes = int(self.num_env_steps) // self.episode_length // self.n_rollout_threads
 
         for episode in range(episodes):
+            if episodes > 1:
+                train_progress = float(episode) / float(episodes - 1)
+            else:
+                train_progress = 1.0
+            try:
+                self.envs.set_training_progress(train_progress)
+            except Exception:
+                pass
+            try:
+                self.trainer.set_training_progress(train_progress)
+            except Exception:
+                pass
             if self.use_linear_lr_decay:
                 self.trainer.policy.lr_decay(episode, episodes)
 

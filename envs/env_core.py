@@ -176,6 +176,7 @@ class EnvCore(object):
 
         # centralized reward computation object (default implementation preserves logic)
         self.reward_calculator = RewardCalculator(self)
+        self.train_progress = 0.0
         
         # print('human number:',self.human_num)
 
@@ -196,15 +197,23 @@ class EnvCore(object):
         self.undetermined_goal_assignment = bool(getattr(args, "enable_undetermined_goal", False))
         self.undetermined_goal_v3 = bool(getattr(args, "enable_undetermined_goal_v3", False))
         self.undetermined_goal_v2 = bool(getattr(args, "enable_undetermined_goal_v2", False))
+        self.undetermined_v3_disable_attn_tail_for_motion = bool(
+            getattr(args, "undetermined_v3_disable_attn_tail_for_motion", False)
+        )
+        self.undetermined_v3_disable_prev_target_for_motion = bool(
+            getattr(args, "undetermined_v3_disable_prev_target_for_motion", False)
+        )
         self.undetermined_v2_goal_slots = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
         self.undetermined_v3_comm_P = max(0, int(getattr(args, "undetermined_v3_comm_ally_slots", 6)))
         self.undetermined_v3_comm_H = max(0, int(getattr(args, "undetermined_v3_comm_human_slots", 4)))
         if self.undetermined_goal_v3:
             if not self.undetermined_goal_assignment:
                 raise ValueError("enable_undetermined_goal_v3 requires enable_undetermined_goal")
-            if not bool(getattr(args, "use_attn_comm_actor", False)):
+            if (not self.undetermined_v3_disable_attn_tail_for_motion) and (not bool(getattr(args, "use_attn_comm_actor", False))):
                 raise ValueError("enable_undetermined_goal_v3 requires use_attn_comm_actor (integrated communication)")
-            if str(getattr(args, "architecture_mode", "default")) != "attn_undetermined_goal":
+            if (not self.undetermined_v3_disable_attn_tail_for_motion) and (
+                str(getattr(args, "architecture_mode", "default")) != "attn_undetermined_goal"
+            ):
                 raise ValueError(
                     "enable_undetermined_goal_v3 requires --architecture_mode attn_undetermined_goal"
                 )
@@ -685,6 +694,13 @@ class EnvCore(object):
             return
         self.v3_exchange_choice = c.copy()
 
+    def set_training_progress(self, progress: float) -> None:
+        try:
+            p = float(progress)
+        except (TypeError, ValueError):
+            p = 0.0
+        self.train_progress = min(1.0, max(0.0, p))
+
     def _undetermined_v3_exchange_mutual_select(self) -> None:
         if not bool(getattr(self, "undetermined_goal_v3", False)):
             return
@@ -1100,12 +1116,17 @@ class EnvCore(object):
         then AttnComm tail from --undetermined_v3_comm_* (fixed caps).
         """
         v2 = self._pack_undetermined_v2_obs(robot_index, robot, for_feature)
-        prev_scalar = np.array([float(getattr(robot, "undet_prev_tid_norm", -1.0))], dtype=np.float32)
-        core_pre_tail = np.concatenate([v2[:-2], prev_scalar], dtype=np.float32)
-        tail = self._attn_comm_tail_vector(
-            robot_index, robot, for_feature, self.undetermined_v3_comm_P, self.undetermined_v3_comm_H
-        )
-        vec = np.concatenate([core_pre_tail, tail, v2[-2:]], dtype=np.float32)
+        core_pre_tail = v2[:-2]
+        if not self.undetermined_v3_disable_prev_target_for_motion:
+            prev_scalar = np.array([float(getattr(robot, "undet_prev_tid_norm", -1.0))], dtype=np.float32)
+            core_pre_tail = np.concatenate([core_pre_tail, prev_scalar], dtype=np.float32)
+        if self.undetermined_v3_disable_attn_tail_for_motion:
+            vec = np.concatenate([core_pre_tail, v2[-2:]], dtype=np.float32)
+        else:
+            tail = self._attn_comm_tail_vector(
+                robot_index, robot, for_feature, self.undetermined_v3_comm_P, self.undetermined_v3_comm_H
+            )
+            vec = np.concatenate([core_pre_tail, tail, v2[-2:]], dtype=np.float32)
         assert vec.shape[0] == self.robot_obs_dim + 2, (
             f"undetermined v3 pack len {vec.shape[0]} != robot_obs_dim+2={self.robot_obs_dim + 2} "
             f"(M={self.undetermined_v2_goal_slots}, P={self.undetermined_v3_comm_P}, H={self.undetermined_v3_comm_H})"

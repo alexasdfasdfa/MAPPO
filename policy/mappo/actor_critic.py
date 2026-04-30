@@ -51,6 +51,9 @@ class R_Actor(nn.Module):
 
         self.use_attn_comm = bool(getattr(args, "use_attn_comm_actor", False)) and not getattr(
             args, "enable_dynamic_goal_assignment", False
+        ) and not bool(
+            getattr(args, "enable_undetermined_goal_v3", False)
+            and getattr(args, "undetermined_v3_disable_attn_tail_for_motion", False)
         )
         self.use_neighbor_attn = (
             bool(
@@ -62,6 +65,9 @@ class R_Actor(nn.Module):
         k_ag = int(args.num_agents)
         self.enable_undetermined_goal = bool(getattr(args, "enable_undetermined_goal", False))
         self.enable_undetermined_v3 = bool(getattr(args, "enable_undetermined_goal_v3", False))
+        self._v3_disable_prev_target_for_motion = bool(
+            getattr(args, "undetermined_v3_disable_prev_target_for_motion", False)
+        )
         self.enable_undetermined_v2 = bool(
             getattr(args, "enable_undetermined_goal_v2", False) or self.enable_undetermined_v3
         )
@@ -89,10 +95,11 @@ class R_Actor(nn.Module):
         self.v3_p1_to_msg = None
         self.v3_swap_head = None
         self.v3_swap_p = max(1, int(getattr(args, "undetermined_v3_exchange_max_neighbors", 10)))
-        if self.use_attn_comm and self.enable_undetermined_v3 and self.undetermined_head is not None:
+        if self.enable_undetermined_v3 and self.undetermined_head is not None:
             if hasattr(self.undetermined_head, "extract_p1_consensus"):
                 d_h = int(getattr(args, "undet_v3_latent_d_h", 64))
-                self.v3_p1_to_msg = nn.Linear(d_h, int(getattr(args, "attn_comm_message_dim", 16)))
+                if self.use_attn_comm:
+                    self.v3_p1_to_msg = nn.Linear(d_h, int(getattr(args, "attn_comm_message_dim", 16)))
                 self.v3_swap_head = nn.Sequential(
                     nn.Linear(d_h, d_h),
                     nn.ReLU(),
@@ -117,7 +124,15 @@ class R_Actor(nn.Module):
                 and self.enable_undetermined_v2
             ):
                 m = max(1, int(getattr(args, "undetermined_v2_goal_slots", 10)))
-                _hy_split = 7 + 5 * m + 1 + (1 if self.enable_undetermined_v3 else 0)
+                _add_prev = (
+                    1
+                    if (
+                        self.enable_undetermined_v3
+                        and not bool(getattr(args, "undetermined_v3_disable_prev_target_for_motion", False))
+                    )
+                    else 0
+                )
+                _hy_split = 7 + 5 * m + 1 + _add_prev
             self.attn_comm_encoder = AttnCommActorEncoder(
                 args, hybrid_undetermined_v2_split=_hy_split
             )
@@ -341,7 +356,14 @@ class R_Actor(nn.Module):
             p1_h = self.undetermined_head.extract_p1_consensus(ro)
         logits = self.v3_swap_head(p1_h)
         # mask invalid neighbor slots from attn ally geometry tail (6 features per slot).
-        m = 1 if self.enable_undetermined_v3 else 0
+        m = (
+            1
+            if (
+                self.enable_undetermined_v3
+                and not bool(getattr(self, "_v3_disable_prev_target_for_motion", False))
+            )
+            else 0
+        )
         m_slots = int(self.undetermined_m_slots)
         core = 7 + 5 * m_slots + 1 + m
         p = self.v3_swap_p

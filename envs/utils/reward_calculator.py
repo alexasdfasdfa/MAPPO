@@ -662,6 +662,75 @@ class RewardCalculator:
         }
         return self._aud_team
 
+    def _ensure_v3_team_shaping_cache(self) -> dict[str, float]:
+        """
+        Extra v3 shaping cached once per env step:
+        - reduce fleet bottleneck (M=max dist2goal) and total remaining path (S=sum dist2goal)
+        - penalize unnecessary travel length
+        - selector-oriented shaping from pending/duplicate/unique target structure
+        """
+        env = self.env
+        key = float(getattr(env, "global_time", 0.0))
+        if getattr(self, "_v3_team_key", None) == key:
+            return self._v3_team  # type: ignore[attr-defined]
+        self._v3_team_key = key
+        a = env.args
+        n = max(1, int(getattr(env, "robot_num", 1)))
+
+        cur_dists = []
+        tids = []
+        pending = 0
+        for r in getattr(env, "robots", []):
+            d = 0.0 if (getattr(r, "collision", False) or getattr(r, "success", False)) else float(
+                getattr(r, "dist2goal", 0.0) or 0.0
+            )
+            cur_dists.append(d)
+            tids.append(int(getattr(r, "target_id", -1)))
+            pending += 1 if bool(getattr(r, "undetermined_target_pending", False)) else 0
+
+        if not cur_dists:
+            cur_dists = [0.0]
+        cur_m = float(max(cur_dists))
+        cur_s = float(sum(cur_dists))
+        prev_m = float(getattr(env, "_undetermined_v3_reward_prev_m", float("nan")))
+        prev_s = float(getattr(env, "_undetermined_v3_reward_prev_s", float("nan")))
+        m_drop = max(0.0, prev_m - cur_m) if math.isfinite(prev_m) else 0.0
+        s_drop = max(0.0, prev_s - cur_s) if math.isfinite(prev_s) else 0.0
+        setattr(env, "_undetermined_v3_reward_prev_m", cur_m)
+        setattr(env, "_undetermined_v3_reward_prev_s", cur_s)
+
+        travel_avg = float(getattr(env, "dynamic_step_travel_sum", 0.0)) / float(n)
+        pending_ratio = float(pending) / float(n)
+        uniq = len(set(tids)) if tids else 0
+        unique_ratio = float(uniq) / float(n)
+        duplicate_ratio = max(0.0, 1.0 - unique_ratio)
+
+        r_m = float(getattr(a, "undetermined_v3_reward_m_drop_scale", 0.0)) * m_drop
+        r_s = float(getattr(a, "undetermined_v3_reward_s_drop_scale", 0.0)) * (s_drop / float(n))
+        r_travel = -float(getattr(a, "undetermined_v3_reward_travel_penalty_scale", 0.0)) * travel_avg
+        r_selector = (
+            float(getattr(a, "undetermined_v3_selector_unique_bonus_scale", 0.0)) * unique_ratio
+            - float(getattr(a, "undetermined_v3_selector_pending_penalty_scale", 0.0)) * pending_ratio
+            - float(getattr(a, "undetermined_v3_selector_duplicate_penalty_scale", 0.0)) * duplicate_ratio
+            + float(getattr(a, "undetermined_v3_selector_progress_bonus_scale", 0.0))
+            * (m_drop + s_drop / float(n))
+        )
+        r_total = r_m + r_s + r_travel + r_selector
+        self._v3_team = {
+            "v3_m_drop": float(m_drop),
+            "v3_s_drop": float(s_drop),
+            "v3_path_travel_avg": float(travel_avg),
+            "v3_selector_pending_ratio": float(pending_ratio),
+            "v3_selector_duplicate_ratio": float(duplicate_ratio),
+            "v3_selector_unique_ratio": float(unique_ratio),
+            "v3_r_m_drop": float(r_m),
+            "v3_r_s_drop": float(r_s),
+            "v3_r_travel_penalty": float(r_travel),
+            "v3_r_selector": float(r_selector),
+            "v3_r_total": float(r_total),
+        }
+        return self._v3_team
+
     def _compute_attn_undetermined_goal_reward(self, robot: Any, for_feature: float) -> np.ndarray:
         """Undetermined execution + ConsMAC obs; reward from paper Eq.(1)-(4), identical per agent."""
         env = self.env
@@ -671,7 +740,8 @@ class RewardCalculator:
         except ValueError:
             _ridx_ex = -1
         team = self._ensure_attn_undetermined_team_cache()
-        reward = float(team["r_team"])
+        reward_team = float(team["r_team"])
+        reward = reward_team
         r_sl, sl_v, sl_succ, sl_delta = self._undetermined_v2_sl_reward_raw(env, a)
         reward += r_sl
         if _ridx_ex >= 0:
@@ -681,7 +751,38 @@ class RewardCalculator:
         nd_goal_terms: dict[str, float] = {}
         if gcoef > 0.0:
             r_goal_add, nd_goal_terms = self._nd_goal_disk_raw_reward(robot, a)
-            reward += gcoef * float(getattr(a, "nd_discount_goal", 200.0)) * float(r_goal_add)
+            goal_term = gcoef * float(getattr(a, "nd_discount_goal", 200.0)) * float(r_goal_add)
+            reward += goal_term
+        else:
+            goal_term = 0.0
+        v3_terms: dict[str, float] = {}
+        v3_motion_boost_add = 0.0
+        v3_selector_scale = 1.0
+        if (
+            bool(getattr(env, "undetermined_goal_v3", False))
+            and bool(getattr(a, "undetermined_v3_reward_enable", True))
+        ):
+            if bool(getattr(a, "undetermined_v3_curriculum_enable", True)):
+                prog = float(getattr(env, "train_progress", 0.0))
+                ratio = float(getattr(a, "undetermined_v3_curriculum_motion_phase_ratio", 0.45))
+                if prog < ratio:
+                    m_boost = float(getattr(a, "undetermined_v3_curriculum_motion_reward_boost", 1.6))
+                    v3_motion_boost_add = (m_boost - 1.0) * (reward_team + float(r_sl) + goal_term)
+                    v3_selector_scale = float(
+                        getattr(a, "undetermined_v3_curriculum_selector_reward_scale_early", 0.35)
+                    )
+                else:
+                    v3_selector_scale = float(
+                        getattr(a, "undetermined_v3_curriculum_selector_reward_scale_late", 1.35)
+                    )
+            v3_terms = self._ensure_v3_team_shaping_cache()
+            v3_non_selector = (
+                float(v3_terms.get("v3_r_m_drop", 0.0))
+                + float(v3_terms.get("v3_r_s_drop", 0.0))
+                + float(v3_terms.get("v3_r_travel_penalty", 0.0))
+            )
+            v3_selector = float(v3_terms.get("v3_r_selector", 0.0))
+            reward += v3_motion_boost_add + v3_non_selector + v3_selector_scale * v3_selector
 
         tr = float(getattr(a, "nd_goal_terminal_reward", 0.0))
         entered = False
@@ -710,10 +811,13 @@ class RewardCalculator:
             "cons_decaf_n_coll_pairs": float(team["n_coll_pairs"]),
             "r_goal_raw": float(r_goal_add),
             "reward_final": float(reward),
+            "v3_motion_boost_add": float(v3_motion_boost_add),
+            "v3_selector_scale": float(v3_selector_scale),
             "nd_terminal_tr": float(tr),
             "nd_tr_applied": float(nd_tr_applied),
             "goal_entered_from_outside": float(1.0 if entered else 0.0),
             "goal_flag": float(1.0 if robot.goal_flag else 0.0),
+            **{k: float(v) for k, v in v3_terms.items()},
             **{k: float(v) for k, v in nd_goal_terms.items()},
         }
         return np.array([reward])

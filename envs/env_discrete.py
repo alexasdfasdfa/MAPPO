@@ -57,6 +57,12 @@ class DiscreteActionEnv(gym.Env):
                     int(all_args.attn_comm_ally_slots),
                     int(all_args.attn_comm_human_slots),
                     int(getattr(all_args, "attn_comm_message_dim", 16)),
+                    include_attn_tail=(
+                        not bool(getattr(all_args, "undetermined_v3_disable_attn_tail_for_motion", False))
+                    ),
+                    include_prev_target=(
+                        not bool(getattr(all_args, "undetermined_v3_disable_prev_target_for_motion", False))
+                    ),
                 )
             elif getattr(all_args, "enable_undetermined_goal_v2", False):
                 m = max(1, int(getattr(all_args, "undetermined_v2_goal_slots", 10)))
@@ -219,6 +225,9 @@ class DiscreteActionEnv(gym.Env):
 
     def set_v3_exchange_choices(self, choices):
         self.env.set_v3_exchange_choices(choices)
+
+    def set_training_progress(self, progress):
+        self.env.set_training_progress(progress)
 
     def reset(self):
         obs = self.env.reset()
