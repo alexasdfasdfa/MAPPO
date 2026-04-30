@@ -386,13 +386,19 @@ def main(args):
     all_args = parser_args(args, parser)
     all_args.num_humans = 2
     all_args.num_attention_agents = 10
-    all_args.n_rollout_threads = 40
-    all_args.episode_length = 400
-    all_args.num_env_steps = all_args.n_rollout_threads * all_args.episode_length * 1200
+    all_args.n_rollout_threads = int(os.getenv("MAPPO_N_ROLLOUT_THREADS", "40"))
+    all_args.episode_length = int(os.getenv("MAPPO_EPISODE_LENGTH", "400"))
+    _num_updates = int(os.getenv("MAPPO_NUM_UPDATES", "1200"))
+    all_args.num_env_steps = int(
+        os.getenv(
+            "MAPPO_NUM_ENV_STEPS",
+            str(all_args.n_rollout_threads * all_args.episode_length * _num_updates),
+        )
+    )
     # PPO: mini_batch_size = (n_rollout_threads * episode_length * num_agents) / num_mini_batch.
     # Too few mini-batches => huge CUDA batches and OOM (e.g. 10 -> ~80k samples/step on 200x400x10).
     # Slightly fewer splits than 400 => larger per-GPU minibatch (stabler grads for formation shaping).
-    all_args.num_mini_batch = 400
+    all_args.num_mini_batch = int(os.getenv("MAPPO_NUM_MINI_BATCH", "400"))
     all_args.save_interval = 1
     all_args.log_interval = 1
     all_args.model_dir = None

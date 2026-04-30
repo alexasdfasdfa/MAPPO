@@ -509,6 +509,12 @@ def get_config():
     parser.add_argument("--undetermined_hungarian_reward_scale", type=float, default=0.10)
     parser.add_argument("--undetermined_goal_distance_penalty_scale", type=float, default=0.004)
     parser.add_argument("--undetermined_far_goal_progress_boost", type=float, default=1.6)
+    parser.add_argument("--undetermined_v2_sl_dense_scale", type=float, default=0.0)
+    parser.add_argument("--undetermined_v2_sl_delta_scale", type=float, default=0.0)
+    parser.add_argument("--undetermined_v2_sl_success_scale", type=float, default=0.0)
+    parser.add_argument("--undetermined_v2_sl_success_threshold", type=float, default=0.97)
+    parser.add_argument("--undetermined_v3_target_kl_coef", type=float, default=0.0)
+    parser.add_argument("--nd_arrival_reward", type=float, default=0.0)
     parser.add_argument("--nd_discount_avoid", type=float, default=50.0)
     parser.add_argument("--nd_discount_nav", type=float, default=20.0)
     parser.add_argument("--nd_discount_goal", type=float, default=200.0)
@@ -680,6 +686,7 @@ def compute_undetermined_v3_robot_obs_dim(
 
 
 def apply_undetermined_reward_floors(args) -> None:
+    setattr(args, "nd_arrival_reward", float(getattr(args, "nd_arrival_reward", 0.0)))
     setattr(args, "nd_discount_avoid", float(getattr(args, "nd_discount_avoid", 50.0)))
     setattr(args, "nd_discount_nav", float(getattr(args, "nd_discount_nav", 20.0)))
     setattr(args, "nd_discount_goal", float(getattr(args, "nd_discount_goal", 200.0)))
@@ -697,3 +704,5 @@ def apply_undetermined_v2_reward_floors(args) -> None:
         "undetermined_v2_sl_success_scale",
         float(getattr(args, "undetermined_v2_sl_success_scale", 0.0)),
     )
+    setattr(args, "undetermined_v2_sl_success_threshold", float(getattr(args, "undetermined_v2_sl_success_threshold", 0.97)))
+    setattr(args, "undetermined_v3_target_kl_coef", float(getattr(args, "undetermined_v3_target_kl_coef", 0.0)))
