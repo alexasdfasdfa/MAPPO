@@ -6,8 +6,8 @@
 #   pretrained selector (from undet_v3_target_latent_decoupled_rank n11) -> MAPPO motion policy (v3 branch)
 
 #SBATCH -o swarm.%j.out
-#SBATCH --partition=titan
-#SBATCH --qos=titan
+#SBATCH --partition=a100
+#SBATCH --qos=a100
 #SBATCH -J mappo-v3selector-n11copy
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
