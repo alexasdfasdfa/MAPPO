@@ -179,6 +179,29 @@ def worker(remote, parent_remote, env_fn_wrapper):
         elif cmd == 'apply_undetermined_targets':
             ob = env.apply_undetermined_targets(data)
             remote.send(ob)
+        elif cmd == 'set_exchange_network':
+            # Receive state_dict (CPU), create network, load and move to device
+            from envs.utils.exchange_network import ExchangeNetwork
+            state_dict, device_type, train_mode = data
+            network = ExchangeNetwork()
+            if state_dict is not None:
+                network.load_state_dict(state_dict)
+            if device_type == 'cuda':
+                network = network.cuda()
+            network.train() if train_mode else network.eval()
+            env.exchange_network = network
+            env.exchange_device = torch.device(device_type)
+            remote.send(None)
+        elif cmd == 'get_exchange_candidates':
+            # Return raw pair features from env, no network inference in subprocess
+            exchange_data = getattr(env, 'exchange_step_data', None)
+            if exchange_data is not None:
+                data_list = list(exchange_data)
+                m_gain = getattr(env, 'undetermined_v2_exchange_step_M_gain', 0.0)
+                env.exchange_step_data = []
+                remote.send((data_list, m_gain))
+            else:
+                remote.send(([], 0.0))
         else:
             raise NotImplementedError
 
@@ -254,6 +277,29 @@ class SubprocVecEnv(ShareVecEnv):   #多线程环境，一般用于训练
         obs = [remote.recv() for remote in self.remotes]
         return np.stack(obs)
 
+    def set_exchange_network(self, network, device=None, train_mode=False):
+        """Inject exchange network into all subprocess envs via state_dict to avoid CUDA tensor sharing."""
+        # Extract state_dict on CPU and device type for safe pipe transfer
+        state_dict = {k: v.cpu().clone() for k, v in network.state_dict().items()}
+        device_type = 'cuda' if (device is not None and str(device).startswith('cuda')) else 'cpu'
+        for remote in self.remotes:
+            remote.send(('set_exchange_network', (state_dict, device_type, train_mode)))
+        for remote in self.remotes:
+            remote.recv()
+
+    def get_exchange_step_data(self):
+        """Get exchange PPO data from subprocess envs via pipe."""
+        for remote in self.remotes:
+            remote.send(('get_exchange_candidates', None))
+        results = [remote.recv() for remote in self.remotes]
+        data = {}
+        for i, (data_list, m_gain) in enumerate(results):
+            if data_list:
+                for item in data_list:
+                    item['advantage'] = float(m_gain)
+                data[i] = data_list
+        return data
+
 class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测试
     def __init__(self, env_fns, args):
         self.envs = [fn() for fn in env_fns]
@@ -321,18 +367,16 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
         return np.stack(obs_list)
 
     def get_exchange_step_data(self):
-        """Get exchange PPO data from all subprocess envs."""
+        """Get exchange PPO data from subprocess envs."""
         data = {}
         for i, env in enumerate(self.envs):
             env_core = getattr(env, 'env_core', env)
             exchange_data = getattr(env_core, 'exchange_step_data', None)
             if exchange_data is not None:
                 data[i] = list(exchange_data)
-                # Record fleet_M_drop as advantage
                 m_gain = getattr(env_core, 'undetermined_v2_exchange_step_M_gain', 0.0)
                 for item in data[i]:
                     item['advantage'] = float(m_gain)
-                # Clear for next step
                 env_core.exchange_step_data = []
         return data
 

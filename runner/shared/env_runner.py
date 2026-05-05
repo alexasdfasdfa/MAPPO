@@ -505,12 +505,15 @@ class EnvRunner(Runner):
                 if episode % self.eval_interval == 0 and self.use_eval:
                     self.eval(total_num_steps)
 
-                # Log exchange network accuracy each episode (if network is trained)
+                # Legacy exchange learning (behavior cloning) - deprecated in favor of exchange PPO.
+                # Requires ExchangeDataCollector and train_exchange_network which were removed.
+                # Remove these guards if you need the old path.
                 if getattr(self.all_args, "enable_exchange_learning", False):
-                    self._log_exchange_accuracy(total_num_steps, episode)
+                    print("[WARNING] --enable_exchange_learning is deprecated. ExchangeDataCollector and "
+                          "train_exchange_network have been removed. Use --enable_exchange_ppo instead.")
                 # Train exchange network periodically
                 if getattr(self.all_args, "enable_exchange_learning", False):
-                    self._maybe_train_exchange_network(total_num_steps, episode)
+                    print("[WARNING] Skipping legacy exchange training (deprecated).")
                 # Log exchange PPO metrics
                 if getattr(self.all_args, "enable_exchange_ppo", False):
                     self._log_exchange_ppo_metrics(total_num_steps)

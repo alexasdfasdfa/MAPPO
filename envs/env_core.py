@@ -235,14 +235,9 @@ class EnvCore(object):
         self.undetermined_v2_exchange_agent_mask = np.zeros(self.robot_num, dtype=np.bool_)
 
         # Exchange learning (behavior cloning to replace rule-based exchange)
+        # Note: ExchangeDataCollector was removed in PPO training migration;
+        # legacy behavior cloning via --enable_exchange_learning is deprecated.
         self.exchange_data_collector = getattr(args, "exchange_data_collector", None)
-        # For SubprocVecEnv, each subprocess creates its own collector with unique file_id
-        if self.exchange_data_collector is None and getattr(args, "enable_exchange_learning", False):
-            import os as _os
-            from envs.utils.exchange_network import ExchangeDataCollector
-            data_dir = str(getattr(args, "exchange_data_dir", "./exchange_data"))
-            file_id = str(getattr(args, "env_rank", _os.getpid()))
-            self.exchange_data_collector = ExchangeDataCollector(data_dir=data_dir, file_id=file_id)
         self.exchange_network = None
         self.use_exchange_network = bool(getattr(args, "enable_exchange_network", False))
         self.exchange_device = torch.device("cpu")
