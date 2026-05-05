@@ -7,7 +7,11 @@
       "Bash(python -m py_compile config/config.py)",
       "Bash(python -m py_compile train.py)",
       "Bash(python -m py_compile runner/shared/env_runner.py)",
-      "Bash(python -m py_compile envs/env_core.py runner/shared/env_runner.py train.py config/config.py envs/utils/exchange_network.py envs/env_discrete.py)"
+      "Bash(python -m py_compile envs/env_core.py runner/shared/env_runner.py train.py config/config.py envs/utils/exchange_network.py envs/env_discrete.py)",
+      "Bash(openspec new *)",
+      "Bash(openspec status *)",
+      "Bash(openspec instructions *)",
+      "Bash(python *)"
     ]
   }
 }

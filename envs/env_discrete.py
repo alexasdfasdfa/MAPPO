@@ -265,13 +265,16 @@ class DiscreteActionEnv(gym.Env):
         robot.px = robot.px + self.time_step * robot.v * np.cos(robot.theta)
         robot.py = robot.py + self.time_step * robot.v * np.sin(robot.theta)
 
-    def set_exchange_network(self, network, device=None):
+    def set_exchange_network(self, network, device=None, train_mode=False):
         """Inject a trained ExchangeNetwork into the underlying env_core."""
         self.env.exchange_network = network
         if device is not None:
             self.env.exchange_device = device
         network.to(device if device else self.env.exchange_device)
-        network.eval()
+        if train_mode:
+            network.train()
+        else:
+            network.eval()
 
     def close(self):
         """Flush any buffered exchange data before shutting down."""

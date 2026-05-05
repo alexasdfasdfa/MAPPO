@@ -427,6 +427,10 @@ class EnvRunner(Runner):
                         obs = self._undetermined_resolve(obs)
                     self._maybe_log_reward_terms(episode, step, infos, rewards)
 
+                    # Collect exchange PPO data from envs
+                    if self.buffer._use_exchange_ppo:
+                        self._last_exchange_data = self.envs.get_exchange_step_data()
+
                     data = (
                         obs,
                         rewards,
@@ -507,6 +511,9 @@ class EnvRunner(Runner):
                 # Train exchange network periodically
                 if getattr(self.all_args, "enable_exchange_learning", False):
                     self._maybe_train_exchange_network(total_num_steps, episode)
+                # Log exchange PPO metrics
+                if getattr(self.all_args, "enable_exchange_ppo", False):
+                    self._log_exchange_ppo_metrics(total_num_steps)
         finally:
             self._close_reward_terms_log()
             self._close_exchange_data_log()
@@ -604,6 +611,23 @@ class EnvRunner(Runner):
         collector = getattr(self.all_args, "exchange_data_collector", None)
         if collector is not None and collector.sample_count > 0:
             collector.flush_to_file(9999999)
+
+    def _log_exchange_ppo_metrics(self, total_num_steps):
+        """Log exchange PPO mode and agreement rate to TensorBoard."""
+        env0 = getattr(self.envs, 'envs', [None])[0]
+        if env0 is None:
+            return
+        env_core = getattr(env0, 'env_core', env0)
+        exchange_mode = getattr(env_core, 'exchange_mode', 'rule_only')
+        agreement_rate = getattr(env_core, '_get_exchange_agreement_rate', lambda: 0.0)()
+        training_steps = getattr(env_core, 'exchange_training_steps', 0)
+
+        self.writter.add_scalars("exchange/agreement_rate", {"exchange_agreement_rate": agreement_rate}, total_num_steps)
+        self.writter.add_scalars("exchange/mode", {"exchange_mode": 1.0 if exchange_mode == "network_active" else 0.0}, total_num_steps)
+        self.writter.add_scalars("exchange/training_steps", {"exchange_training_steps": training_steps}, total_num_steps)
+        if exchange_mode == "shadow":
+            total_comparisons = getattr(env_core, 'exchange_total_comparisons', 0)
+            self.writter.add_scalars("exchange/total_comparisons", {"exchange_total_comparisons": total_comparisons}, total_num_steps)
 
     def warmup(self):
         # reset env
@@ -783,6 +807,43 @@ class EnvRunner(Runner):
             comm_rnn_states_actor=comm_rnn_out if self.buffer.comm_rnn_states is not None else None,
             undet_target_logits=undet_logits,
         )
+
+        # Insert exchange PPO data if enabled
+        if self.buffer._use_exchange_ppo:
+            self._insert_exchange_step(infos)
+
+    def _insert_exchange_step(self, infos):
+        """Extract exchange data from env infos and write to buffer."""
+        # exchange_step_data is set by EnvCore._undetermined_v2_exchange_shadow_mode or _ppo_network
+        # For SubprocVecEnv, data comes through infos
+        exchange_data = getattr(self, '_last_exchange_data', None)
+        if exchange_data is None:
+            return
+
+        step = self.buffer.step - 1  # buffer.step points to next slot
+        if step < 0:
+            step = self.episode_length - 1
+
+        # Aggregate data across threads
+        # Each thread's env_core has exchange_step_data
+        pair_features = np.zeros((self.n_rollout_threads, self.num_agents, 20), dtype=np.float32)
+        log_probs = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        actions = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        advantages = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+
+        for t_idx in range(self.n_rollout_threads):
+            thread_data = exchange_data.get(t_idx, [])
+            for item in thread_data:
+                agent_ids = item.get('agents', (0, 0))
+                # Only record for the first agent in the pair (to avoid double counting)
+                aid = agent_ids[0]
+                if aid < self.num_agents:
+                    pair_features[t_idx, aid] = item['pair_features']
+                    log_probs[t_idx, aid] = item['log_prob']
+                    actions[t_idx, aid] = item['swap_action']
+                    advantages[t_idx, aid] = item.get('advantage', 0.0)
+
+        self.buffer.insert_exchange(step, pair_features, log_probs, actions, advantages)
 
     # @torch.no_grad()
     # def render(self):

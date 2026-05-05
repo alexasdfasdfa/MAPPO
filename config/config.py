@@ -239,6 +239,43 @@ def get_config():
         default=0.5,
         help="Probability threshold for neural exchange: swap if predicted prob >= threshold.",
     )
+    # Exchange PPO training (replaces behavior cloning)
+    parser.add_argument(
+        "--enable_exchange_ppo",
+        action="store_true",
+        default=False,
+        help="Enable PPO-based exchange network training (replaces BCE behavior cloning).",
+    )
+    parser.add_argument(
+        "--exchange_shadow_threshold",
+        type=float,
+        default=0.85,
+        help="Agreement rate threshold to switch from shadow mode to network active mode.",
+    )
+    parser.add_argument(
+        "--exchange_min_shadow_steps",
+        type=int,
+        default=500,
+        help="Minimum training steps in shadow mode before network can take over.",
+    )
+    parser.add_argument(
+        "--exchange_entropy_coef",
+        type=float,
+        default=0.01,
+        help="Entropy regularization coefficient for exchange policy.",
+    )
+    parser.add_argument(
+        "--exchange_clip_param",
+        type=float,
+        default=0.2,
+        help="PPO clip parameter for exchange policy update.",
+    )
+    parser.add_argument(
+        "--exchange_fallback_window",
+        type=int,
+        default=50,
+        help="Consecutive steps of fleet_M worsening that trigger fallback to shadow mode.",
+    )
     parser.add_argument(
         "--enable_undetermined_goal_v3",
         action="store_true",
@@ -1704,6 +1741,11 @@ def resolve_dynamic_target_reasoning_args(args):
     if getattr(args, "actor_neighbor_n", None) is None:
         args.actor_neighbor_n = int(getattr(args, "neighbor_n", 10))
     return args
+
+
+def compute_exchange_obs_dim() -> int:
+    """Pair feature dimension for exchange network (always 20)."""
+    return 20
 
 
 def compute_undetermined_robot_obs_dim(num_agents: int) -> int:

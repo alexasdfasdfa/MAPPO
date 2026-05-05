@@ -307,6 +307,11 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
             for i, env in enumerate(self.envs):
                 env.set_comm_broadcasts(b[i])
 
+    def set_exchange_network(self, network, device=None, train_mode=False):
+        """Inject exchange network into all subprocess envs."""
+        for env in self.envs:
+            env.set_exchange_network(network, device, train_mode)
+
     def apply_undetermined_targets(self, targets):
         t = np.asarray(targets, dtype=np.int64)
         if t.ndim == 1:
@@ -314,6 +319,22 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
             return np.array([obs])
         obs_list = [self.envs[i].apply_undetermined_targets(t[i]) for i in range(len(self.envs))]
         return np.stack(obs_list)
+
+    def get_exchange_step_data(self):
+        """Get exchange PPO data from all subprocess envs."""
+        data = {}
+        for i, env in enumerate(self.envs):
+            env_core = getattr(env, 'env_core', env)
+            exchange_data = getattr(env_core, 'exchange_step_data', None)
+            if exchange_data is not None:
+                data[i] = list(exchange_data)
+                # Record fleet_M_drop as advantage
+                m_gain = getattr(env_core, 'undetermined_v2_exchange_step_M_gain', 0.0)
+                for item in data[i]:
+                    item['advantage'] = float(m_gain)
+                # Clear for next step
+                env_core.exchange_step_data = []
+        return data
 
     def render(self, mode="vedio", visualize=False):
         episode_success = self.envs[0].render(mode=mode,visualize=visualize)

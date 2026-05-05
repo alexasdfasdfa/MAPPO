@@ -82,6 +82,22 @@ class Runner(object):
 
         apply_undet_v2_target_latent_heads(self.all_args, [self.policy.actor], self.device)
 
+        # Exchange network for PPO training
+        if getattr(self.all_args, "enable_exchange_ppo", False):
+            from envs.utils.exchange_network import ExchangeNetwork
+            self.policy.exchange_net = ExchangeNetwork().to(self.device)
+            # Inject the same network instance into envs for shadow mode inference
+            self.envs.set_exchange_network(self.policy.exchange_net, self.device, train_mode=False)
+            print(
+                f"[train] exchange PPO: shadow_threshold={float(getattr(self.all_args, 'exchange_shadow_threshold', 0.85))}, "
+                f"min_shadow_steps={int(getattr(self.all_args, 'exchange_min_shadow_steps', 500))}, "
+                f"entropy_coef={float(getattr(self.all_args, 'exchange_entropy_coef', 0.01))}, "
+                f"clip_param={float(getattr(self.all_args, 'exchange_clip_param', 0.2))}, "
+                f"fallback_window={int(getattr(self.all_args, 'exchange_fallback_window', 50))}"
+            )
+        else:
+            self.policy.exchange_net = None
+
         # algorithm
         self.trainer = TrainAlgo(self.all_args, self.policy, device = self.device)
         

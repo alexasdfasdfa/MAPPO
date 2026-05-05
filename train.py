@@ -464,6 +464,14 @@ def main(args):
             f"train_interval={all_args.exchange_train_interval}, "
             f"accuracy_threshold={all_args.exchange_accuracy_threshold}"
         )
+    if getattr(all_args, "enable_exchange_ppo", False):
+        print(
+            f"[train] exchange PPO enabled: shadow_threshold={all_args.exchange_shadow_threshold}, "
+            f"min_shadow_steps={all_args.exchange_min_shadow_steps}, "
+            f"entropy_coef={all_args.exchange_entropy_coef}, "
+            f"clip_param={all_args.exchange_clip_param}, "
+            f"fallback_window={all_args.exchange_fallback_window}"
+        )
 
     # env init
     envs = make_train_env(all_args)

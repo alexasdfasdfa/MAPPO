@@ -248,6 +248,18 @@ class EnvCore(object):
         self.exchange_device = torch.device("cpu")
         self._exchange_data_step_counter = 0
 
+        # Exchange PPO shadow mode
+        self.enable_exchange_ppo = bool(getattr(args, "enable_exchange_ppo", False))
+        self.exchange_mode = "shadow" if self.enable_exchange_ppo else "rule_only"
+        self.exchange_agreement_count = 0
+        self.exchange_total_comparisons = 0
+        self.exchange_fleet_M_history = []
+        self.exchange_shadow_threshold = float(getattr(args, "exchange_shadow_threshold", 0.85))
+        self.exchange_min_shadow_steps = int(getattr(args, "exchange_min_shadow_steps", 500))
+        self.exchange_fallback_window = int(getattr(args, "exchange_fallback_window", 50))
+        self.exchange_training_steps = 0
+        self.exchange_network = None
+
         # Auto-load trained network for rendering (when --enable_exchange_network is set)
         if self.use_exchange_network:
             _data_dir = str(getattr(args, "exchange_data_dir", "./exchange_data"))
@@ -1300,23 +1312,350 @@ class EnvCore(object):
         """
         Entry point for task exchange.
 
-        Two phases:
-        1. Before network is trained: rule-based exchange + data collection
-        2. After network meets accuracy threshold: neural exchange for actual
-           decisions, rule still runs for continued data collection.
+        Three modes:
+        - rule_only: standard rule-based exchange (legacy behavior cloning)
+        - shadow: PPO training warmup - rule executes swaps, network observes and records
+        - network_active: network makes swap decisions, rule is disabled
         """
         if not getattr(self, "undetermined_v2_exchange", False):
             return
         if self.goal_positions is None:
             return
 
-        if self.use_exchange_network and self.exchange_network is not None:
-            # Phase 2: neural makes decisions, rule collects data for re-training
+        if self.enable_exchange_ppo:
+            self._check_exchange_mode_transition()
+            if self.exchange_mode == "shadow":
+                self._undetermined_v2_exchange_shadow_mode()
+            elif self.exchange_mode == "network_active":
+                self._undetermined_v2_exchange_ppo_network()
+            # fallback: if exchange_network is None, stay in rule_only
+        elif self.use_exchange_network and self.exchange_network is not None:
+            # Legacy behavior cloning mode: neural makes decisions, rule collects data
             self._undetermined_v2_exchange_rule_with_collection(data_only=True)
             self._undetermined_v2_exchange_neural()
         else:
-            # Phase 1: rule-based exchange + data collection
+            # Rule-based exchange + data collection (behavior cloning)
             self._undetermined_v2_exchange_rule_with_collection(data_only=False)
+
+    def _update_exchange_agreement(self, rule_action: int, network_action: int):
+        """Track agreement rate between rule and network decisions."""
+        self.exchange_total_comparisons += 1
+        if rule_action == network_action:
+            self.exchange_agreement_count += 1
+
+    def _get_exchange_agreement_rate(self) -> float:
+        if self.exchange_total_comparisons == 0:
+            return 0.0
+        return self.exchange_agreement_count / self.exchange_total_comparisons
+
+    def _check_exchange_mode_transition(self):
+        """Check if conditions are met to transition from shadow to network_active."""
+        if self.exchange_mode != "shadow":
+            return
+        if self.exchange_network is None:
+            return
+        rate = self._get_exchange_agreement_rate()
+        if (rate > self.exchange_shadow_threshold and
+                self.exchange_training_steps >= self.exchange_min_shadow_steps):
+            self.exchange_mode = "network_active"
+            print(f"[exchange_ppo] Transitioning to network_active mode: "
+                  f"agreement_rate={rate:.3f}, steps={self.exchange_training_steps}")
+
+    def _check_exchange_fallback(self):
+        """Check if fleet_M has been worsening, trigger fallback to shadow mode."""
+        if self.exchange_mode != "network_active":
+            return
+        window = self.exchange_fallback_window
+        history = self.exchange_fleet_M_history
+        if len(history) < window:
+            return
+        recent = history[-window:]
+        # Check if fleet_M has been monotonically worsening
+        worsening = all(recent[i] < recent[i + 1] for i in range(len(recent) - 1))
+        if worsening:
+            self.exchange_mode = "shadow"
+            self.exchange_agreement_count = 0
+            self.exchange_total_comparisons = 0
+            print(f"[exchange_ppo] Fallback to shadow mode: fleet_M worsening for {window} consecutive steps")
+
+    def _undetermined_v2_exchange_shadow_mode(self):
+        """
+        Shadow mode: rule executes swaps, network observes and records.
+        Collects (pair_features, log_prob, rule_action, network_action) for PPO training.
+        """
+        if self.exchange_network is None:
+            self._undetermined_v2_exchange_rule_with_collection(data_only=False)
+            return
+
+        K = int(self.num_goal_targets)
+        if K < 2:
+            return
+
+        crit = str(getattr(self.args, "undetermined_v2_exchange_accept_criterion", "fleet_m"))
+        if crit == "cone_mutual_greedy_m":
+            crit = "fleet_m"
+
+        R_ex = float(self.undetermined_v2_exchange_radius)
+        min_gain = float(getattr(self.args, "undetermined_v2_exchange_min_gain", 0.05))
+        max_pairs = max(1, int(getattr(self.args, "undetermined_v2_exchange_max_pairs_per_step", 1)))
+        ignore_pending = bool(getattr(self.args, "undetermined_v2_exchange_ignore_pending", False))
+
+        def dist_to_assigned_goal(idx: int) -> float:
+            r = self.robots[idx]
+            if r.collision or r.success:
+                return 0.0
+            tid = int(r.target_id) % K
+            gx, gy = self.goal_positions[tid]
+            return cal_distance(r.px, r.py, gx, gy)
+
+        cur_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
+        M_fleet = max(cur_dist) if cur_dist else 0.0
+        self.exchange_fleet_M_history.append(M_fleet)
+        self._check_exchange_fallback()
+
+        candidates = []
+        for i in range(self.robot_num):
+            ri = self.robots[i]
+            if ri.collision or ri.success:
+                continue
+            if not ignore_pending and bool(getattr(ri, "undetermined_target_pending", False)):
+                continue
+            for j in range(i + 1, self.robot_num):
+                rj = self.robots[j]
+                if rj.collision or rj.success:
+                    continue
+                if not ignore_pending and bool(getattr(rj, "undetermined_target_pending", False)):
+                    continue
+                if cal_distance(ri.px, ri.py, rj.px, rj.py) > R_ex + 1e-9:
+                    continue
+                ti = int(ri.target_id) % K
+                tj = int(rj.target_id) % K
+                if ti == tj:
+                    continue
+                gxi, gyi = self.goal_positions[ti]
+                gxj, gyj = self.goal_positions[tj]
+                d_i_after = cal_distance(ri.px, ri.py, gxj, gyj)
+                d_j_after = cal_distance(rj.px, rj.py, gxi, gyi)
+                others = 0.0
+                for k in range(self.robot_num):
+                    if k == i or k == j:
+                        continue
+                    others = max(others, cur_dist[k])
+                M_after = max(others, d_i_after, d_j_after)
+                gain_fleet = M_fleet - M_after
+                gain_pair = max(cur_dist[i], cur_dist[j]) - max(d_i_after, d_j_after)
+                sort_gain = gain_pair if crit == "pair_max" else gain_fleet
+                accept = (gain_pair if crit == "pair_max" else gain_fleet) > min_gain + 1e-9
+                if accept:
+                    candidates.append((sort_gain, i, j))
+
+        candidates.sort(key=lambda t: t[0], reverse=True)
+
+        # Rule-based swap decision
+        rule_swap_set = set()
+        used = set()
+        for _gain, i, j in candidates:
+            if i in used or j in used:
+                continue
+            rule_swap_set.add((i, j))
+            used.add(i)
+            used.add(j)
+            if len(rule_swap_set) >= max_pairs:
+                break
+
+        # Network observes all candidate pairs, records data
+        from envs.utils.exchange_network import ExchangeNetwork
+        features_list = []
+        pair_index_map = {}
+        feat_idx = 0
+        for (i, j) in candidates:
+            ri, rj = self.robots[i], self.robots[j]
+            ti = int(ri.target_id) % K
+            tj = int(rj.target_id) % K
+            gxi, gyi = self.goal_positions[ti]
+            gxj, gyj = self.goal_positions[tj]
+            obs_i = np.array([
+                gxi - ri.px, gyi - ri.py, ri.v, ri.theta, 1.0,
+                ri.vx_formation, ri.vy_formation, ri.px, ri.py,
+            ], dtype=np.float32)
+            obs_j = np.array([
+                gxj - rj.px, gyj - rj.py, rj.v, rj.theta, 1.0,
+                rj.vx_formation, rj.vy_formation, rj.px, rj.py,
+            ], dtype=np.float32)
+            feat = ExchangeNetwork.build_pair_features(
+                obs_i, obs_j, ri.px, ri.py, rj.px, rj.py, gxi, gyi, gxj, gyj
+            )
+            features_list.append(feat)
+            pair_index_map[feat_idx] = (i, j)
+            feat_idx += 1
+
+        if features_list:
+            features_tensor = torch.from_numpy(np.stack(features_list))
+            with torch.no_grad():
+                swap_actions, log_probs = self.exchange_network.sample_swap(features_tensor)
+
+            for feat_idx, (swap_action, log_prob) in enumerate(zip(swap_actions, log_probs)):
+                i, j = pair_index_map[feat_idx]
+                rule_action = 1 if (i, j) in rule_swap_set else 0
+                network_action = int(swap_action.item())
+                self._update_exchange_agreement(rule_action, network_action)
+
+                # Store data for buffer: features, log_prob, action (network's), advantage (computed later)
+                if not hasattr(self, 'exchange_step_data'):
+                    self.exchange_step_data = []
+                self.exchange_step_data.append({
+                    'pair_features': features_list[feat_idx],
+                    'log_prob': log_prob.item(),
+                    'swap_action': network_action,
+                    'agents': (i, j),
+                })
+
+        # Execute rule-based swaps (network does NOT execute in shadow mode)
+        swapped_pairs = set()
+        for i, j in rule_swap_set:
+            ri, rj = self.robots[i], self.robots[j]
+            ti = int(ri.target_id) % K
+            tj = int(rj.target_id) % K
+            ri.target_id = tj
+            rj.target_id = ti
+            ri.undetermined_target_pending = False
+            rj.undetermined_target_pending = False
+            self.undetermined_v2_exchange_agent_mask[i] = True
+            self.undetermined_v2_exchange_agent_mask[j] = True
+            swapped_pairs.add((i, j))
+
+        if len(swapped_pairs) > 0:
+            new_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
+            M_after = max(new_dist) if new_dist else 0.0
+            self.undetermined_v2_exchange_step_M_gain = float(M_fleet - M_after)
+            self.undetermined_v2_exchange_step_S_gain = 0.0
+            self._undetermined_sync_all_goals()
+            self._undetermined_auction_duplicate_targets()
+            self._compute_undetermined_hungarian_shaping()
+
+    def _undetermined_v2_exchange_ppo_network(self):
+        """
+        Network active mode: ExchangeNetwork makes swap decisions via PPO policy.
+        Rule-based exchange is disabled.
+        """
+        if self.exchange_network is None:
+            self._undetermined_v2_exchange_rule_with_collection(data_only=False)
+            return
+
+        self.undetermined_v2_exchange_agent_mask.fill(False)
+        self.undetermined_v2_exchange_step_M_gain = 0.0
+        self.undetermined_v2_exchange_step_S_gain = 0.0
+        K = int(self.num_goal_targets)
+        if K < 2:
+            return
+
+        R_ex = float(self.undetermined_v2_exchange_radius)
+        ignore_pending = bool(getattr(self.args, "undetermined_v2_exchange_ignore_pending", False))
+        max_pairs = max(1, int(getattr(self.args, "undetermined_v2_exchange_max_pairs_per_step", 1)))
+
+        def dist_to_assigned_goal(idx: int) -> float:
+            r = self.robots[idx]
+            if r.collision or r.success:
+                return 0.0
+            tid = int(r.target_id) % K
+            gx, gy = self.goal_positions[tid]
+            return cal_distance(r.px, r.py, gx, gy)
+
+        cur_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
+        M_fleet = max(cur_dist) if cur_dist else 0.0
+        self.exchange_fleet_M_history.append(M_fleet)
+        self._check_exchange_fallback()
+
+        candidate_pairs = []
+        for i in range(self.robot_num):
+            ri = self.robots[i]
+            if ri.collision or ri.success:
+                continue
+            if not ignore_pending and bool(getattr(ri, "undetermined_target_pending", False)):
+                continue
+            for j in range(i + 1, self.robot_num):
+                rj = self.robots[j]
+                if rj.collision or rj.success:
+                    continue
+                if not ignore_pending and bool(getattr(rj, "undetermined_target_pending", False)):
+                    continue
+                if cal_distance(ri.px, ri.py, rj.px, rj.py) > R_ex + 1e-9:
+                    continue
+                ti = int(ri.target_id) % K
+                tj = int(rj.target_id) % K
+                if ti == tj:
+                    continue
+                candidate_pairs.append((i, j))
+
+        if not candidate_pairs:
+            return
+
+        from envs.utils.exchange_network import ExchangeNetwork
+        features_list = []
+        pair_index_map = {}
+        for idx, (i, j) in enumerate(candidate_pairs):
+            ri, rj = self.robots[i], self.robots[j]
+            ti = int(ri.target_id) % K
+            tj = int(rj.target_id) % K
+            gxi, gyi = self.goal_positions[ti]
+            gxj, gyj = self.goal_positions[tj]
+            obs_i = np.array([
+                gxi - ri.px, gyi - ri.py, ri.v, ri.theta, 1.0,
+                ri.vx_formation, ri.vy_formation, ri.px, ri.py,
+            ], dtype=np.float32)
+            obs_j = np.array([
+                gxj - rj.px, gyj - rj.py, rj.v, rj.theta, 1.0,
+                rj.vx_formation, rj.vy_formation, rj.px, rj.py,
+            ], dtype=np.float32)
+            feat = ExchangeNetwork.build_pair_features(
+                obs_i, obs_j, ri.px, ri.py, rj.px, rj.py, gxi, gyi, gxj, gyj
+            )
+            features_list.append(feat)
+            pair_index_map[idx] = (i, j)
+
+        features_tensor = torch.from_numpy(np.stack(features_list))
+        with torch.no_grad():
+            swap_actions, log_probs = self.exchange_network.sample_swap(features_tensor)
+
+        # Execute swaps where network decided to swap
+        swapped_pairs = set()
+        if not hasattr(self, 'exchange_step_data'):
+            self.exchange_step_data = []
+        self.exchange_step_data = []
+
+        for idx in range(len(candidate_pairs)):
+            swap_action = int(swap_actions[idx].item())
+            log_prob = log_probs[idx]
+            i, j = pair_index_map[idx]
+            if swap_action == 1 and len(swapped_pairs) < max_pairs:
+                ri, rj = self.robots[i], self.robots[j]
+                ti = int(ri.target_id) % K
+                tj = int(rj.target_id) % K
+                ri.target_id = tj
+                rj.target_id = ti
+                ri.undetermined_target_pending = False
+                rj.undetermined_target_pending = False
+                self.undetermined_v2_exchange_agent_mask[i] = True
+                self.undetermined_v2_exchange_agent_mask[j] = True
+                swapped_pairs.add((i, j))
+
+            self.exchange_step_data.append({
+                'pair_features': features_list[idx],
+                'log_prob': log_prob.item(),
+                'swap_action': swap_action,
+                'agents': (i, j),
+            })
+
+        if len(swapped_pairs) > 0:
+            new_dist = [dist_to_assigned_goal(k) for k in range(self.robot_num)]
+            M_after = max(new_dist) if new_dist else 0.0
+            self.undetermined_v2_exchange_step_M_gain = float(M_fleet - M_after)
+            S_before = float(sum(cur_dist))
+            S_after = float(sum(new_dist))
+            self.undetermined_v2_exchange_step_S_gain = float(S_before - S_after)
+            self._undetermined_sync_all_goals()
+            self._undetermined_auction_duplicate_targets()
+            self._compute_undetermined_hungarian_shaping()
 
     def _undetermined_v2_exchange_rule_with_collection(self, data_only: bool = False):
         """

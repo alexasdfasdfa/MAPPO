@@ -1,17 +1,12 @@
 """
-ExchangeNetwork: learns the task-exchange rule via behavior cloning.
-ExchangeDataCollector: collects (obs_i, obs_j, label) pairs during env steps.
+ExchangeNetwork: predicts swap decisions for agent pairs, trained via PPO.
 """
-import json
 import math
-import os
-import random
-from typing import List, Tuple, Optional
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
 
 from envs.utils.utils import cal_distance
 
@@ -111,179 +106,53 @@ class ExchangeNetwork(nn.Module):
         self.to(device)
         self.eval()
 
+    def get_swap_log_prob(self, pair_features: torch.Tensor) -> torch.Tensor:
+        """
+        Compute log probability of swap action for pair features.
 
-# ---------------------------------------------------------------------------
-# Training utilities
-# ---------------------------------------------------------------------------
+        Args:
+            pair_features: [batch, 20] tensor
+        Returns:
+            log_prob: [batch, 2] tensor, columns are [log_prob(no_swap), log_prob(swap)]
+        """
+        logit = self.forward(pair_features)  # [batch, 1]
+        prob = torch.sigmoid(logit)
+        # Bernoulli: log_prob = [log(1-p), log(p)]
+        log_prob = torch.cat([torch.log(1 - prob + 1e-8), torch.log(prob + 1e-8)], dim=-1)
+        return log_prob
 
-def _load_exchange_data(data_dir: str) -> Tuple[np.ndarray, np.ndarray]:
-    """Load all JSONL files from data_dir, return (features, labels)."""
-    features_list = []
-    labels_list = []
+    def sample_swap(self, pair_features: torch.Tensor) -> tuple:
+        """
+        Sample swap action and return (action, log_prob).
 
-    for fname in sorted(os.listdir(data_dir)):
-        if not fname.endswith(".jsonl"):
-            continue
-        fpath = os.path.join(data_dir, fname)
-        with open(fpath, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                rec = json.loads(line)
-                feat = np.array(rec["features"], dtype=np.float32)
-                label = int(rec["label"])
-                features_list.append(feat)
-                labels_list.append(label)
+        Args:
+            pair_features: [batch, 20] tensor
+        Returns:
+            action: [batch] tensor of 0/1
+            log_prob: [batch, 1] tensor of log probability of sampled action
+        """
+        logit = self.forward(pair_features)  # [batch, 1]
+        prob = torch.sigmoid(logit)
+        dist = torch.distributions.Bernoulli(prob)
+        action = dist.sample().squeeze(-1)  # [batch]
+        log_prob = dist.log_prob(action).unsqueeze(-1)  # [batch, 1]
+        return action, log_prob
 
-    if not features_list:
-        return np.empty((0, ExchangeNetwork.PAIR_FEAT_DIM), dtype=np.float32), np.empty((0,), dtype=np.float32)
+    def compute_entropy(self, pair_features: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Compute Bernoulli entropy of swap distribution.
 
-    X = np.stack(features_list, axis=0)
-    y = np.array(labels_list, dtype=np.float32)
-    return X, y
+        If pair_features is provided, computes entropy for those features.
+        Otherwise computes from current output (requires forward pass context).
 
-
-def train_exchange_network(
-    data_dir: str,
-    model_save_path: str,
-    epochs: int = 50,
-    batch_size: int = 256,
-    lr: float = 1e-3,
-    device: torch.device = torch.device("cpu"),
-    val_split: float = 0.2,
-) -> dict:
-    """
-    Train ExchangeNetwork from JSONL data.
-
-    Returns: dict with 'best_val_acc', 'final_loss', 'num_samples'
-    """
-    X, y = _load_exchange_data(data_dir)
-    if X.shape[0] < 32:
-        print(f"[exchange_net] too few samples ({X.shape[0]}), skip training")
-        return {"best_val_acc": 0.0, "final_loss": -1.0, "num_samples": X.shape[0]}
-
-    # Train/val split
-    n = X.shape[0]
-    n_val = max(1, int(n * val_split))
-    indices = np.random.permutation(n)
-    val_idx = indices[:n_val]
-    train_idx = indices[n_val:]
-
-    X_train = torch.from_numpy(X[train_idx])
-    y_train = torch.from_numpy(y[train_idx])
-    X_val = torch.from_numpy(X[val_idx])
-    y_val = torch.from_numpy(y[val_idx])
-
-    train_ds = TensorDataset(X_train, y_train)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=False)
-
-    model = ExchangeNetwork().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.BCEWithLogitsLoss()
-
-    best_val_acc = 0.0
-    best_state = None
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0.0
-        n_batches = 0
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            logits = model(xb).squeeze(-1)
-            loss = criterion(logits, yb)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            n_batches += 1
-
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            val_logits = model(X_val.to(device)).squeeze(-1)
-            val_preds = (torch.sigmoid(val_logits) > 0.5).float()
-            val_acc = (val_preds == y_val.to(device)).float().mean().item()
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-
-        if epoch % 10 == 0 or epoch == epochs - 1:
-            avg_loss = total_loss / max(1, n_batches)
-            print(
-                f"[exchange_net] epoch {epoch}/{epochs} "
-                f"loss={avg_loss:.4f} val_acc={val_acc:.4f} best_val_acc={best_val_acc:.4f}"
-            )
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
-        torch.save(model.state_dict(), model_save_path)
-        print(f"[exchange_net] model saved to {model_save_path} (best_val_acc={best_val_acc:.4f})")
-
-    return {
-        "best_val_acc": best_val_acc,
-        "final_loss": total_loss / max(1, n_batches),
-        "num_samples": n,
-    }
-
-
-# ---------------------------------------------------------------------------
-# ExchangeDataCollector
-# ---------------------------------------------------------------------------
-
-class ExchangeDataCollector:
-    """
-    Collects exchange training data during env steps.
-
-    Appends to a single file per process to avoid creating millions of tiny files.
-    """
-
-    FLUSH_INTERVAL = 5000  # flush buffer every N samples
-
-    def __init__(self, data_dir: str = "./exchange_data", file_id: str = "all"):
-        self.data_dir = data_dir
-        self.buffer: List[dict] = []
-        self.total_count = 0
-        os.makedirs(self.data_dir, exist_ok=True)
-        # Single consolidated file per process (avoids millions of tiny files)
-        self._fpath = os.path.join(self.data_dir, f"exchange_data_{file_id}.jsonl")
-
-    def add_candidate(
-        self,
-        obs_i: np.ndarray,
-        obs_j: np.ndarray,
-        px_i: float, py_i: float,
-        px_j: float, py_j: float,
-        gx_i: float, gy_i: float,
-        gx_j: float, gy_j: float,
-        swapped: bool,
-    ):
-        features = ExchangeNetwork.build_pair_features(
-            obs_i, obs_j, px_i, py_i, px_j, py_j, gx_i, gy_i, gx_j, gy_j
-        )
-        self.buffer.append({
-            "features": features.tolist(),
-            "label": 1 if swapped else 0,
-        })
-        self.total_count += 1
-        if len(self.buffer) >= self.FLUSH_INTERVAL:
-            self._flush_buffer()
-
-    def _flush_buffer(self):
-        if not self.buffer:
-            return
-        with open(self._fpath, "a", encoding="utf-8") as f:
-            for rec in self.buffer:
-                f.write(json.dumps(rec) + "\n")
-        self.buffer.clear()
-
-    def flush_to_file(self, step_id: int = 0):
-        """Final flush of any remaining buffered data."""
-        self._flush_buffer()
-
-    @property
-    def sample_count(self) -> int:
-        return len(self.buffer) + self.total_count
+        Returns:
+            entropy: [batch] tensor of Bernoulli entropy values
+        """
+        if pair_features is None:
+            # This method is typically called with features during loss computation
+            raise ValueError("pair_features must be provided")
+        logit = self.forward(pair_features)
+        prob = torch.sigmoid(logit)
+        # Bernoulli entropy: -p*log(p) - (1-p)*log(1-p)
+        entropy = -(prob * torch.log(prob + 1e-8) + (1 - prob) * torch.log(1 - prob + 1e-8))
+        return entropy.squeeze(-1)

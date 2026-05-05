@@ -122,6 +122,31 @@ class SharedReplayBuffer(object):
 
         self.step = 0
 
+        # Exchange PPO data buffers
+        self._use_exchange_ppo = bool(getattr(args, "enable_exchange_ppo", False))
+        if self._use_exchange_ppo:
+            self.exchange_pair_features = np.zeros(
+                (self.episode_length + 1, self.n_rollout_threads, num_agents, 20),
+                dtype=np.float32,
+            )
+            self.exchange_old_log_probs = np.zeros(
+                (self.episode_length + 1, self.n_rollout_threads, num_agents, 1),
+                dtype=np.float32,
+            )
+            self.exchange_actions = np.zeros(
+                (self.episode_length + 1, self.n_rollout_threads, num_agents, 1),
+                dtype=np.float32,
+            )
+            self.exchange_advantages = np.zeros(
+                (self.episode_length, self.n_rollout_threads, num_agents, 1),
+                dtype=np.float32,
+            )
+        else:
+            self.exchange_pair_features = None
+            self.exchange_old_log_probs = None
+            self.exchange_actions = None
+            self.exchange_advantages = None
+
     def insert(
         self,
         share_obs,
@@ -176,6 +201,26 @@ class SharedReplayBuffer(object):
 
         self.step = (self.step + 1) % self.episode_length
 
+    def insert_exchange(self, step, pair_features, log_prob, swap_action, advantage):
+        """
+        Insert exchange PPO data for a single step.
+        :param step: current step index (0-based within episode)
+        :param pair_features: [T, N, 20] or [N, 20] pair features for candidate pairs
+        :param log_prob: [T, N, 1] or [N, 1] log probability of swap action taken
+        :param swap_action: [T, N, 1] or [N, 1] 0 or 1
+        :param advantage: [T, N, 1] or [N, 1] fleet_M_drop as advantage
+        """
+        if not self._use_exchange_ppo:
+            return
+        if pair_features is not None:
+            self.exchange_pair_features[step + 1] = np.asarray(pair_features, dtype=np.float32).copy()
+        if log_prob is not None:
+            self.exchange_old_log_probs[step + 1] = np.asarray(log_prob, dtype=np.float32).copy()
+        if swap_action is not None:
+            self.exchange_actions[step + 1] = np.asarray(swap_action, dtype=np.float32).copy()
+        if advantage is not None:
+            self.exchange_advantages[step] = np.asarray(advantage, dtype=np.float32).copy()
+
     def chooseinsert(self, share_obs, obs, rnn_states, rnn_states_critic, actions, action_log_probs,
                      value_preds, rewards, masks, bad_masks=None, active_masks=None, available_actions=None):
         """
@@ -226,6 +271,10 @@ class SharedReplayBuffer(object):
             self.comm_rnn_states[0] = self.comm_rnn_states[-1].copy()
         if self.undet_target_logits is not None:
             self.undet_target_logits[0] = self.undet_target_logits[-1].copy()
+        if self.exchange_pair_features is not None:
+            self.exchange_pair_features[0] = self.exchange_pair_features[-1].copy()
+            self.exchange_old_log_probs[0] = self.exchange_old_log_probs[-1].copy()
+            self.exchange_actions[0] = self.exchange_actions[-1].copy()
 
     def chooseafter_update(self):
         """Copy last timestep data to first index. This method is used for Hanabi."""
@@ -704,4 +753,41 @@ class SharedReplayBuffer(object):
                 available_actions_batch,
                 old_undet_target_logits_batch,
             )
-           
+
+
+    def exchange_feed_forward_generator(self, num_mini_batch=None, mini_batch_size=None):
+        """
+        Yield training data for exchange PPO policy update.
+        :param num_mini_batch: number of minibatches to split the batch into.
+        :param mini_batch_size: number of samples in each minibatch.
+        """
+        if not self._use_exchange_ppo:
+            return
+
+        episode_length, n_rollout_threads, num_agents = self.rewards.shape[0:3]
+        batch_size = n_rollout_threads * episode_length * num_agents
+
+        if mini_batch_size is None:
+            assert batch_size >= num_mini_batch, (
+                "PPO requires the number of processes ({}) "
+                "* number of steps ({}) * number of agents ({}) = {} "
+                "to be greater than or equal to the number of PPO mini batches ({})."
+                "".format(n_rollout_threads, episode_length, num_agents,
+                          n_rollout_threads * episode_length * num_agents,
+                          num_mini_batch))
+            mini_batch_size = batch_size // num_mini_batch
+
+        rand = torch.randperm(batch_size).numpy()
+        sampler = [rand[i * mini_batch_size:(i + 1) * mini_batch_size] for i in range(num_mini_batch)]
+
+        pair_features = self.exchange_pair_features[:-1].reshape(-1, 20)
+        old_log_probs = self.exchange_old_log_probs[:-1].reshape(-1, 1)
+        actions = self.exchange_actions[:-1].reshape(-1, 1)
+        advantages = self.exchange_advantages.reshape(-1, 1)
+
+        for indices in sampler:
+            pair_features_batch = pair_features[indices]
+            old_log_probs_batch = old_log_probs[indices]
+            actions_batch = actions[indices]
+            advantages_batch = advantages[indices]
+            yield pair_features_batch, old_log_probs_batch, actions_batch, advantages_batch

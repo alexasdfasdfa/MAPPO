@@ -5,6 +5,8 @@ data.csv
 fig/
 render.py
 exchange_data/
+.claude/
+openspec/
 
 # Python bytecode (should not be versioned; regenerate on run)
 __pycache__/

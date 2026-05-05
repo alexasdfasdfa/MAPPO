@@ -56,6 +56,16 @@ class RMAPPO():
         self._use_value_active_masks = args.use_value_active_masks
         self._use_policy_active_masks = args.use_policy_active_masks
 
+        # Exchange PPO parameters
+        self._use_exchange_ppo = bool(getattr(args, "enable_exchange_ppo", False))
+        if self._use_exchange_ppo:
+            self.exchange_clip_param = float(getattr(args, "exchange_clip_param", 0.2))
+            self.exchange_entropy_coef = float(getattr(args, "exchange_entropy_coef", 0.01))
+            self.exchange_optimizer = torch.optim.Adam(
+                self.policy.exchange_net.parameters(),
+                lr=float(getattr(args, "exchange_lr", 1e-3)),
+            )
+
         assert (self._use_popart and self._use_valuenorm) == False, (
             "self._use_popart and self._use_valuenorm can not be set True simultaneously")
 
@@ -321,6 +331,52 @@ class RMAPPO():
             undet_v3_kl_item,
         )
 
+    def exchange_ppo_update(self, sample):
+        """
+        Update exchange network using PPO clipped surrogate loss.
+        :param sample: tuple of (pair_features, old_log_probs, actions, advantages)
+
+        :return exchange_loss: (torch.Tensor) exchange policy loss
+        :return exchange_entropy: (torch.Tensor) Bernoulli entropy
+        :return exchange_grad_norm: (torch.Tensor) gradient norm
+        """
+        pair_features, old_log_probs, actions, advantages = sample
+
+        pair_features = check(pair_features).to(**self.tpdv)
+        old_log_probs = check(old_log_probs).to(**self.tpdv)
+        actions = check(actions).to(**self.tpdv)
+        advantages = check(advantages).to(**self.tpdv)
+
+        # Compute new log probabilities
+        new_log_probs = self.policy.exchange_net.get_swap_log_prob(pair_features)
+        # Extract log prob for the action that was taken
+        # actions are 0 or 1, new_log_probs is [batch, 2]
+        actions_long = actions.long()
+        new_log_probs_taken = new_log_probs.gather(1, actions_long).reshape(-1, 1)
+
+        # Importance ratio
+        imp_weights = torch.exp(new_log_probs_taken - old_log_probs)
+
+        # Clipped surrogate loss
+        surr1 = imp_weights * advantages
+        surr2 = torch.clamp(imp_weights, 1.0 - self.exchange_clip_param, 1.0 + self.exchange_clip_param) * advantages
+        policy_loss = -(torch.min(surr1, surr2)).mean()
+
+        # Entropy bonus
+        entropy = self.policy.exchange_net.compute_entropy(pair_features)
+        entropy_loss = entropy.mean()
+
+        loss = policy_loss - self.exchange_entropy_coef * entropy_loss
+
+        self.exchange_optimizer.zero_grad()
+        loss.backward()
+        exchange_grad_norm = nn.utils.clip_grad_norm_(
+            self.policy.exchange_net.parameters(), self.max_grad_norm
+        )
+        self.exchange_optimizer.step()
+
+        return loss.detach().item(), entropy_loss.detach().item(), float(exchange_grad_norm)
+
     def train(self, buffer, update_actor=True):
         """
         Perform a training update using minibatch GD.
@@ -351,6 +407,10 @@ class RMAPPO():
             train_info["undet_head_aux_loss"] = 0.0
         if self._undet_v3_kl_coef > 1e-12 and getattr(self._args, "enable_undetermined_goal_v3", False):
             train_info["undet_v3_target_kl"] = 0.0
+        if self._use_exchange_ppo:
+            train_info['exchange_loss'] = 0
+            train_info['exchange_entropy'] = 0
+            train_info['exchange_grad_norm'] = 0
 
         for _ in range(self.ppo_epoch):#耗时16
             if self._use_recurrent_policy:
@@ -386,6 +446,14 @@ class RMAPPO():
                     and undet_v3_kl_item is not None
                 ):
                     train_info["undet_v3_target_kl"] += undet_v3_kl_item
+
+            # Exchange PPO update
+            if self._use_exchange_ppo:
+                for ex_sample in buffer.exchange_feed_forward_generator(self.num_mini_batch):
+                    ex_loss, ex_entropy, ex_grad_norm = self.exchange_ppo_update(ex_sample)
+                    train_info['exchange_loss'] += ex_loss
+                    train_info['exchange_entropy'] += ex_entropy
+                    train_info['exchange_grad_norm'] += ex_grad_norm
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
