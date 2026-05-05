@@ -447,7 +447,7 @@ def render_all_agents_gif(
             else (i % K)
         )
         hex_c = mcolors.to_hex(target_colors[tid_init])
-        (ln,) = ax.plot([], [], color=hex_c, linewidth=1.4, alpha=0.88)
+        # (ln,) = ax.plot([], [], color=hex_c, linewidth=1.4, alpha=0.88)
         sc = ax.scatter(
             [],
             [],
@@ -457,7 +457,6 @@ def render_all_agents_gif(
             edgecolors="k",
             linewidths=0.4,
         )
-        lines.append(ln)
         scats.append(sc)
 
     title_artist = ax.set_title("")
@@ -465,16 +464,16 @@ def render_all_agents_gif(
     for t in indices:
         for i in range(A):
             seg = traj[: t + 1, i, :]
-            lines[i].set_data(seg[:, 0], seg[:, 1])
+            # lines[i].set_data(seg[:, 0], seg[:, 1])
             scats[i].set_offsets(seg[-1:])
             if use_dynamic_goals and target_ids_by_step is not None and goal_positions is not None:
                 tid = int(target_ids_by_step[t, i]) % K
                 hex_t = mcolors.to_hex(target_colors[tid])
-                lines[i].set_color(hex_t)
+                # lines[i].set_color(hex_t)
                 scats[i].set_facecolors([hex_t])
             else:
                 hex_s = mcolors.to_hex(target_colors[i % K])
-                lines[i].set_color(hex_s)
+                # lines[i].set_color(hex_s)
                 scats[i].set_facecolors([hex_s])
         if use_dynamic_goals and goal_scats:
             assert goal_positions is not None and target_ids_by_step is not None
@@ -484,7 +483,7 @@ def render_all_agents_gif(
                 goal_scats[i].set_offsets(np.array([[gx, gy]]))
                 goal_scats[i].set_edgecolors([mcolors.to_hex(target_colors[tid])])
         title_artist.set_text(
-            f"episode {episode_id}  |  steps 0–{t} / {T - 1}  |  agents 0..{A - 1}"
+            f"steps 0–{t} / {T - 1}  |  agents 0..{A - 1}"
         )
 
         fig.canvas.draw()

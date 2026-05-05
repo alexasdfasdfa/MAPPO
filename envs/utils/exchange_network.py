@@ -238,17 +238,18 @@ class ExchangeDataCollector:
     """
     Collects exchange training data during env steps.
 
-    Usage:
-        collector = ExchangeDataCollector(data_dir="./exchange_data")
-        # In env._undetermined_v2_exchange_heuristic():
-        collector.add_candidate(obs_i, obs_j, px_i, py_i, px_j, py_j,
-                                gx_i, gy_i, gx_j, gy_j, swapped=True/False)
-        collector.flush_to_file(step_id)
+    Appends to a single file per process to avoid creating millions of tiny files.
     """
 
-    def __init__(self, data_dir: str = "./exchange_data"):
+    FLUSH_INTERVAL = 5000  # flush buffer every N samples
+
+    def __init__(self, data_dir: str = "./exchange_data", file_id: str = "all"):
         self.data_dir = data_dir
         self.buffer: List[dict] = []
+        self.total_count = 0
+        os.makedirs(self.data_dir, exist_ok=True)
+        # Single consolidated file per process (avoids millions of tiny files)
+        self._fpath = os.path.join(self.data_dir, f"exchange_data_{file_id}.jsonl")
 
     def add_candidate(
         self,
@@ -267,17 +268,22 @@ class ExchangeDataCollector:
             "features": features.tolist(),
             "label": 1 if swapped else 0,
         })
+        self.total_count += 1
+        if len(self.buffer) >= self.FLUSH_INTERVAL:
+            self._flush_buffer()
 
-    def flush_to_file(self, step_id: int):
+    def _flush_buffer(self):
         if not self.buffer:
             return
-        os.makedirs(self.data_dir, exist_ok=True)
-        fpath = os.path.join(self.data_dir, f"step_{step_id:07d}.jsonl")
-        with open(fpath, "w", encoding="utf-8") as f:
+        with open(self._fpath, "a", encoding="utf-8") as f:
             for rec in self.buffer:
                 f.write(json.dumps(rec) + "\n")
         self.buffer.clear()
 
+    def flush_to_file(self, step_id: int = 0):
+        """Final flush of any remaining buffered data."""
+        self._flush_buffer()
+
     @property
     def sample_count(self) -> int:
-        return len(self.buffer)
+        return len(self.buffer) + self.total_count

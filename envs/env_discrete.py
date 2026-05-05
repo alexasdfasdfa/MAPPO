@@ -273,6 +273,12 @@ class DiscreteActionEnv(gym.Env):
         network.to(device if device else self.env.exchange_device)
         network.eval()
 
+    def close(self):
+        """Flush any buffered exchange data before shutting down."""
+        collector = getattr(self.env, "exchange_data_collector", None)
+        if collector is not None and collector.sample_count > 0:
+            collector.flush_to_file(9999999)
+
     def render(self, mode='vedio', visualize = False):
         from matplotlib import animation
         import matplotlib.pyplot as plt

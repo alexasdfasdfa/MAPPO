@@ -3,6 +3,7 @@ import math
 import numpy as np
 import torch
 import rvo2
+import os
 from numpy.linalg import norm
 from envs.utils.human import Human
 from envs.utils.info import *
@@ -235,10 +236,30 @@ class EnvCore(object):
 
         # Exchange learning (behavior cloning to replace rule-based exchange)
         self.exchange_data_collector = getattr(args, "exchange_data_collector", None)
+        # For SubprocVecEnv, each subprocess creates its own collector with unique file_id
+        if self.exchange_data_collector is None and getattr(args, "enable_exchange_learning", False):
+            import os as _os
+            from envs.utils.exchange_network import ExchangeDataCollector
+            data_dir = str(getattr(args, "exchange_data_dir", "./exchange_data"))
+            file_id = str(getattr(args, "env_rank", _os.getpid()))
+            self.exchange_data_collector = ExchangeDataCollector(data_dir=data_dir, file_id=file_id)
         self.exchange_network = None
         self.use_exchange_network = bool(getattr(args, "enable_exchange_network", False))
         self.exchange_device = torch.device("cpu")
         self._exchange_data_step_counter = 0
+
+        # Auto-load trained network for rendering (when --enable_exchange_network is set)
+        if self.use_exchange_network:
+            _data_dir = str(getattr(args, "exchange_data_dir", "./exchange_data"))
+            _model_path = os.path.join(_data_dir, "exchange_net.pt")
+            if os.path.exists(_model_path):
+                from envs.utils.exchange_network import ExchangeNetwork
+                self.exchange_network = ExchangeNetwork()
+                self.exchange_network.load(_model_path, self.exchange_device)
+                print(f"[exchange_net] loaded trained model from {_model_path}")
+            else:
+                print(f"[exchange_net] model not found at {_model_path}, falling back to rule-based exchange")
+                self.use_exchange_network = False
 
         self.dynamic_goal_assignment = bool(getattr(args, "enable_dynamic_goal_assignment", False))
         if self.undetermined_goal_assignment:

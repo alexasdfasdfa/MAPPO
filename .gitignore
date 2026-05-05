@@ -4,6 +4,7 @@ results/
 data.csv
 fig/
 render.py
+exchange_data/
 
 # Python bytecode (should not be versioned; regenerate on run)
 __pycache__/

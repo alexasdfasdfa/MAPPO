@@ -501,12 +501,58 @@ class EnvRunner(Runner):
                 if episode % self.eval_interval == 0 and self.use_eval:
                     self.eval(total_num_steps)
 
+                # Log exchange network accuracy each episode (if network is trained)
+                if getattr(self.all_args, "enable_exchange_learning", False):
+                    self._log_exchange_accuracy(total_num_steps, episode)
                 # Train exchange network periodically
                 if getattr(self.all_args, "enable_exchange_learning", False):
                     self._maybe_train_exchange_network(total_num_steps, episode)
         finally:
             self._close_reward_terms_log()
             self._close_exchange_data_log()
+
+    def _log_exchange_accuracy(self, total_num_steps, episode):
+        """Evaluate current exchange model accuracy on all collected data."""
+        data_dir = str(getattr(self.all_args, "exchange_data_dir", "./exchange_data"))
+        model_path = str(Path(data_dir) / "exchange_net.pt")
+
+        import json
+        import numpy as np
+        import torch
+        from envs.utils.exchange_network import ExchangeNetwork
+
+        features_list = []
+        labels_list = []
+        for fpath in sorted(Path(data_dir).glob("exchange_data_*.jsonl")):
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+                    features_list.append(np.array(rec["features"], dtype=np.float32))
+                    labels_list.append(float(rec["label"]))
+
+        n_samples = len(features_list)
+        if n_samples == 0:
+            return
+
+        if Path(model_path).exists():
+            X = np.stack(features_list, axis=0)
+            y = np.array(labels_list, dtype=np.float32)
+
+            net = ExchangeNetwork()
+            net.load(model_path, self.device)
+            net.eval()
+
+            with torch.no_grad():
+                x = torch.from_numpy(X).to(self.device)
+                logits = net(x).squeeze(-1)
+                preds = (torch.sigmoid(logits) > 0.5).float().cpu().numpy()
+                acc = (preds == y).mean()
+            print(f"[exchange_acc] ep={episode} step={total_num_steps} samples={n_samples} acc={acc:.4f}")
+        else:
+            print(f"[exchange_acc] ep={episode} samples={n_samples} (model not trained yet)")
 
     def _maybe_train_exchange_network(self, total_num_steps, episode):
         """Train exchange network every exchange_train_interval steps if enough data collected."""
@@ -518,8 +564,8 @@ class EnvRunner(Runner):
         if not Path(data_dir).exists():
             return
 
-        # Count available JSONL samples
-        jsonl_files = list(Path(data_dir).glob("step_*.jsonl"))
+        # Count available samples from consolidated files
+        jsonl_files = list(Path(data_dir).glob("exchange_data_*.jsonl"))
         if not jsonl_files:
             return
 
