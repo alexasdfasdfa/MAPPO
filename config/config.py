@@ -250,13 +250,13 @@ def get_config():
         "--exchange_shadow_threshold",
         type=float,
         default=0.85,
-        help="Agreement rate threshold to switch from shadow mode to network active mode.",
+        help="DEPRECATED: shadow mode removed. Exchange network trains in network_active mode from the start.",
     )
     parser.add_argument(
         "--exchange_min_shadow_steps",
         type=int,
         default=500,
-        help="Minimum training steps in shadow mode before network can take over.",
+        help="DEPRECATED: shadow mode removed. This parameter is ignored.",
     )
     parser.add_argument(
         "--exchange_entropy_coef",

@@ -499,6 +499,18 @@ class EnvRunner(Runner):
                     train_infos["average_episode_rewards"] = np.mean(self.buffer.rewards) * self.episode_length
                     print("average episode rewards is {}".format(train_infos["average_episode_rewards"]))
                     self.log_train(train_infos, total_num_steps)
+
+                    # Print exchange PPO metrics to console
+                    if getattr(self.all_args, "enable_exchange_ppo", False) and self.buffer._use_exchange_ppo:
+                        ex_loss = train_infos.get("exchange_loss", 0)
+                        ex_entropy = train_infos.get("exchange_entropy", 0)
+                        ex_mode = train_infos.get("exchange_mode", "network_active")
+                        ex_agree = train_infos.get("exchange_agreement_rate", 0)
+                        ex_grad = train_infos.get("exchange_grad_norm", 0)
+                        print(
+                            f"  exchange: mode={ex_mode} agreement={ex_agree:.3f} "
+                            f"loss={ex_loss:.4f} entropy={ex_entropy:.4f} grad_norm={ex_grad:.4f}"
+                        )
                     # self.log_env(env_infos, total_num_steps)
 
                 # eval
@@ -517,6 +529,12 @@ class EnvRunner(Runner):
                 # Log exchange PPO metrics
                 if getattr(self.all_args, "enable_exchange_ppo", False):
                     self._log_exchange_ppo_metrics(total_num_steps)
+                    # Inject into train_infos for console printing
+                    env0 = getattr(self.envs, 'envs', [None])[0]
+                    if env0 is not None:
+                        env_core = getattr(env0, 'env_core', env0)
+                        train_infos['exchange_mode'] = getattr(env_core, 'exchange_mode', 'rule_only')
+                        train_infos['exchange_agreement_rate'] = getattr(env_core, '_get_exchange_agreement_rate', lambda: 0.0)()
         finally:
             self._close_reward_terms_log()
             self._close_exchange_data_log()
@@ -621,7 +639,7 @@ class EnvRunner(Runner):
         if env0 is None:
             return
         env_core = getattr(env0, 'env_core', env0)
-        exchange_mode = getattr(env_core, 'exchange_mode', 'rule_only')
+        exchange_mode = getattr(env_core, 'exchange_mode', 'network_active')
         agreement_rate = getattr(env_core, '_get_exchange_agreement_rate', lambda: 0.0)()
         training_steps = getattr(env_core, 'exchange_training_steps', 0)
 
@@ -817,7 +835,7 @@ class EnvRunner(Runner):
 
     def _insert_exchange_step(self, infos):
         """Extract exchange data from env infos and write to buffer."""
-        # exchange_step_data is set by EnvCore._undetermined_v2_exchange_shadow_mode or _ppo_network
+        # exchange_step_data is set by EnvCore._undetermined_v2_exchange_ppo_network
         # For SubprocVecEnv, data comes through infos
         exchange_data = getattr(self, '_last_exchange_data', None)
         if exchange_data is None:

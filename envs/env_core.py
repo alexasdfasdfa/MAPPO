@@ -243,30 +243,20 @@ class EnvCore(object):
         self.exchange_device = torch.device("cpu")
         self._exchange_data_step_counter = 0
 
-        # Exchange PPO shadow mode
+        # Exchange PPO — always network_active when enabled
         self.enable_exchange_ppo = bool(getattr(args, "enable_exchange_ppo", False))
-        self.exchange_mode = "shadow" if self.enable_exchange_ppo else "rule_only"
+        self.exchange_mode = "network_active" if self.enable_exchange_ppo else "rule_only"
         self.exchange_agreement_count = 0
         self.exchange_total_comparisons = 0
         self.exchange_fleet_M_history = []
-        self.exchange_shadow_threshold = float(getattr(args, "exchange_shadow_threshold", 0.85))
-        self.exchange_min_shadow_steps = int(getattr(args, "exchange_min_shadow_steps", 500))
         self.exchange_fallback_window = int(getattr(args, "exchange_fallback_window", 50))
         self.exchange_training_steps = 0
         self.exchange_network = None
 
-        # Auto-load trained network for rendering (when --enable_exchange_network is set)
-        if self.use_exchange_network:
-            _data_dir = str(getattr(args, "exchange_data_dir", "./exchange_data"))
-            _model_path = os.path.join(_data_dir, "exchange_net.pt")
-            if os.path.exists(_model_path):
-                from envs.utils.exchange_network import ExchangeNetwork
-                self.exchange_network = ExchangeNetwork()
-                self.exchange_network.load(_model_path, self.exchange_device)
-                print(f"[exchange_net] loaded trained model from {_model_path}")
-            else:
-                print(f"[exchange_net] model not found at {_model_path}, falling back to rule-based exchange")
-                self.use_exchange_network = False
+        # Auto-load trained exchange network (for training and render).
+        # Priority: PPO-trained exchange_nn.pt (from model_dir) → legacy BC exchange_net.pt → rule-based
+        if self.enable_exchange_ppo or self.use_exchange_network or getattr(args, "model_dir", None):
+            self._load_exchange_network_from_args(args)
 
         self.dynamic_goal_assignment = bool(getattr(args, "enable_dynamic_goal_assignment", False))
         if self.undetermined_goal_assignment:
@@ -1318,12 +1308,11 @@ class EnvCore(object):
             return
 
         if self.enable_exchange_ppo:
-            self._check_exchange_mode_transition()
-            if self.exchange_mode == "shadow":
-                self._undetermined_v2_exchange_shadow_mode()
-            elif self.exchange_mode == "network_active":
+            if self.exchange_network is None:
+                # No network yet — fall back to rule-based exchange
+                self._undetermined_v2_exchange_rule_with_collection(data_only=False)
+            else:
                 self._undetermined_v2_exchange_ppo_network()
-            # fallback: if exchange_network is None, stay in rule_only
         elif self.use_exchange_network and self.exchange_network is not None:
             # Legacy behavior cloning mode: neural makes decisions, rule collects data
             self._undetermined_v2_exchange_rule_with_collection(data_only=True)
@@ -1331,6 +1320,32 @@ class EnvCore(object):
         else:
             # Rule-based exchange + data collection (behavior cloning)
             self._undetermined_v2_exchange_rule_with_collection(data_only=False)
+
+    def _load_exchange_network_from_args(self, args):
+        """Load exchange network from model_dir/exchange_nn.pt, fallback to exchange_data/exchange_net.pt."""
+        _loaded = False
+        # First try: PPO-trained model from model_dir
+        _model_dir = str(getattr(args, "model_dir", None) or "")
+        if _model_dir:
+            _ppo_path = os.path.join(_model_dir, "exchange_nn.pt")
+            if os.path.exists(_ppo_path):
+                from envs.utils.exchange_network import ExchangeNetwork
+                self.exchange_network = ExchangeNetwork()
+                self.exchange_network.load(_ppo_path, self.exchange_device)
+                print(f"[exchange_net] loaded PPO-trained model from {_ppo_path}")
+                _loaded = True
+        # Second try: legacy BC model
+        if not _loaded:
+            _data_dir = str(getattr(args, "exchange_data_dir", "./exchange_data"))
+            _model_path = os.path.join(_data_dir, "exchange_net.pt")
+            if os.path.exists(_model_path):
+                from envs.utils.exchange_network import ExchangeNetwork
+                self.exchange_network = ExchangeNetwork()
+                self.exchange_network.load(_model_path, self.exchange_device)
+                print(f"[exchange_net] loaded legacy BC model from {_model_path}")
+                _loaded = True
+        if not _loaded:
+            print(f"[exchange_net] no trained exchange model found, using rule-based exchange as fallback")
 
     def _update_exchange_agreement(self, rule_action: int, network_action: int):
         """Track agreement rate between rule and network decisions."""
@@ -1375,8 +1390,9 @@ class EnvCore(object):
 
     def _undetermined_v2_exchange_shadow_mode(self):
         """
-        Shadow mode: rule executes swaps, network observes and records.
-        Collects (pair_features, log_prob, rule_action, network_action) for PPO training.
+        DEPRECATED: Shadow mode was removed in favor of always network_active training.
+        This method is kept for reference but should not be called.
+        Old behavior: rule executes swaps, network observes and records.
         """
         if self.exchange_network is None:
             self._undetermined_v2_exchange_rule_with_collection(data_only=False)

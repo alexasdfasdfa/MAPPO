@@ -180,17 +180,16 @@ def worker(remote, parent_remote, env_fn_wrapper):
             ob = env.apply_undetermined_targets(data)
             remote.send(ob)
         elif cmd == 'set_exchange_network':
-            # Receive state_dict (CPU), create network, load and move to device
+            # Keep network on CPU in subprocess — small model, CPU inference is fast enough.
+            # Avoiding .cuda() prevents CUDA re-initialization in forked subprocess.
             from envs.utils.exchange_network import ExchangeNetwork
             state_dict, device_type, train_mode = data
             network = ExchangeNetwork()
             if state_dict is not None:
                 network.load_state_dict(state_dict)
-            if device_type == 'cuda':
-                network = network.cuda()
             network.train() if train_mode else network.eval()
             env.exchange_network = network
-            env.exchange_device = torch.device(device_type)
+            env.exchange_device = torch.device('cpu')
             remote.send(None)
         elif cmd == 'get_exchange_candidates':
             # Return raw pair features from env, no network inference in subprocess

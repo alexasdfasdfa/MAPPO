@@ -86,7 +86,7 @@ class Runner(object):
         if getattr(self.all_args, "enable_exchange_ppo", False):
             from envs.utils.exchange_network import ExchangeNetwork
             self.policy.exchange_net = ExchangeNetwork().to(self.device)
-            # Inject the same network instance into envs for shadow mode inference
+            # Inject the same network instance into envs for rollout inference
             self.envs.set_exchange_network(self.policy.exchange_net, self.device, train_mode=False)
             print(
                 f"[train] exchange PPO: shadow_threshold={float(getattr(self.all_args, 'exchange_shadow_threshold', 0.85))}, "
@@ -150,6 +150,8 @@ class Runner(object):
         torch.save(policy_actor.state_dict(), str(self.save_dir) + "/actor.pt")
         policy_critic = self.trainer.policy.critic
         torch.save(policy_critic.state_dict(), str(self.save_dir) + "/critic.pt")
+        if self.policy.exchange_net is not None:
+            torch.save(self.policy.exchange_net.state_dict(), str(self.save_dir) + "/exchange_nn.pt")
 
     def restore(self):
         """Restore policy's networks from a saved model."""

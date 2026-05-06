@@ -11,7 +11,9 @@
       "Bash(openspec new *)",
       "Bash(openspec status *)",
       "Bash(openspec instructions *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Read(//d/school-data/FourDown/graduation_proj/xu/**)",
+      "Bash(ls openspec/changes/)"
     ]
   }
 }
