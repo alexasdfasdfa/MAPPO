@@ -188,8 +188,14 @@ def worker(remote, parent_remote, env_fn_wrapper):
             if state_dict is not None:
                 network.load_state_dict(state_dict)
             network.train() if train_mode else network.eval()
+            # Inject into both wrapper (DiscreteActionEnv) and inner env (EnvCore)
+            # so that step() calls in EnvCore use the correct PPO network.
             env.exchange_network = network
             env.exchange_device = torch.device('cpu')
+            inner_env = getattr(env, 'env', None)
+            if inner_env is not None:
+                inner_env.exchange_network = network
+                inner_env.exchange_device = torch.device('cpu')
             remote.send(None)
         elif cmd == 'get_exchange_candidates':
             # Return raw pair features from env, no network inference in subprocess

@@ -1372,21 +1372,8 @@ class EnvCore(object):
                   f"agreement_rate={rate:.3f}, steps={self.exchange_training_steps}")
 
     def _check_exchange_fallback(self):
-        """Check if fleet_M has been worsening, trigger fallback to shadow mode."""
-        if self.exchange_mode != "network_active":
-            return
-        window = self.exchange_fallback_window
-        history = self.exchange_fleet_M_history
-        if len(history) < window:
-            return
-        recent = history[-window:]
-        # Check if fleet_M has been monotonically worsening
-        worsening = all(recent[i] < recent[i + 1] for i in range(len(recent) - 1))
-        if worsening:
-            self.exchange_mode = "shadow"
-            self.exchange_agreement_count = 0
-            self.exchange_total_comparisons = 0
-            print(f"[exchange_ppo] Fallback to shadow mode: fleet_M worsening for {window} consecutive steps")
+        """DEPRECATED: shadow mode removed. No fallback needed — network trains全程."""
+        pass
 
     def _undetermined_v2_exchange_shadow_mode(self):
         """
@@ -1636,7 +1623,7 @@ class EnvCore(object):
 
         for idx in range(len(candidate_pairs)):
             swap_action = int(swap_actions[idx].item())
-            log_prob = log_probs[idx]
+            log_prob = float(log_probs[idx].item())
             i, j = pair_index_map[idx]
             if swap_action == 1 and len(swapped_pairs) < max_pairs:
                 ri, rj = self.robots[i], self.robots[j]
@@ -1652,7 +1639,7 @@ class EnvCore(object):
 
             self.exchange_step_data.append({
                 'pair_features': features_list[idx],
-                'log_prob': log_prob.item(),
+                'log_prob': log_prob,
                 'swap_action': swap_action,
                 'agents': (i, j),
             })

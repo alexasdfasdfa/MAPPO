@@ -452,6 +452,10 @@ class EnvRunner(Runner):
                 self.compute()
                 train_infos = self.train()
 
+                # Sync updated exchange network weights to subprocess envs after training
+                if getattr(self.all_args, "enable_exchange_ppo", False):
+                    self.envs.set_exchange_network(self.policy.exchange_net, self.device, train_mode=False)
+
                 # post process
                 total_num_steps = (episode + 1) * self.episode_length * self.n_rollout_threads
 

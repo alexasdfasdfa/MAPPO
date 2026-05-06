@@ -129,13 +129,13 @@ class ExchangeNetwork(nn.Module):
             pair_features: [batch, 20] tensor
         Returns:
             action: [batch] tensor of 0/1
-            log_prob: [batch, 1] tensor of log probability of sampled action
+            log_prob: [batch] tensor of log probability of sampled action
         """
         logit = self.forward(pair_features)  # [batch, 1]
-        prob = torch.sigmoid(logit)
+        prob = torch.sigmoid(logit).squeeze(-1)  # [batch]
         dist = torch.distributions.Bernoulli(prob)
-        action = dist.sample().squeeze(-1)  # [batch]
-        log_prob = dist.log_prob(action).unsqueeze(-1)  # [batch, 1]
+        action = dist.sample()  # [batch]
+        log_prob = dist.log_prob(action)  # [batch]
         return action, log_prob
 
     def compute_entropy(self, pair_features: Optional[torch.Tensor] = None) -> torch.Tensor:
