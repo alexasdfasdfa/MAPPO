@@ -395,8 +395,7 @@ class EnvRunner(Runner):
                 if self.use_linear_lr_decay:
                     self.trainer.policy.lr_decay(episode, episodes)
 
-                # Accumulate exchange data in memory for ALL steps
-                self._exchange_buffer = []
+                # Exchange data is inserted immediately, no buffering needed
 
                 for step in range(self.episode_length):
                     # Sample actions
@@ -430,11 +429,9 @@ class EnvRunner(Runner):
                         obs = self._undetermined_resolve(obs)
                     self._maybe_log_reward_terms(episode, step, infos, rewards)
 
-                    # Collect exchange PPO data: accumulate in memory for all steps
+                    # Collect exchange PPO data: store directly for immediate insertion
                     if self.buffer._use_exchange_ppo:
-                        step_exchange_data = self.envs.get_exchange_step_data()
-                        if step_exchange_data:
-                            self._exchange_buffer.append((step, step_exchange_data))
+                        pass  # data inserted immediately in _insert_exchange_latest
 
                     data = (
                         obs,
@@ -839,39 +836,46 @@ class EnvRunner(Runner):
             undet_target_logits=undet_logits,
         )
 
-        # Insert exchange PPO data if enabled
+        # Insert exchange PPO data for the just-collected step
         if self.buffer._use_exchange_ppo:
-            self._insert_exchange_step(infos)
+            self._insert_exchange_latest()
 
-    def _insert_exchange_step(self, infos):
-        """Write accumulated exchange data from ALL steps into buffer."""
+    def _insert_exchange_latest(self):
+        """Insert exchange data for the most recently collected step into buffer.
+
+        Called immediately after self.buffer.insert(), so self.buffer.step
+        has already been incremented. The step we just collected is step-1.
+        """
         if not self.buffer._use_exchange_ppo:
             return
 
-        exchange_buffer = getattr(self, '_exchange_buffer', None)
-        if not exchange_buffer:
+        exchange_data = self.envs.get_exchange_step_data()
+        if not exchange_data:
             return
 
-        for step_idx, exchange_data in exchange_buffer:
-            buffer_step = step_idx + 1  # buffer uses step+1 for insertion
+        # self.buffer.step was just incremented by insert().
+        # The data we collected corresponds to step-1.
+        # insert_exchange(step) writes to buffer[step+1], so passing step-1
+        # writes to buffer[step], which is the correct slot.
+        buffer_step = self.buffer.step - 1
 
-            pair_features = np.zeros((self.n_rollout_threads, self.num_agents, 20), dtype=np.float32)
-            log_probs = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-            actions = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
-            advantages = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        pair_features = np.zeros((self.n_rollout_threads, self.num_agents, 20), dtype=np.float32)
+        log_probs = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        actions = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
+        advantages = np.zeros((self.n_rollout_threads, self.num_agents, 1), dtype=np.float32)
 
-            for t_idx in range(self.n_rollout_threads):
-                thread_data = exchange_data.get(t_idx, [])
-                for item in thread_data:
-                    agent_ids = item.get('agents', (0, 0))
-                    aid = agent_ids[0]
-                    if aid < self.num_agents:
-                        pair_features[t_idx, aid] = item['pair_features']
-                        log_probs[t_idx, aid] = item['log_prob']
-                        actions[t_idx, aid] = item['swap_action']
-                        advantages[t_idx, aid] = item.get('advantage', 0.0)
+        for t_idx in range(self.n_rollout_threads):
+            thread_data = exchange_data.get(t_idx, [])
+            for item in thread_data:
+                agent_ids = item.get('agents', (0, 0))
+                aid = agent_ids[0]
+                if aid < self.num_agents:
+                    pair_features[t_idx, aid] = item['pair_features']
+                    log_probs[t_idx, aid] = item['log_prob']
+                    actions[t_idx, aid] = item['swap_action']
+                    advantages[t_idx, aid] = item.get('advantage', 0.0)
 
-            self.buffer.insert_exchange(buffer_step, pair_features, log_probs, actions, advantages)
+        self.buffer.insert_exchange(buffer_step, pair_features, log_probs, actions, advantages)
 
     # @torch.no_grad()
     # def render(self):

@@ -1,0 +1,152 @@
+% ============================================================
+% Neural Network — Methodology section
+% Paste under \section{Preliminary \& Methodology}
+% ============================================================
+
+\subsection{Neural Network for Target Exchange}
+
+In multi-robot formation control, the assignment of individual robots to specific goal positions within a target formation significantly influences the overall fleet efficiency. A naive fixed assignment may result in suboptimal travel distances, as robots initially positioned far from their designated goals must traverse longer paths, creating a bottleneck that delays the entire formation's convergence. To address this challenge, we introduce a learnable target-exchange mechanism that enables pairs of robots to swap their assigned goals when doing so improves the fleet-wide bottleneck metric. This mechanism is realized through an independent neural network trained via Proximal Policy Optimization (PPO) operating alongside the main MAPPO actor-critic policy within the CTDE (Centralized Training, Decentralized Execution) framework.
+
+The exchange network is designed as a standalone modular component, decoupled from the actor and critic networks. Its weights are saved independently to a checkpoint file denoted as \texttt{exchange\_nn.pt}, enabling separate loading during rendering or resumption of training without dependency on the main policy checkpoint. This architectural decoupling ensures that the exchange policy can be pre-trained, fine-tuned, or replaced independently of the motion-control policy, facilitating modular development and experimentation.
+
+\subsubsection{Network Architecture}
+
+The exchange network is a fully connected feed-forward neural network, formally expressed as a parameterized function $f_{\theta}: \mathbb{R}^{d_{\text{pair}}} \rightarrow \mathbb{R}$, where $d_{\text{pair}} = 20$ is the dimensionality of the pairwise input feature vector and $\theta$ denotes the trainable parameters. The network consists of three hidden layers with dimensions $20 \rightarrow 64 \rightarrow 32 \rightarrow 1$. Each of the first two linear layers is followed by a Rectified Linear Unit (ReLU) activation function, while the final output layer produces a single scalar logit without activation. The swap probability is obtained by applying the sigmoid function to this logit:
+
+\begin{equation}
+    p_{\text{swap}} = \sigma\bigl(f_{\theta}(\mathbf{x}_{i,j})\bigr),
+\end{equation}
+
+where $\mathbf{x}_{i,j} \in \mathbb{R}^{20}$ is the concatenated feature vector encoding the geometric and kinematic state of the agent pair $(i, j)$. The network parameters are initialized using the Xavier uniform initialization scheme, with all bias terms set to zero. The relatively compact architecture---totaling approximately 2,000 trainable parameters---is intentional, as the exchange decision is a binary classification problem with relatively low-dimensional input, and a smaller model reduces inference latency during the time-critical environment simulation step.
+
+\subsubsection{Pairwise Feature Engineering}
+
+A critical design consideration is the construction of informative yet compact features that capture the spatial and kinematic context relevant to the swap decision. For each agent $i$, a 9-dimensional feature vector is extracted from the observation:
+
+\begin{equation}
+    \mathbf{f}_i = \bigl[\Delta x_g^{(i)},\; \Delta y_g^{(i)},\; v^{(i)},\; \theta^{(i)},\; f_{\text{formation}}^{(i)},\; v_x^{\text{for},(i)},\; v_y^{\text{for},(i)},\; p_x^{(i)},\; p_y^{(i)}\bigr]^\top,
+\end{equation}
+
+where the components represent, respectively: the displacement from the agent's current position to its assigned goal in Cartesian coordinates; the scalar speed; the heading angle; the Laplacian formation similarity feature, which quantifies the agent's contribution to the overall formation shape match; the formation-compensation velocity components that drive the agent toward its relative position in the desired formation topology; and the absolute world coordinates of the agent.
+
+The pairwise feature vector $\mathbf{x}_{i,j}$ is constructed by concatenating the individual features of both agents, augmented with two derived features:
+
+\begin{equation}
+    \mathbf{x}_{i,j} = \bigl[\mathbf{f}_i;\; \mathbf{f}_j;\; d_{i,j};\; \Delta_{\text{mutual}}^{(i,j)}\bigr]^\top \in \mathbb{R}^{20},
+\end{equation}
+
+where $d_{i,j} = \| \mathbf{p}_i - \mathbf{p}_j \|_2$ is the Euclidean distance between the two agents, and $\Delta_{\text{mutual}}^{(i,j)}$ is the mutual improvement score, defined as the total reduction in distance-to-goal that would result from swapping the agents' assigned goals:
+
+\begin{equation}
+    \Delta_{\text{mutual}}^{(i,j)} = \bigl(d_i^{\text{cur}} - d_i^{\text{after}}\bigr) + \bigl(d_j^{\text{cur}} - d_j^{\text{after}}\bigr).
+\end{equation}
+
+Here, $d_i^{\text{cur}}$ denotes the current distance from agent $i$ to its assigned goal, and $d_i^{\text{after}}$ denotes the distance from agent $i$ to agent $j$'s current goal (i.e., the distance after the swap). A positive mutual improvement score indicates that both agents would, in aggregate, be closer to their new goals after the swap, providing a geometrically grounded heuristic that the network can leverage in conjunction with the richer kinematic context.
+
+\subsubsection{PPO-Based Training Objective}
+
+The exchange network is trained using the PPO clipped surrogate objective, which provides a stable policy gradient estimate by constraining the policy update magnitude through importance weight clipping. At each environment step, candidate agent pairs are identified based on spatial proximity: only pairs whose inter-agent distance falls within a predefined communication radius $R_{\text{ex}}$ are considered, and pairs sharing the same assigned goal are excluded. For each candidate pair, the network produces a swap probability $p_{\text{swap}}$ and samples a binary action $a \in \{0, 1\}$ from the corresponding Bernoulli distribution.
+
+The advantage signal driving the policy update is computed as the reduction in the fleet bottleneck distance, defined as the maximum distance-to-goal across all agents in the formation:
+
+\begin{equation}
+    A = M_{\text{before}} - M_{\text{after}}, \quad \text{where} \quad M = \max_{k \in \{1,\dots,N\}} d\bigl(k, \text{goal}_k\bigr).
+\end{equation}
+
+This formulation directly optimizes the network to minimize the completion time of the slowest agent, which is the dominant factor in formation convergence time. A positive advantage indicates that the executed swap reduced the fleet bottleneck, providing a clear learning signal that aligns the exchange policy with the formation task objective.
+
+The policy loss is computed as the standard PPO clipped surrogate loss:
+
+\begin{equation}
+    L^{\text{PPO}}(\theta) = -\mathbb{E}_{t}\Bigl[\min\bigl(r_t(\theta) \cdot A_t,\; \text{clip}(r_t(\theta), 1-\epsilon, 1+\epsilon) \cdot A_t\bigr)\Bigr],
+\end{equation}
+
+where $r_t(\theta) = \pi_\theta(a_t \mid \mathbf{x}_t) / \pi_{\theta_{\text{old}}}(a_t \mid \mathbf{x}_t)$ is the importance sampling ratio between the current and old policies, and $\epsilon$ is the clipping hyperparameter. The entropy of the Bernoulli policy is added as a regularization term to encourage exploration:
+
+\begin{equation}
+    H(\pi_\theta) = \mathbb{E}_{t}\bigl[ -p_t \log p_t - (1-p_t) \log(1-p_t) \bigr],
+\end{equation}
+
+yielding the combined objective $L(\theta) = L^{\text{PPO}}(\theta) - \beta \cdot H(\pi_\theta)$, where $\beta$ is the entropy coefficient. The network is optimized using the Adam optimizer with a learning rate of $10^{-3}$, and gradients are clipped to a maximum $L_2$ norm of 5.0 to prevent destabilizing updates.
+
+\subsubsection{Data Collection and Training Pipeline}
+
+The exchange network training is integrated into the main MAPPO training loop through a collect-then-update cycle that ensures on-policy data collection. The pipeline proceeds as follows:
+
+\begin{enumerate}
+    \item \textbf{Rollout collection}: During each episode of $\tau = 100$ environment steps, all $N_{\text{env}} = 40$ parallel subprocess environments independently identify candidate agent pairs and sample swap actions using the current exchange network. For each step and each environment, the tuple $(\mathbf{x}_{i,j}, \log \pi_\theta, a, A)$ is accumulated in a per-episode memory buffer.
+    \item \textbf{Buffer insertion}: After completing all $\tau$ steps, the accumulated exchange data is inserted into the experience replay buffer, indexed by the corresponding step positions. Each agent involved in a swap has its row in the exchange buffer populated with the relevant features, log-probability, action, and advantage.
+    \item \textbf{Joint training update}: The MAPPO actor and critic are updated first, followed by the exchange network. The exchange network undergoes $K = 12$ PPO epochs with $M = 100$ mini-batches, matching the update schedule of the main policy. This joint training ensures that the exchange policy adapts in concert with the evolving motion-control policy.
+    \item \textbf{Weight synchronization}: After the training update, the updated exchange network weights are serialized and broadcast to all 40 subprocess environments via Python inter-process communication pipes. Each subprocess reconstructs the network from the received state dictionary, ensuring that subsequent rollouts use the latest policy parameters.
+\end{enumerate}
+
+\subsubsection{Training Mode Design}
+
+A notable design decision in our exchange training pipeline is the elimination of the shadow mode paradigm used in prior work. In shadow mode, the neural network observes swap decisions made by a rule-based heuristic and collects training data passively, but its decisions are not executed. This paradigm violates the on-policy assumption inherent to PPO, as the network's log-probabilities correspond to actions it did not actually take.
+
+Our pipeline instead employs \texttt{network\_active} mode from the first training iteration: the exchange network directly controls all swap decisions, and the PPO loss is computed from the network's actual actions and their outcomes. This end-to-end training approach ensures that the network learns from its own decisions, enabling it to discover exchange strategies that may surpass the performance of hand-crafted rules rather than merely imitating them.
+
+% ============================================================
+% Neural Network — Experiments section
+% Paste under \section{Experiments \& Results}
+% ============================================================
+
+\subsection{Neural Network Training Setup and Diagnostics}
+
+\subsubsection{Experimental Configuration}
+
+The exchange network is evaluated under the undetermined-v2 target assignment mode, which provides robots with a fixed-size observation window of their $M = 10$ nearest unassigned goals and employs sticky target assignment with auction-based conflict resolution. Pairwise target exchange is enabled with the fleet bottleneck criterion as the accept condition for swaps. The training is conducted with 40 parallel environment instances, each simulating a swarm of $N = 10$ robots navigating to font-pattern-defined goal formations.
+
+\begin{table}[htbp]
+    \centering
+    \caption{Exchange Network Training Hyperparameters}
+    \label{tab:exchange_config}
+    \begin{tabular}{lc}
+        \toprule
+        \textbf{Hyperparameter} & \textbf{Value} \\
+        \midrule
+        Network architecture & $20 \rightarrow 64 \rightarrow 32 \rightarrow 1$ \\
+        Activation function & ReLU \\
+        Weight initialization & Xavier uniform \\
+        Optimizer & Adam \\
+        Learning rate & $10^{-3}$ \\
+        PPO clip parameter $\epsilon$ & 0.2 \\
+        Entropy coefficient $\beta$ & 0.01 \\
+        Gradient clipping norm & 5.0 \\
+        PPO epochs per update & 12 \\
+        Mini-batches per epoch & 100 \\
+        Communication radius $R_{\text{ex}}$ & 6.0\,m \\
+        Max swaps per step & 1 \\
+        Minimum swap gain $\Delta_{\min}$ & 0.05\,m \\
+        Accept criterion & Fleet bottleneck $M$ \\
+        Parallel environments $N_{\text{env}}$ & 40 \\
+        Episode length $\tau$ & 100 \\
+        Number of agents $N$ & 10 \\
+        Total training steps & $19.2 \times 10^6$ \\
+        \bottomrule
+    \end{tabular}
+\end{table}
+
+The fleet bottleneck accept criterion requires that a candidate swap reduces the maximum distance-to-goal across all agents by at least $\Delta_{\min} = 0.05$\,m to be considered advantageous. This threshold ensures that the advantage signal is non-trivial and provides a meaningful gradient direction for policy optimization. The communication radius of 6.0\,m is chosen to match the undetermined goal communication radius, ensuring that exchange decisions are made between agents that are within the same local communication neighborhood.
+
+\subsubsection{Training Diagnostics and Monitoring}
+
+To assess the exchange network's learning progress and diagnose potential training issues, the following metrics are monitored and logged at regular intervals during training:
+
+\begin{itemize}
+    \item \textbf{Exchange loss}: The combined PPO objective, comprising the clipped surrogate policy loss and the negative entropy bonus. A decreasing loss indicates that the network is improving its swap decisions with respect to the fleet bottleneck advantage signal. The loss is averaged over all PPO epochs and mini-batches within each training update.
+
+    \item \textbf{Exchange entropy}: The mean Bernoulli entropy of the swap policy across all candidate pairs in the current mini-batch. For a Bernoulli distribution, the maximum entropy is $\log 2 \approx 0.693$, corresponding to a uniform random policy with $p_{\text{swap}} = 0.5$. A healthy training run should exhibit entropy values above 0.3, indicating that the network maintains sufficient exploration and does not prematurely collapse to deterministic decisions. Persistently low entropy ($< 0.1$) may indicate policy collapse, while entropy consistently near the maximum may suggest insufficient learning signal.
+
+    \item \textbf{Gradient norm}: The $L_2$ norm of the exchange network's gradients after gradient clipping. A non-zero gradient norm indicates that the network is receiving meaningful learning signals from the PPO objective. The magnitude of the gradient norm provides insight into the stability of training: excessively large norms (approaching the clipping threshold of 5.0) may indicate unstable updates, while near-zero norms suggest that the network has converged or the advantage signal is too weak to drive learning.
+
+    \item \textbf{Agreement rate}: The fraction of times the network's sampled swap decision agrees with the fleet bottleneck rule criterion. Initially, this metric is expected to be near 0.5 (random agreement), and an increasing trend indicates that the network is learning to make decisions aligned with the fleet bottleneck heuristic. A decrease after initial improvement may suggest the network has discovered strategies that outperform the rule-based baseline.
+\end{itemize}
+
+\subsubsection{Implementation and Deployment}
+
+The exchange network is implemented as a PyTorch \texttt{nn.Module} subclass and is integrated into the MAPPO training infrastructure as an auxiliary policy module. The training loop is orchestrated by the \texttt{env\_runner.py} module, which manages the collect-then-update cycle and inter-process weight synchronization. The experience replay buffer is extended with dedicated storage arrays for exchange-specific data: pairwise features (20 dimensions per agent), old log-probabilities, sampled swap actions, and fleet bottleneck advantages.
+
+During inference and rendering, the exchange network is loaded from its standalone checkpoint file \texttt{exchange\_nn.pt}. The loading mechanism implements a priority-based fallback strategy: first, it attempts to load from the model directory containing the most recent actor and critic checkpoints; second, it falls back to a legacy behavior cloning checkpoint; third, it defaults to the rule-based exchange heuristic if no trained model is found. This ensures that the system can operate correctly whether or not a trained exchange network is available, while prioritizing the most recent PPO-trained model when present.
+
+The network operates in evaluation mode during rendering, producing deterministic swap decisions by thresholding the swap probability at 0.5. The compact architecture and CPU-based inference ensure minimal computational overhead during the simulation, as the forward pass for a single pair requires only a few hundred floating-point operations.

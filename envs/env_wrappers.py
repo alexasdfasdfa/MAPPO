@@ -198,12 +198,13 @@ def worker(remote, parent_remote, env_fn_wrapper):
                 inner_env.exchange_device = torch.device('cpu')
             remote.send(None)
         elif cmd == 'get_exchange_candidates':
-            # Return raw pair features from env, no network inference in subprocess
-            exchange_data = getattr(env, 'exchange_step_data', None)
+            # env is DiscreteActionEnv, exchange data lives on env.env (EnvCore)
+            env_core = getattr(env, 'env', env)
+            exchange_data = getattr(env_core, 'exchange_step_data', None)
             if exchange_data is not None:
                 data_list = list(exchange_data)
-                m_gain = getattr(env, 'undetermined_v2_exchange_step_M_gain', 0.0)
-                env.exchange_step_data = []
+                m_gain = getattr(env_core, 'undetermined_v2_exchange_step_M_gain', 0.0)
+                env_core.exchange_step_data = []
                 remote.send((data_list, m_gain))
             else:
                 remote.send(([], 0.0))
@@ -375,7 +376,8 @@ class DummyVecEnv(ShareVecEnv):     #单线程环境，一般用于验证和测�
         """Get exchange PPO data from subprocess envs."""
         data = {}
         for i, env in enumerate(self.envs):
-            env_core = getattr(env, 'env_core', env)
+            # env is DiscreteActionEnv, exchange data lives on env.env (EnvCore)
+            env_core = getattr(env, 'env', env)
             exchange_data = getattr(env_core, 'exchange_step_data', None)
             if exchange_data is not None:
                 data[i] = list(exchange_data)

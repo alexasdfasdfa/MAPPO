@@ -138,7 +138,7 @@ class SharedReplayBuffer(object):
                 dtype=np.float32,
             )
             self.exchange_advantages = np.zeros(
-                (self.episode_length, self.n_rollout_threads, num_agents, 1),
+                (self.episode_length + 1, self.n_rollout_threads, num_agents, 1),
                 dtype=np.float32,
             )
         else:
@@ -219,7 +219,7 @@ class SharedReplayBuffer(object):
         if swap_action is not None:
             self.exchange_actions[step + 1] = np.asarray(swap_action, dtype=np.float32).copy()
         if advantage is not None:
-            self.exchange_advantages[step] = np.asarray(advantage, dtype=np.float32).copy()
+            self.exchange_advantages[step + 1] = np.asarray(advantage, dtype=np.float32).copy()
 
     def chooseinsert(self, share_obs, obs, rnn_states, rnn_states_critic, actions, action_log_probs,
                      value_preds, rewards, masks, bad_masks=None, active_masks=None, available_actions=None):
@@ -783,7 +783,7 @@ class SharedReplayBuffer(object):
         pair_features = self.exchange_pair_features[:-1].reshape(-1, 20)
         old_log_probs = self.exchange_old_log_probs[:-1].reshape(-1, 1)
         actions = self.exchange_actions[:-1].reshape(-1, 1)
-        advantages = self.exchange_advantages.reshape(-1, 1)
+        advantages = self.exchange_advantages[:-1].reshape(-1, 1)
 
         for indices in sampler:
             pair_features_batch = pair_features[indices]
